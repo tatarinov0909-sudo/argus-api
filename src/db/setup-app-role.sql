@@ -24,6 +24,13 @@ REVOKE DELETE ON journal_entries FROM argus_app;
 -- not just by which methods the repository happens to export.
 REVOKE UPDATE ON journal_entries FROM argus_app;
 
+-- Login lookups for staff/seller keys run as SECURITY DEFINER functions
+-- (see 1754395300000_login-lookup-functions.js) precisely so they can see
+-- past RLS for that one narrow, safe-by-uniqueness query. argus_app needs
+-- EXECUTE on them specifically — table grants above don't cover functions.
+GRANT EXECUTE ON FUNCTION find_staff_key_for_login(TEXT) TO argus_app;
+GRANT EXECUTE ON FUNCTION find_seller_key_for_login(TEXT) TO argus_app;
+
 -- Sequences aren't used (all PKs are gen_random_uuid()), so no sequence
 -- grants needed. If a future migration adds a SERIAL/IDENTITY column,
 -- remember to GRANT USAGE on its sequence too.

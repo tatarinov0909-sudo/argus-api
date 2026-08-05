@@ -33,20 +33,23 @@ async function registerOwner({ name, email, password, warehouseName, city }) {
   }
   const passwordHash = await bcrypt.hash(password, 12);
 
-  return withoutTenantContext(async (client) => {
+  // Bootstrap problem: the warehouse row is RLS-protected by its own id,
+  // which doesn't exist until we insert it. Generate the id client-side so
+  // withTenantContext can scope a real transaction to it before inserting —
+  // set_config(..., true) ("is_local") only holds for the current
+  // transaction, so this must run inside withTenantContext's BEGIN/COMMIT,
+  // not as a bare query before it (that was the bug: the setting was gone
+  // by the time the INSERT ran, and Postgres correctly rejected the row).
+  const warehouseId = crypto.randomUUID();
+  const warehouseCode = String(1000 + Math.floor(Math.random() * 9000));
+
+  return withTenantContext({ warehouseId }, async (client) => {
     const ownerResult = await client.query(
       `INSERT INTO owners (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email`,
       [name, email, passwordHash],
     );
     const owner = ownerResult.rows[0];
 
-    // Bootstrap problem: the warehouse row is RLS-protected by its own id,
-    // which doesn't exist until we insert it. Generate the id client-side
-    // so we can scope the very same transaction to it before inserting.
-    const warehouseId = crypto.randomUUID();
-    const warehouseCode = String(1000 + Math.floor(Math.random() * 9000));
-
-    await client.query(`SELECT set_config('app.current_warehouse_id', $1, true)`, [warehouseId]);
     const whResult = await client.query(
       `INSERT INTO warehouses (id, owner_id, name, city, warehouse_code)
        VALUES ($1, $2, $3, $4, $5) RETURNING id, name, city, warehouse_code`,
@@ -90,8 +93,10 @@ async function loginStaffKey({ keyCode }) {
   const normalized = keyCode.trim().toUpperCase();
 
   return withoutTenantContext(async (client) => {
+    // RLS-protected table, looked up before we know its warehouse scope —
+    // see the comment on find_staff_key_for_login in the migration.
     const result = await client.query(
-      `SELECT id, warehouse_id, name, active FROM staff_keys WHERE key_code = $1`,
+      `SELECT * FROM find_staff_key_for_login($1)`,
       [normalized],
     );
     const key = result.rows[0];
@@ -115,9 +120,7 @@ async function loginSellerKey({ keyCode, name }) {
 
   return withoutTenantContext(async (client) => {
     const result = await client.query(
-      `SELECT sk.id, sk.company_id, sk.warehouse_id, sk.active, c.name AS company_name
-       FROM seller_keys sk JOIN companies c ON c.id = sk.company_id
-       WHERE sk.key_code = $1`,
+      `SELECT * FROM find_seller_key_for_login($1)`,
       [normalized],
     );
     const key = result.rows[0];
