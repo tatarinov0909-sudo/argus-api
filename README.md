@@ -39,9 +39,13 @@ since the tests specifically verify Postgres RLS and grant behavior.
 
 ## Deploying
 
-`deploy/provision-vps.sh` — run once on a fresh Ubuntu VPS as root. Installs
-Node, Postgres, nginx, certbot, pm2, and prints the remaining manual steps
-(copy the app up, run migrations, set up the app DB role, get a cert).
+Already live: reg.ru Cloud VPS (Russia region), Node via pm2, Postgres 16 in
+Docker (bound to 127.0.0.1 only), nginx + Let's Encrypt fronting
+`https://api.argus-ai.online`. `deploy/provision-vps.sh` documents that setup
+from scratch (Node, Postgres, nginx, certbot, pm2) — re-run it as a checklist
+if this ever needs to move to a new server. For an ordinary code update:
+upload the changed files (FTP-style file copy, same as the static frontend),
+run any new migration with an admin `DATABASE_URL`, then `pm2 restart argus-api`.
 
 ## Project layout
 
@@ -52,3 +56,12 @@ One folder per domain under `src/`: `auth`, `warehouses`, `staff`, `sellers`,
 verified JWT into the `{warehouseId, companyId}` pair every DB call must be
 scoped by — read the comment there before touching anything seller-facing,
 it's the fix for a tenant-isolation bug this project already shipped once.
+
+Any login/lookup query that runs *before* tenant context can be set (finding
+a key or a warehouse by something other than its own RLS-protected id) needs
+a narrow `SECURITY DEFINER` SQL function — see migrations 300000/400000/500000
+and the matching `GRANT EXECUTE` lines in `setup-app-role.sql` for the
+existing examples (`find_staff_key_for_login`, `find_seller_key_for_login`,
+`find_owner_warehouse`). A plain `SELECT` under `argus_app` in that situation
+silently returns zero rows instead of erroring — it looks like "not found,"
+not like a permissions problem, so it's easy to miss.

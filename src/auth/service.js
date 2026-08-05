@@ -138,23 +138,10 @@ async function loginSellerKey({ keyCode, name }) {
   });
 }
 
-// Used by the staff module when the owner issues a new key — kept here
-// since generating a unique seller key code is an auth-shaped concern.
-async function generateSellerKeyCode(client) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const digits = String(1000 + Math.floor(Math.random() * 9000));
-    const candidate = `PENDING-${digits}-K`; // caller replaces PENDING with a real prefix
-    const exists = await client.query(`SELECT 1 FROM seller_keys WHERE key_code LIKE $1`, [`%-${digits}-K`]);
-    if (exists.rowCount === 0) return digits;
-  }
-  throw new HttpError(500, 'Не удалось сгенерировать уникальный ключ, попробуйте ещё раз');
-}
-
 module.exports = {
   registerOwner,
   loginOwner,
   loginStaffKey,
   loginSellerKey,
   transliteratePrefix,
-  generateSellerKeyCode,
 };
