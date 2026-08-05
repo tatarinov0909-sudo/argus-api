@@ -77,7 +77,7 @@ async function loginOwner({ email, password }) {
     if (!ok) throw new HttpError(401, 'Неверный email или пароль');
 
     const whResult = await client.query(
-      `SELECT id, name, city, warehouse_code FROM warehouses WHERE owner_id = $1 ORDER BY created_at ASC LIMIT 1`,
+      `SELECT * FROM find_owner_warehouse($1)`,
       [owner.id],
     );
     const warehouse = whResult.rows[0];

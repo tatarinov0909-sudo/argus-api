@@ -30,6 +30,7 @@ REVOKE UPDATE ON journal_entries FROM argus_app;
 -- EXECUTE on them specifically — table grants above don't cover functions.
 GRANT EXECUTE ON FUNCTION find_staff_key_for_login(TEXT) TO argus_app;
 GRANT EXECUTE ON FUNCTION find_seller_key_for_login(TEXT) TO argus_app;
+GRANT EXECUTE ON FUNCTION find_owner_warehouse(UUID) TO argus_app;
 
 -- Sequences aren't used (all PKs are gen_random_uuid()), so no sequence
 -- grants needed. If a future migration adds a SERIAL/IDENTITY column,
