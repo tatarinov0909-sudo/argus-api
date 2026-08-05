@@ -57,7 +57,7 @@ async function registerOwner({ name, email, password, warehouseName, city }) {
     );
     const warehouse = whResult.rows[0];
 
-    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id });
+    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name });
     return { token, owner, warehouse };
   });
 }
@@ -83,7 +83,7 @@ async function loginOwner({ email, password }) {
     const warehouse = whResult.rows[0];
     if (!warehouse) throw new HttpError(404, 'У этого аккаунта пока нет склада');
 
-    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id });
+    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name });
     return { token, owner: { id: owner.id, name: owner.name, email: owner.email }, warehouse };
   });
 }
