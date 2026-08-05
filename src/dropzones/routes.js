@@ -1,0 +1,106 @@
+const express = require('express');
+const { requireAuth, requireRole } = require('../middleware/auth');
+const { withTenantContext } = require('../db/pool');
+const { HttpError } = require('../middleware/errorHandler');
+
+const router = express.Router();
+
+router.get('/', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const zones = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await client.query(
+        `SELECT dz.id, dz.zone_num, dz.label,
+                COALESCE(json_agg(json_build_object(
+                  'id', di.id, 'companyId', di.company_id, 'sku', di.sku, 'qty', di.qty, 'direction', di.direction
+                ) ORDER BY di.created_at) FILTER (WHERE di.id IS NOT NULL), '[]') AS items
+         FROM dropzones dz
+         LEFT JOIN dropzone_items di ON di.dropzone_id = dz.id
+         WHERE dz.warehouse_id = $1
+         GROUP BY dz.id ORDER BY dz.zone_num ASC`,
+        [warehouseId],
+      );
+      return result.rows;
+    });
+    res.json(zones);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Replaces all zones — called alongside POST /api/cells/rows when the
+// owner (re)builds the warehouse via the constructor or a document upload.
+router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { count } = req.body;
+    const zoneCount = Math.max(0, parseInt(count, 10) || 0);
+
+    const zones = await withTenantContext({ warehouseId }, async (client) => {
+      await client.query(`DELETE FROM dropzones WHERE warehouse_id = $1`, [warehouseId]);
+      const created = [];
+      for (let i = 1; i <= zoneCount; i++) {
+        const result = await client.query(
+          `INSERT INTO dropzones (warehouse_id, zone_num, label) VALUES ($1, $2, $3)
+           RETURNING id, zone_num, label`,
+          [warehouseId, i, `Зона ${i}`],
+        );
+        created.push({ ...result.rows[0], items: [] });
+      }
+      return created;
+    });
+    res.status(201).json(zones);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/:zoneId/items', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { zoneId } = req.params;
+    const { companyId, sku, qty, direction } = req.body;
+    if (!sku || qty == null || !['in', 'out'].includes(direction)) {
+      throw new HttpError(400, 'Не хватает данных для позиции в зоне разгрузки');
+    }
+
+    const item = await withTenantContext({ warehouseId }, async (client) => {
+      const zoneResult = await client.query(
+        `SELECT id FROM dropzones WHERE id = $1 AND warehouse_id = $2`,
+        [zoneId, warehouseId],
+      );
+      if (!zoneResult.rows[0]) throw new HttpError(404, 'Зона не найдена');
+
+      const result = await client.query(
+        `INSERT INTO dropzone_items (dropzone_id, warehouse_id, company_id, sku, qty, direction)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, company_id, sku, qty, direction`,
+        [zoneId, warehouseId, companyId || null, sku, qty, direction],
+      );
+      return result.rows[0];
+    });
+    res.status(201).json(item);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.delete('/items/:itemId', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { itemId } = req.params;
+    const deleted = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await client.query(
+        `DELETE FROM dropzone_items WHERE id = $1 AND warehouse_id = $2 RETURNING id`,
+        [itemId, warehouseId],
+      );
+      return result.rows[0];
+    });
+    if (!deleted) throw new HttpError(404, 'Позиция не найдена');
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;
