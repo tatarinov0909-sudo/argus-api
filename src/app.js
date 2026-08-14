@@ -10,8 +10,10 @@ const staffRoutes = require('./staff/routes');
 const sellerRoutes = require('./sellers/routes');
 const cellRoutes = require('./cells/routes');
 const dropzoneRoutes = require('./dropzones/routes');
+const productRoutes = require('./products/routes');
 const invoiceRoutes = require('./invoices/routes');
 const receivingRoutes = require('./receiving/routes');
+const shippingRoutes = require('./shipping/routes');
 const journalRoutes = require('./journal/routes');
 
 function createApp() {
@@ -29,8 +31,10 @@ function createApp() {
   app.use('/api/sellers', sellerRoutes);
   app.use('/api/cells', cellRoutes);
   app.use('/api/dropzones', dropzoneRoutes);
+  app.use('/api/products', productRoutes);
   app.use('/api/invoices', invoiceRoutes);
   app.use('/api/receiving', receivingRoutes);
+  app.use('/api/shipping', shippingRoutes);
   app.use('/api/journal', journalRoutes);
 
   app.use(errorHandler);

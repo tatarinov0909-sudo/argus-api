@@ -11,11 +11,21 @@ const router = express.Router();
 router.get('/', requireAuth, async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
+    // ?direction=in|out — the worker's receiving screen and picking screen are
+    // separate views over the same table. Omitted means "everything", so the
+    // owner's existing all-invoices list keeps working untouched.
+    const { direction } = req.query;
+    if (direction && direction !== 'in' && direction !== 'out') {
+      throw new HttpError(400, 'direction может быть только in или out');
+    }
     const rows = await withTenantContext(ctx, async (client) => {
       const result = await client.query(
-        `SELECT i.id, i.number, i.status, i.created_at, i.company_id, c.name AS company_name
+        `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
+                c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id
+         WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
          ORDER BY i.created_at DESC`,
+        [direction || null],
       );
       return result.rows;
     });
@@ -32,12 +42,48 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 
     const invoice = await withTenantContext(ctx, async (client) => {
       const invoiceResult = await client.query(
-        `SELECT i.id, i.number, i.status, i.created_at, i.company_id, c.name AS company_name
+        `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
+                c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id WHERE i.id = $1`,
         [id],
       );
       const inv = invoiceResult.rows[0];
       if (!inv) return null;
+
+      // Inbound keeps the flat one-record-per-item shape it always had.
+      // Outbound aggregates instead, because one line can be picked from
+      // several cells (see the shipping migration for why).
+      if (inv.direction === 'out') {
+        const itemsResult = await client.query(
+          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+                  COALESCE(SUM(sr.picked_qty), 0) AS picked_qty,
+                  COALESCE(BOOL_OR(sr.is_final), false) AS closed,
+                  COALESCE(
+                    json_agg(
+                      json_build_object(
+                        'id', sr.id,
+                        'pickedQty', sr.picked_qty,
+                        'finishedAt', sr.finished_at,
+                        'rowNum', wr.row_num,
+                        'rackStart', cb.rack_start,
+                        'rackEnd', cb.rack_end,
+                        'tierStart', cb.tier_start,
+                        'tierEnd', cb.tier_end
+                      ) ORDER BY sr.finished_at
+                    ) FILTER (WHERE sr.id IS NOT NULL),
+                    '[]'
+                  ) AS picks
+           FROM invoice_items ii
+           LEFT JOIN shipping_records sr ON sr.invoice_item_id = ii.id
+           LEFT JOIN cell_blocks cb ON cb.id = sr.cell_block_id
+           LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+           WHERE ii.invoice_id = $1
+           GROUP BY ii.id, ii.name, ii.sku, ii.declared_qty
+           ORDER BY ii.id`,
+          [id],
+        );
+        return { ...inv, items: itemsResult.rows };
+      }
 
       const itemsResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
@@ -61,12 +107,17 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 });
 
 // Manual invoice entry — stands in for the 1C sync that doesn't exist yet.
+// Defaults to 'in' so every existing caller keeps creating receiving documents
+// without change; pass direction:'out' to create a shipment order.
 router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { companyId, number, items } = req.body;
+    const { companyId, number, items, direction = 'in' } = req.body;
     if (!companyId || !number || !Array.isArray(items) || items.length === 0) {
       throw new HttpError(400, 'Укажите компанию, номер накладной и хотя бы одну позицию');
+    }
+    if (direction !== 'in' && direction !== 'out') {
+      throw new HttpError(400, 'direction может быть только in или out');
     }
     for (const it of items) {
       if (!it.name || !it.sku || it.declaredQty == null) {
@@ -82,9 +133,10 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
       if (!companyResult.rows[0]) throw new HttpError(404, 'Компания не найдена');
 
       const invoiceResult = await client.query(
-        `INSERT INTO invoices (warehouse_id, company_id, number) VALUES ($1, $2, $3)
-         RETURNING id, number, status, created_at, company_id`,
-        [warehouseId, companyId, number],
+        `INSERT INTO invoices (warehouse_id, company_id, number, direction)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, number, status, direction, created_at, company_id`,
+        [warehouseId, companyId, number, direction],
       );
       const inv = invoiceResult.rows[0];
 
