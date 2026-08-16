@@ -31,6 +31,18 @@ REVOKE UPDATE ON journal_entries FROM argus_app;
 GRANT EXECUTE ON FUNCTION find_staff_key_for_login(TEXT) TO argus_app;
 GRANT EXECUTE ON FUNCTION find_seller_key_for_login(TEXT) TO argus_app;
 GRANT EXECUTE ON FUNCTION find_owner_warehouse(UUID) TO argus_app;
+GRANT EXECUTE ON FUNCTION find_integration_key_for_login(TEXT) TO argus_app;
+
+-- IMPORTANT for anyone adding a migration later: every GRANT in this file is a
+-- ONE-TIME SNAPSHOT taken when the script runs, and there is no
+-- ALTER DEFAULT PRIVILEGES behind it. On an already-deployed database this
+-- script has long since run, so a table or function created by a later
+-- migration gets NO privileges — the app connects fine and then fails with
+-- "permission denied" the first time that object is touched. Every migration
+-- that creates a table or function must therefore issue its own GRANT,
+-- wrapped in an "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='argus_app')"
+-- guard so a fresh database without the role can still migrate. See
+-- 1754395600000_shipping.js for the pattern.
 
 -- Sequences aren't used (all PKs are gen_random_uuid()), so no sequence
 -- grants needed. If a future migration adds a SERIAL/IDENTITY column,

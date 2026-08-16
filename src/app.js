@@ -15,6 +15,7 @@ const invoiceRoutes = require('./invoices/routes');
 const receivingRoutes = require('./receiving/routes');
 const shippingRoutes = require('./shipping/routes');
 const journalRoutes = require('./journal/routes');
+const syncRoutes = require('./sync/routes');
 
 function createApp() {
   const app = express();
@@ -36,6 +37,7 @@ function createApp() {
   app.use('/api/receiving', receivingRoutes);
   app.use('/api/shipping', shippingRoutes);
   app.use('/api/journal', journalRoutes);
+  app.use('/api/sync', syncRoutes);
 
   app.use(errorHandler);
 

@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const journal = require('../journal/repository');
+const outbox = require('../sync/outbox');
 
 const router = express.Router();
 
@@ -120,9 +121,13 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     const record = await withTenantContext({ warehouseId }, async (client) => {
       const itemResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
-                i.direction
+                ii.external_id,
+                i.direction, i.number AS invoice_number,
+                i.external_id AS invoice_external_id,
+                c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
+         JOIN companies c ON c.id = ii.company_id
          WHERE ii.id = $1 AND ii.warehouse_id = $2`,
         [invoiceItemId, warehouseId],
       );
@@ -231,6 +236,23 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         actorId: staffKeyId,
         status: hasDiscrepancy ? 'pending' : 'auto',
       });
+
+      // Only on the pick that closes the line. A partial pick mid-walk is not a
+      // completed movement — emitting one per cell visited would have 1C post
+      // the same shipment two or three times.
+      if (isFinal) {
+        await outbox.appendShipping(client, {
+          warehouseId,
+          item,
+          invoice: {
+            id: item.invoice_id,
+            number: item.invoice_number,
+            external_id: item.invoice_external_id,
+          },
+          company: { id: item.company_id, external_id: item.company_external_id },
+          actualQty: totalPicked,
+        });
+      }
 
       // The invoice is done when every line has been explicitly closed.
       const remaining = await client.query(

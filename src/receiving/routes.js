@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const journal = require('../journal/repository');
+const outbox = require('../sync/outbox');
 
 const router = express.Router();
 
@@ -19,9 +20,17 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     }
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
+      // Invoice and company are joined in for the sync payload, so the outbox
+      // row carries the 1C identifiers without a second round trip.
       const itemResult = await client.query(
-        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id
-         FROM invoice_items ii WHERE ii.id = $1 AND ii.warehouse_id = $2`,
+        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
+                ii.external_id,
+                i.number AS invoice_number, i.external_id AS invoice_external_id,
+                c.external_id AS company_external_id
+         FROM invoice_items ii
+         JOIN invoices i ON i.id = ii.invoice_id
+         JOIN companies c ON c.id = ii.company_id
+         WHERE ii.id = $1 AND ii.warehouse_id = $2`,
         [invoiceItemId, warehouseId],
       );
       const item = itemResult.rows[0];
@@ -76,6 +85,20 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         actorType: 'worker',
         actorId: staffKeyId,
         status: hasDiscrepancy ? 'pending' : 'auto',
+      });
+
+      // Same transaction as the stock movement above — a receiving record can
+      // never exist without the event that tells 1C about it.
+      await outbox.appendReceiving(client, {
+        warehouseId,
+        item,
+        invoice: {
+          id: item.invoice_id,
+          number: item.invoice_number,
+          external_id: item.invoice_external_id,
+        },
+        company: { id: item.company_id, external_id: item.company_external_id },
+        actualQty: acceptedQty,
       });
 
       const remaining = await client.query(
