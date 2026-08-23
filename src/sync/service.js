@@ -93,7 +93,7 @@ function numeric(value) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-async function upsertProducts(client, warehouseId, records) {
+async function upsertProducts(client, warehouseId, records, options = {}) {
   const results = [];
   for (const rec of records) {
     const externalId = rec.externalId?.trim();
@@ -104,7 +104,10 @@ async function upsertProducts(client, warehouseId, records) {
       continue;
     }
 
-    const companyId = await resolveCompany(client, warehouseId, rec.companyExternalId);
+    // Некоторые базы (в частности старые УТ 10.3) не связывают номенклатуру
+    // с контрагентом вообще — тогда весь пуш идёт под одну явно указанную
+    // владельцем компанию, а не по externalId на каждую запись.
+    const companyId = (await resolveCompany(client, warehouseId, rec.companyExternalId)) || options.defaultCompanyId || null;
     if (!companyId) {
       results.push({
         externalId, status: 'error',
