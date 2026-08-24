@@ -41,6 +41,7 @@ function createApp() {
   app.use('/api/shipping', shippingRoutes);
   app.use('/api/journal', journalRoutes);
   app.use('/api/sync', syncRoutes);
+  app.use('/api/agents', agentRoutes);
 
   app.use(errorHandler);
 
