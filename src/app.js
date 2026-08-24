@@ -16,12 +16,15 @@ const receivingRoutes = require('./receiving/routes');
 const shippingRoutes = require('./shipping/routes');
 const journalRoutes = require('./journal/routes');
 const syncRoutes = require('./sync/routes');
+const agentRoutes = require('./agents/routes');
 
 function createApp() {
   const app = express();
 
   app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') ?? true }));
-  app.use(express.json());
+  // Default body-parser limit is 100kb — a 500-record 1C sync batch
+  // (companies/products/invoices) routinely exceeds that.
+  app.use(express.json({ limit: '5mb' }));
   app.use(pinoHttp({ level: process.env.LOG_LEVEL || 'info' }));
 
   app.get('/health', (req, res) => res.json({ ok: true }));

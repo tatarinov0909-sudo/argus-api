@@ -153,18 +153,38 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       continue;
     }
 
-    const inserted = await client.query(
-      `INSERT INTO products
-         (warehouse_id, company_id, sku, name, category,
-          length_mm, width_mm, height_mm, weight_g, active, external_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-      [
-        warehouseId, companyId, sku, fields.name, fields.category,
-        fields.length_mm, fields.width_mm, fields.height_mm, fields.weight_g,
-        fields.active, externalId,
-      ],
-    );
-    results.push({ externalId, id: inserted.rows[0].id, status: 'created' });
+    // SAVEPOINT, not just try/catch: the whole batch runs inside one
+    // transaction (withTenantContext), and Postgres poisons the entire
+    // transaction after any failed statement — every query after it errors
+    // with "current transaction is aborted" even though the JS exception
+    // was caught. The savepoint gives one bad row something to roll back to
+    // without taking the other 499 rows in the batch down with it.
+    await client.query('SAVEPOINT sp_insert_product');
+    try {
+      const inserted = await client.query(
+        `INSERT INTO products
+           (warehouse_id, company_id, sku, name, category,
+            length_mm, width_mm, height_mm, weight_g, active, external_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+        [
+          warehouseId, companyId, sku, fields.name, fields.category,
+          fields.length_mm, fields.width_mm, fields.height_mm, fields.weight_g,
+          fields.active, externalId,
+        ],
+      );
+      await client.query('RELEASE SAVEPOINT sp_insert_product');
+      results.push({ externalId, id: inserted.rows[0].id, status: 'created' });
+    } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_insert_product');
+      // 1C "Код" isn't guaranteed unique across the whole catalog the way a
+      // real SKU would be — a second item can collide with (company, sku)
+      // once the first has already claimed it.
+      if (err.code === '23505') {
+        results.push({ externalId, status: 'error', error: `Дубликат SKU "${sku}" для этой компании` });
+        continue;
+      }
+      throw err;
+    }
   }
   return results;
 }
