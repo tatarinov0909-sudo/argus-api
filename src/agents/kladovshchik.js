@@ -40,4 +40,51 @@ async function findProducts(client, warehouseId, query) {
   return results;
 }
 
-module.exports = { findProducts };
+function formatBlockLabel(rowNum, block) {
+  const rackPart = block.rack_start === block.rack_end ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
+  const tierPart = block.tier_start === block.tier_end ? block.tier_start : `${block.tier_start}–${block.tier_end}`;
+  return `${rowNum}.${rackPart}.${tierPart}`;
+}
+
+// Подсказка ячейки при приёмке — чистое правило, без ИИ: сначала предложить
+// ячейку, где этот SKU уже лежит (не размазывать один товар по складу),
+// потом — просто свободную. Про габариты (влезет/не влезет) правила пока
+// нет — у товаров почти всегда пустые размеры (см. argus_1c_sync_status),
+// добавится само, когда данные появятся.
+async function suggestCells(client, warehouseId, sku, limit = 3) {
+  const sameSku = await client.query(
+    `SELECT DISTINCT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+     FROM cell_stock cs
+     JOIN cell_blocks cb ON cb.id = cs.cell_block_id
+     JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+     WHERE cs.warehouse_id = $1 AND cs.sku = $2
+     ORDER BY wr.row_num, cb.rack_start, cb.tier_start
+     LIMIT $3`,
+    [warehouseId, sku, limit],
+  );
+
+  const options = sameSku.rows.map((b) => ({
+    blockId: b.id,
+    label: formatBlockLabel(b.row_num, b),
+    reason: 'same_sku',
+  }));
+
+  if (options.length < limit) {
+    const empty = await client.query(
+      `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       FROM cell_blocks cb
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty'
+       ORDER BY wr.row_num, cb.rack_start, cb.tier_start
+       LIMIT $2`,
+      [warehouseId, limit - options.length],
+    );
+    for (const b of empty.rows) {
+      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'empty' });
+    }
+  }
+
+  return options;
+}
+
+module.exports = { findProducts, suggestCells };

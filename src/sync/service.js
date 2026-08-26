@@ -189,7 +189,7 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
   return results;
 }
 
-async function upsertInvoices(client, warehouseId, records) {
+async function upsertInvoices(client, warehouseId, records, options = {}) {
   const results = [];
   for (const rec of records) {
     const externalId = rec.externalId?.trim();
@@ -203,7 +203,10 @@ async function upsertInvoices(client, warehouseId, records) {
       continue;
     }
 
-    const companyId = await resolveCompany(client, warehouseId, rec.companyExternalId);
+    // Та же оговорка, что и у товаров: базы без связи документа с
+    // контрагентом (в частности старая УТ 10.3) шлют весь пуш под одну
+    // явно указанную владельцем компанию, не по externalId на запись.
+    const companyId = (await resolveCompany(client, warehouseId, rec.companyExternalId)) || options.defaultCompanyId || null;
     if (!companyId) {
       results.push({
         externalId, status: 'error',

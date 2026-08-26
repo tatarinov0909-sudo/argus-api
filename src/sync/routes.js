@@ -194,47 +194,54 @@ function pushHandler(upsertFn) {
 }
 
 router.post('/push/companies', requireAuth, requireRole('integration'), pushHandler(service.upsertCompanies));
-router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandler(service.upsertInvoices));
 
-// Separate from pushHandler: products can carry a batch-level defaultCompanyName,
-// for bases where nomenclature isn't linked to a counterparty at all (owner picks
-// one already-existing Argus company by name instead of per-record externalId).
-router.post('/push/products', requireAuth, requireRole('integration'), async (req, res, next) => {
-  try {
-    const { warehouseId, integrationKeyId } = req.auth;
-    const records = requireBatch(req.body);
-    const defaultCompanyName = req.body.defaultCompanyName?.trim();
-
-    const results = await withTenantContext({ warehouseId }, async (client) => {
-      let defaultCompanyId = null;
-      if (defaultCompanyName) {
-        const found = await client.query(
-          `SELECT id FROM companies WHERE warehouse_id = $1 AND name = $2`,
-          [warehouseId, defaultCompanyName],
-        );
-        if (!found.rows[0]) {
-          throw new HttpError(400, `Компания "${defaultCompanyName}" не найдена в Аргусе — создайте её в кабинете сначала`);
-        }
-        defaultCompanyId = found.rows[0].id;
-      }
-
-      const out = await service.upsertProducts(client, warehouseId, records, { defaultCompanyId });
-      await client.query(
-        `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
-        [integrationKeyId],
-      );
-      return out;
-    });
-
-    const summary = results.reduce((acc, r) => {
-      acc[r.status] = (acc[r.status] || 0) + 1;
-      return acc;
-    }, {});
-    res.json({ summary, results });
-  } catch (err) {
-    next(err);
+// Общий хелпер: базы без связи документа/номенклатуры с контрагентом
+// (в частности старая УТ 10.3) шлют весь пуш под одну явно указанную
+// владельцем компанию, а не по externalId на каждую запись.
+async function resolveDefaultCompanyId(client, warehouseId, defaultCompanyName) {
+  if (!defaultCompanyName) return null;
+  const found = await client.query(
+    `SELECT id FROM companies WHERE warehouse_id = $1 AND name = $2`,
+    [warehouseId, defaultCompanyName],
+  );
+  if (!found.rows[0]) {
+    throw new HttpError(400, `Компания "${defaultCompanyName}" не найдена в Аргусе — создайте её в кабинете сначала`);
   }
-});
+  return found.rows[0].id;
+}
+
+// Отдельно от pushHandler: и товары, и накладные могут нести пакетный
+// defaultCompanyName — см. resolveDefaultCompanyId выше.
+function pushHandlerWithDefaultCompany(upsertFn) {
+  return async (req, res, next) => {
+    try {
+      const { warehouseId, integrationKeyId } = req.auth;
+      const records = requireBatch(req.body);
+      const defaultCompanyName = req.body.defaultCompanyName?.trim();
+
+      const results = await withTenantContext({ warehouseId }, async (client) => {
+        const defaultCompanyId = await resolveDefaultCompanyId(client, warehouseId, defaultCompanyName);
+        const out = await upsertFn(client, warehouseId, records, { defaultCompanyId });
+        await client.query(
+          `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
+          [integrationKeyId],
+        );
+        return out;
+      });
+
+      const summary = results.reduce((acc, r) => {
+        acc[r.status] = (acc[r.status] || 0) + 1;
+        return acc;
+      }, {});
+      res.json({ summary, results });
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
+router.post('/push/products', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertProducts));
+router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertInvoices));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 
