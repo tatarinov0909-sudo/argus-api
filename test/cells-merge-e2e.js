@@ -248,6 +248,43 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(oldMerge.status, 404, `still reachable: ${JSON.stringify(oldMerge.body)}`);
     });
 
+    console.log('\nWiping the layout\n');
+
+    // Goods are still on the shelves at this point (SKU-KEEP, 25 units).
+    const wipeBlind = await api('DELETE', '/api/cells/rows', { token: ownerToken });
+    check('wiping a stocked warehouse is refused without confirmation', () => {
+      assert.equal(wipeBlind.status, 409, JSON.stringify(wipeBlind.body));
+    });
+    check('the refusal says what would be lost', () => {
+      assert.match(wipeBlind.body.error, /25 шт/, `vague warning: ${wipeBlind.body.error}`);
+    });
+    row = await getRow();
+    check('refused wipe changed nothing', () => {
+      assert.ok(row && row.blocks.length > 0, 'layout disappeared on a refused wipe');
+    });
+
+    const wipe = await api('DELETE', '/api/cells/rows?confirm=true', { token: ownerToken });
+    check('confirmed wipe succeeds', () => assert.equal(wipe.status, 200, JSON.stringify(wipe.body)));
+    check('wipe reports what it cleared', () => {
+      assert.equal(wipe.body.deletedRows, 1);
+      assert.ok(wipe.body.clearedUnits >= 25, JSON.stringify(wipe.body));
+    });
+
+    const afterWipe = await api('GET', '/api/cells/rows', { token: ownerToken });
+    check('warehouse is back to unconfigured', () => {
+      assert.deepEqual(afterWipe.body, [], JSON.stringify(afterWipe.body));
+    });
+    const zonesAfter = await api('GET', '/api/dropzones', { token: ownerToken });
+    check('unloading zones went with it', () => {
+      assert.deepEqual(zonesAfter.body, [], JSON.stringify(zonesAfter.body));
+    });
+
+    // An empty warehouse needs no confirmation — nothing to lose.
+    const wipeEmpty = await api('DELETE', '/api/cells/rows', { token: ownerToken });
+    check('wiping an empty warehouse needs no confirmation', () => {
+      assert.equal(wipeEmpty.status, 200, JSON.stringify(wipeEmpty.body));
+    });
+
   } finally {
     server.close();
   }

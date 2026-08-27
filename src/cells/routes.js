@@ -99,6 +99,49 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
   }
 });
 
+// Wipe the layout entirely and go back to "склад не настроен".
+//
+// Deleting warehouse_rows cascades to cell_blocks and on to cell_stock, so
+// this also erases the record of whatever is on the shelves. That is fine when
+// the shelves are empty and destructive when they are not, and the owner can't
+// tell which from the button — so a wipe that would take goods with it is
+// refused unless the request says so explicitly. The UI turns that refusal
+// into a warning naming what would be lost, instead of a generic "are you
+// sure?" that teaches people to click through.
+router.delete('/rows', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const confirmed = req.query.confirm === 'true';
+
+    const result = await withTenantContext({ warehouseId }, async (client) => {
+      // Зоны разгрузки — такая же часть схемы, и в них тоже числится товар,
+      // поэтому считаем и сносим их вместе с ячейками.
+      const stock = await client.query(
+        `SELECT
+           (SELECT count(*)::int FROM cell_stock WHERE warehouse_id = $1)
+           + (SELECT count(*)::int FROM dropzone_items WHERE warehouse_id = $1) AS positions,
+           (SELECT coalesce(sum(qty), 0)::int FROM cell_stock WHERE warehouse_id = $1)
+           + (SELECT coalesce(sum(qty), 0)::int FROM dropzone_items WHERE warehouse_id = $1) AS units`,
+        [warehouseId],
+      );
+      const { positions, units } = stock.rows[0];
+
+      if (positions > 0 && !confirmed) {
+        throw new HttpError(409, `В ячейках и зонах числится товар: ${positions} позиций, ${units} шт. Удаление схемы сотрёт эти записи.`);
+      }
+
+      const deleted = await client.query(
+        `DELETE FROM warehouse_rows WHERE warehouse_id = $1`, [warehouseId],
+      );
+      await client.query(`DELETE FROM dropzones WHERE warehouse_id = $1`, [warehouseId]);
+      return { deletedRows: deleted.rowCount, clearedPositions: positions, clearedUnits: units };
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Merge every block inside a rectangle into one, atomically.
 //
 // Replaced the old pairwise /blocks/merge, which was removed rather than kept
