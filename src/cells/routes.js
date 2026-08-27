@@ -99,37 +99,109 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
   }
 });
 
-router.post('/blocks/merge', requireAuth, requireRole('owner'), async (req, res, next) => {
+// Merge every block inside a rectangle into one, atomically.
+//
+// Replaced the old pairwise /blocks/merge, which was removed rather than kept
+// alongside: it took a bounding box of two arbitrary blocks without checking
+// that they were adjacent (so merging racks 1 and 5 produced a block sitting
+// on top of the untouched blocks 2-4), and it lost stock through the cascade
+// described below. A 1x2 rectangle covers everything it could legitimately do.
+//
+// This replaces pairwise merging for the UI: dragging a rectangle is a single
+// gesture, so it has to be a single server call. A chain of pairwise merges
+// driven from the browser leaves the layout half-merged whenever one step
+// fails, and a half-merged shelf is something a human has to untangle by hand.
+//
+// Unlike the old pairwise endpoint, this one EXPANDS one existing block and
+// moves the others' stock into it, instead of deleting every block and
+// inserting a fresh one. That is not a style preference: cell_stock is wired
+// to cell_blocks with ON DELETE CASCADE, so delete-then-insert silently
+// destroys the record of goods that are still physically on the shelf.
+router.post('/blocks/merge-rect', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { blockAId, blockBId } = req.body;
-    if (!blockAId || !blockBId) throw new HttpError(400, 'Не указаны ячейки для объединения');
+    const { rowNum, rackStart, rackEnd, tierStart, tierEnd } = req.body || {};
+
+    const bounds = [rowNum, rackStart, rackEnd, tierStart, tierEnd].map(Number);
+    if (bounds.some((n) => !Number.isInteger(n) || n < 1)) {
+      throw new HttpError(400, 'Неверно задана область объединения');
+    }
+    const [row, r0, r1, t0, t1] = bounds;
+    // Accept a rectangle dragged in any direction.
+    const rackLo = Math.min(r0, r1), rackHi = Math.max(r0, r1);
+    const tierLo = Math.min(t0, t1), tierHi = Math.max(t0, t1);
+    const area = (rackHi - rackLo + 1) * (tierHi - tierLo + 1);
+    if (area < 2) throw new HttpError(400, 'Выделите хотя бы две ячейки');
 
     const merged = await withTenantContext({ warehouseId }, async (client) => {
-      const result = await client.query(
-        `SELECT id, warehouse_row_id, rack_start, rack_end, tier_start, tier_end
-         FROM cell_blocks WHERE id = ANY($1::uuid[]) AND warehouse_id = $2`,
-        [[blockAId, blockBId], warehouseId],
+      const rowResult = await client.query(
+        `SELECT id, rack_count, tier_count FROM warehouse_rows
+         WHERE warehouse_id = $1 AND row_num = $2`,
+        [warehouseId, row],
       );
-      if (result.rows.length !== 2) throw new HttpError(404, 'Ячейки не найдены');
-      const [a, b] = result.rows;
-      if (a.warehouse_row_id !== b.warehouse_row_id) {
-        throw new HttpError(400, 'Можно объединять только ячейки одного ряда');
+      const warehouseRow = rowResult.rows[0];
+      if (!warehouseRow) throw new HttpError(404, 'Ряд не найден');
+      if (rackHi > warehouseRow.rack_count || tierHi > warehouseRow.tier_count) {
+        throw new HttpError(400, 'Область выходит за границы ряда');
       }
 
-      const rackStart = Math.min(a.rack_start, b.rack_start);
-      const rackEnd = Math.max(a.rack_end, b.rack_end);
-      const tierStart = Math.min(a.tier_start, b.tier_start);
-      const tierEnd = Math.max(a.tier_end, b.tier_end);
-
-      await client.query(`DELETE FROM cell_blocks WHERE id = ANY($1::uuid[])`, [[blockAId, blockBId]]);
-      const insertResult = await client.query(
-        `INSERT INTO cell_blocks (warehouse_row_id, warehouse_id, rack_start, rack_end, tier_start, tier_end)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, warehouse_row_id, rack_start, rack_end, tier_start, tier_end, state, fill_pct`,
-        [a.warehouse_row_id, warehouseId, rackStart, rackEnd, tierStart, tierEnd],
+      // FOR UPDATE so two owners dragging overlapping rectangles at once can't
+      // both pass the coverage check below and corrupt the layout.
+      const blocksResult = await client.query(
+        `SELECT id, rack_start, rack_end, tier_start, tier_end
+         FROM cell_blocks
+         WHERE warehouse_row_id = $1 AND warehouse_id = $2
+           AND rack_start <= $4 AND rack_end >= $3
+           AND tier_start <= $6 AND tier_end >= $5
+         ORDER BY tier_start, rack_start
+         FOR UPDATE`,
+        [warehouseRow.id, warehouseId, rackLo, rackHi, tierLo, tierHi],
       );
-      return insertResult.rows[0];
+      const blocks = blocksResult.rows;
+      if (blocks.length === 0) throw new HttpError(404, 'В этой области нет ячеек');
+
+      // A block that pokes outside the selection can't be swallowed without
+      // silently resizing the part the owner didn't select.
+      const sticksOut = blocks.some((b) => (
+        b.rack_start < rackLo || b.rack_end > rackHi
+        || b.tier_start < tierLo || b.tier_end > tierHi
+      ));
+      if (sticksOut) {
+        throw new HttpError(400, 'Выделение задевает объединённую ячейку — захватите её целиком');
+      }
+
+      // Blocks never overlap, so equal areas prove the rectangle is exactly tiled.
+      const covered = blocks.reduce((sum, b) => (
+        sum + (b.rack_end - b.rack_start + 1) * (b.tier_end - b.tier_start + 1)
+      ), 0);
+      if (covered !== area) throw new HttpError(400, 'В выделении есть пропуски');
+
+      if (blocks.length === 1) return blocks[0]; // already one block — nothing to do
+
+      const [keeper, ...absorbed] = blocks;
+      const absorbedIds = absorbed.map((b) => b.id);
+
+      // Move stock BEFORE deleting, or ON DELETE CASCADE takes it with them.
+      await client.query(
+        `UPDATE cell_stock SET cell_block_id = $1, updated_at = now()
+         WHERE cell_block_id = ANY($2::uuid[])`,
+        [keeper.id, absorbedIds],
+      );
+      await client.query(`DELETE FROM cell_blocks WHERE id = ANY($1::uuid[])`, [absorbedIds]);
+
+      const updated = await client.query(
+        `UPDATE cell_blocks
+         SET rack_start = $2, rack_end = $3, tier_start = $4, tier_end = $5,
+             state = CASE WHEN EXISTS (SELECT 1 FROM cell_stock WHERE cell_block_id = $1)
+                          THEN 'occupied'::cell_state ELSE 'empty'::cell_state END,
+             fill_pct = CASE WHEN EXISTS (SELECT 1 FROM cell_stock WHERE cell_block_id = $1)
+                             THEN 100 ELSE 0 END,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING id, warehouse_row_id, rack_start, rack_end, tier_start, tier_end, state, fill_pct`,
+        [keeper.id, rackLo, rackHi, tierLo, tierHi],
+      );
+      return updated.rows[0];
     });
     res.status(201).json(merged);
   } catch (err) {
@@ -151,7 +223,19 @@ router.post('/blocks/:id/split', requireAuth, requireRole('owner'), async (req, 
       const block = blockResult.rows[0];
       if (!block) throw new HttpError(404, 'Ячейка не найдена');
 
-      await client.query(`DELETE FROM cell_blocks WHERE id = $1`, [id]); // cascades cell_stock
+      // Splitting an occupied block is refused rather than guessed at. The
+      // goods sit somewhere inside the merged space; nothing in the data says
+      // which of the resulting cells that is, and the delete below cascades
+      // cell_stock — so guessing would either invent a location or quietly
+      // erase goods that are still on the shelf.
+      const stockResult = await client.query(
+        `SELECT count(*)::int AS n FROM cell_stock WHERE cell_block_id = $1`, [id],
+      );
+      if (stockResult.rows[0].n > 0) {
+        throw new HttpError(409, 'В ячейке лежит товар — разберите её после того, как товар заберут');
+      }
+
+      await client.query(`DELETE FROM cell_blocks WHERE id = $1`, [id]);
 
       const created = [];
       for (let r = block.rack_start; r <= block.rack_end; r++) {
