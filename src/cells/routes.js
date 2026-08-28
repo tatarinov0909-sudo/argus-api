@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { LIMITS, normalizeName } = require('../warehouses/naming');
 
 const router = express.Router();
 
@@ -12,7 +13,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const rowsResult = await client.query(
-        `SELECT id, row_num, rack_count, tier_count FROM warehouse_rows
+        `SELECT id, row_num, rack_count, tier_count, label FROM warehouse_rows
          WHERE warehouse_id = $1 ORDER BY row_num ASC`,
         [warehouseId],
       );
@@ -52,6 +53,28 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
     const { configs } = req.body; // [{ rackCount, tierCount }, ...]
     if (!Array.isArray(configs) || configs.length === 0) {
       throw new HttpError(400, 'Добавьте хотя бы один ряд');
+    }
+    if (configs.length > LIMITS.rows) {
+      throw new HttpError(400, `Рядов не больше ${LIMITS.rows}`);
+    }
+
+    // Потолки нужны здесь, а не только в браузере: ячейки создаются одной
+    // вставкой rackCount × tierCount строк, и запрос с парой лишних нулей
+    // положил бы базу. Раньше сервер принял бы любое число.
+    let cellsTotal = 0;
+    configs.forEach((c, i) => {
+      const racks = Math.max(1, parseInt(c.rackCount, 10) || 1);
+      const tiers = Math.max(1, parseInt(c.tierCount, 10) || 1);
+      if (racks > LIMITS.racksPerRow) {
+        throw new HttpError(400, `Ряд ${i + 1}: стеллажей не больше ${LIMITS.racksPerRow}`);
+      }
+      if (tiers > LIMITS.tiersPerRack) {
+        throw new HttpError(400, `Ряд ${i + 1}: ярусов не больше ${LIMITS.tiersPerRack}`);
+      }
+      cellsTotal += racks * tiers;
+    });
+    if (cellsTotal > LIMITS.cellsTotal) {
+      throw new HttpError(400, `Всего мест получается ${cellsTotal.toLocaleString('ru-RU')} — больше ${LIMITS.cellsTotal.toLocaleString('ru-RU')} склад не потянет`);
     }
 
     const rows = await withTenantContext({ warehouseId }, async (client) => {
@@ -99,6 +122,39 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
   }
 });
 
+// Своё имя для ряда. Пустое имя стирает название и возвращает номер.
+router.patch('/rows/:rowNum/name', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rowNum = Number(req.params.rowNum);
+    if (!Number.isInteger(rowNum) || rowNum < 1) throw new HttpError(400, 'Неверный номер ряда');
+    const label = normalizeName(req.body?.label, { what: 'ряда' });
+
+    const row = await withTenantContext({ warehouseId }, async (client) => {
+      try {
+        const result = await client.query(
+          `UPDATE warehouse_rows SET label = $3
+           WHERE warehouse_id = $1 AND row_num = $2
+           RETURNING id, row_num, rack_count, tier_count, label`,
+          [warehouseId, rowNum, label],
+        );
+        return result.rows[0] || null;
+      } catch (err) {
+        // Уникальный индекс по (склад, имя) — единственное место, где имя
+        // нельзя занять дважды даже двумя одновременными запросами.
+        if (err.code === '23505') {
+          throw new HttpError(409, `Ряд с названием «${label}» уже есть — адреса ячеек стали бы неоднозначными`);
+        }
+        throw err;
+      }
+    });
+    if (!row) throw new HttpError(404, 'Ряд не найден');
+    res.json(row);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Wipe the layout entirely and go back to "склад не настроен".
 //
 // Deleting warehouse_rows cascades to cell_blocks and on to cell_stock, so
@@ -114,7 +170,7 @@ router.delete('/rows', requireAuth, requireRole('owner'), async (req, res, next)
     const confirmed = req.query.confirm === 'true';
 
     const result = await withTenantContext({ warehouseId }, async (client) => {
-      // Зоны разгрузки — такая же часть схемы, и в них тоже числится товар,
+      // Зоны сортировки — такая же часть схемы, и в них тоже числится товар,
       // поэтому считаем и сносим их вместе с ячейками.
       const stock = await client.query(
         `SELECT

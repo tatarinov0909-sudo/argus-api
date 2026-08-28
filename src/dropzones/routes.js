@@ -2,8 +2,13 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { normalizeName } = require('../warehouses/naming');
 
 const router = express.Router();
+
+// Зон на складе столько же порядка, сколько рядов, и создаются они по одной
+// вставке — потолок нужен только чтобы поймать опечатку.
+const MAX_ZONES = 60;
 
 router.get('/', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
   try {
@@ -35,15 +40,18 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
     const { warehouseId } = req.auth;
     const { count } = req.body;
     const zoneCount = Math.max(0, parseInt(count, 10) || 0);
+    if (zoneCount > MAX_ZONES) throw new HttpError(400, `Зон не больше ${MAX_ZONES}`);
 
     const zones = await withTenantContext({ warehouseId }, async (client) => {
       await client.query(`DELETE FROM dropzones WHERE warehouse_id = $1`, [warehouseId]);
       const created = [];
       for (let i = 1; i <= zoneCount; i++) {
+        // label остаётся пустым: это место под имя, которое задаст владелец.
+        // Пока его нет, зона показывается по номеру.
         const result = await client.query(
-          `INSERT INTO dropzones (warehouse_id, zone_num, label) VALUES ($1, $2, $3)
+          `INSERT INTO dropzones (warehouse_id, zone_num) VALUES ($1, $2)
            RETURNING id, zone_num, label`,
-          [warehouseId, i, `Зона ${i}`],
+          [warehouseId, i],
         );
         created.push({ ...result.rows[0], items: [] });
       }
@@ -55,13 +63,43 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   }
 });
 
+// Своё имя для зоны. Пустое имя стирает название и возвращает номер.
+router.patch('/:zoneId/name', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { zoneId } = req.params;
+    const label = normalizeName(req.body?.label, { what: 'зоны' });
+
+    const zone = await withTenantContext({ warehouseId }, async (client) => {
+      try {
+        const result = await client.query(
+          `UPDATE dropzones SET label = $3
+           WHERE id = $1 AND warehouse_id = $2
+           RETURNING id, zone_num, label`,
+          [zoneId, warehouseId, label],
+        );
+        return result.rows[0] || null;
+      } catch (err) {
+        if (err.code === '23505') {
+          throw new HttpError(409, `Зона с названием «${label}» уже есть`);
+        }
+        throw err;
+      }
+    });
+    if (!zone) throw new HttpError(404, 'Зона не найдена');
+    res.json(zone);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/:zoneId/items', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { zoneId } = req.params;
     const { companyId, sku, qty, direction } = req.body;
     if (!sku || qty == null || !['in', 'out'].includes(direction)) {
-      throw new HttpError(400, 'Не хватает данных для позиции в зоне разгрузки');
+      throw new HttpError(400, 'Не хватает данных для позиции в зоне сортировки');
     }
 
     const item = await withTenantContext({ warehouseId }, async (client) => {
