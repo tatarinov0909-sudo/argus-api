@@ -13,7 +13,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const rowsResult = await client.query(
-        `SELECT id, row_num, rack_count, tier_count, label FROM warehouse_rows
+        `SELECT id, row_num, rack_count, tier_count, label, aisle_after FROM warehouse_rows
          WHERE warehouse_id = $1 ORDER BY row_num ASC`,
         [warehouseId],
       );
@@ -50,7 +50,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
 router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { configs } = req.body; // [{ rackCount, tierCount }, ...]
+    const { configs } = req.body; // [{ rackCount, tierCount, aisleAfter }, ...]
     if (!Array.isArray(configs) || configs.length === 0) {
       throw new HttpError(400, 'Добавьте хотя бы один ряд');
     }
@@ -85,15 +85,16 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
 
       const createdRows = [];
       for (let i = 0; i < configs.length; i++) {
-        const { rackCount, tierCount } = configs[i];
+        const { rackCount, tierCount, aisleAfter } = configs[i];
         const rackN = Math.max(1, parseInt(rackCount, 10) || 1);
         const tierN = Math.max(1, parseInt(tierCount, 10) || 1);
         const rowNum = i + 1;
 
         const rowResult = await client.query(
-          `INSERT INTO warehouse_rows (warehouse_id, row_num, rack_count, tier_count)
-           VALUES ($1, $2, $3, $4) RETURNING id, row_num, rack_count, tier_count`,
-          [warehouseId, rowNum, rackN, tierN],
+          `INSERT INTO warehouse_rows (warehouse_id, row_num, rack_count, tier_count, aisle_after)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id, row_num, rack_count, tier_count, aisle_after`,
+          // Проход после последнего ряда — это уже не проход, а край склада.
+          [warehouseId, rowNum, rackN, tierN, aisleAfter === true && i < configs.length - 1],
         );
         const row = rowResult.rows[0];
 
@@ -117,6 +118,44 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
       return createdRows;
     });
     res.status(201).json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Расстановка проходов. Массив идёт по порядку рядов: aisles[i] — есть ли
+// проход после ряда i+1. Последний элемент игнорируется: за последним рядом
+// проход нарисовать негде.
+router.patch('/rows/aisles', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { aisles } = req.body;
+    if (!Array.isArray(aisles)) throw new HttpError(400, 'Ожидается список проходов');
+
+    const rows = await withTenantContext({ warehouseId }, async (client) => {
+      const existing = await client.query(
+        `SELECT row_num FROM warehouse_rows WHERE warehouse_id = $1 ORDER BY row_num ASC`,
+        [warehouseId],
+      );
+      if (existing.rows.length !== aisles.length) {
+        throw new HttpError(400, `Рядов на складе ${existing.rows.length}, а проходов прислано ${aisles.length}`);
+      }
+      // Один UPDATE вместо запроса на ряд: расстановка меняется целиком, и
+      // частично применённая — это чужая схема склада.
+      const result = await client.query(
+        `UPDATE warehouse_rows AS wr SET aisle_after = v.flag
+         FROM unnest($2::int[], $3::boolean[]) AS v(row_num, flag)
+         WHERE wr.warehouse_id = $1 AND wr.row_num = v.row_num
+         RETURNING wr.row_num, wr.aisle_after`,
+        [
+          warehouseId,
+          existing.rows.map((r) => r.row_num),
+          aisles.map((flag, i) => flag === true && i < aisles.length - 1),
+        ],
+      );
+      return result.rows.sort((a, b) => a.row_num - b.row_num);
+    });
+    res.json(rows);
   } catch (err) {
     next(err);
   }

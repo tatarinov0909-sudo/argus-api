@@ -199,6 +199,66 @@ async function api(method, path, { token, body } = {}) {
     });
     check('a zone may reuse a row name', () => assert.equal(sameAsRow.status, 200, JSON.stringify(sameAsRow.body)));
 
+    console.log('');
+    console.log('Проходы');
+    console.log('');
+
+    // Проходы задаются при постройке и переставляются потом, не трогая товар.
+    const built = await api('POST', '/api/cells/rows', {
+      token,
+      body: {
+        configs: [
+          { rackCount: 2, tierCount: 2, aisleAfter: false },
+          { rackCount: 2, tierCount: 2, aisleAfter: true },
+          { rackCount: 2, tierCount: 2, aisleAfter: false },
+        ],
+      },
+    });
+    check('проходы принимаются прямо при постройке', () => {
+      assert.equal(built.status, 201, JSON.stringify(built.body));
+      assert.deepEqual(built.body.map((r) => r.aisle_after), [false, true, false]);
+    });
+
+    const laid = await api('GET', '/api/cells/rows', { token });
+    check('расстановка возвращается вместе со схемой', () => {
+      assert.deepEqual(laid.body.map((r) => r.aisle_after), [false, true, false]);
+    });
+
+    const moved = await api('PATCH', '/api/cells/rows/aisles', {
+      token, body: { aisles: [true, false, false] },
+    });
+    check('проход можно переставить', () => {
+      assert.equal(moved.status, 200, JSON.stringify(moved.body));
+      assert.deepEqual(moved.body.map((r) => r.aisle_after), [true, false, false]);
+    });
+
+    // Проход за последним рядом — это край склада, а не проход.
+    const trailing = await api('PATCH', '/api/cells/rows/aisles', {
+      token, body: { aisles: [false, false, true] },
+    });
+    check('проход после последнего ряда не сохраняется', () => {
+      assert.deepEqual(trailing.body.map((r) => r.aisle_after), [false, false, false]);
+    });
+
+    const wrongLength = await api('PATCH', '/api/cells/rows/aisles', {
+      token, body: { aisles: [true, false] },
+    });
+    check('список не по числу рядов отклоняется', () => {
+      assert.equal(wrongLength.status, 400, JSON.stringify(wrongLength.body));
+    });
+
+    const notArray = await api('PATCH', '/api/cells/rows/aisles', { token, body: { aisles: 'да' } });
+    check('не-список отклоняется', () => assert.equal(notArray.status, 400, JSON.stringify(notArray.body)));
+
+    // Переименование ряда не должно сбивать проходы, и наоборот.
+    await api('PATCH', '/api/cells/rows/aisles', { token, body: { aisles: [true, false, false] } });
+    await api('PATCH', '/api/cells/rows/1/name', { token, body: { label: 'Ы' } });
+    const after = await api('GET', '/api/cells/rows', { token });
+    check('имя и проход живут независимо', () => {
+      assert.equal(after.body[0].label, 'Ы');
+      assert.deepEqual(after.body.map((r) => r.aisle_after), [true, false, false]);
+    });
+
   } finally {
     server.close();
   }
