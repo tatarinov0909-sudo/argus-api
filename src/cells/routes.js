@@ -50,7 +50,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
 router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { configs } = req.body; // [{ rackCount, tierCount, aisleAfter }, ...]
+    const { configs } = req.body; // [{ rackCount, tierCount, aisleAfter, label }, ...]
     if (!Array.isArray(configs) || configs.length === 0) {
       throw new HttpError(400, 'Добавьте хотя бы один ряд');
     }
@@ -73,6 +73,26 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
       }
       cellsTotal += racks * tiers;
     });
+    // Имена разбираем заранее, до первой вставки: если восьмой ряд назван
+    // занятым именем, откатывать уже построенные семь неоткуда — запрос
+    // обязан упасть до того, как что-то создано.
+    const labels = configs.map((c, i) => {
+      try {
+        return normalizeName(c.label, { what: 'ряда' });
+      } catch (err) {
+        throw new HttpError(err.status || 400, `Ряд ${i + 1}: ${err.message}`);
+      }
+    });
+    const seen = new Set();
+    labels.forEach((label, i) => {
+      if (!label) return;
+      const key = label.toLowerCase();
+      if (seen.has(key)) {
+        throw new HttpError(409, `Ряд ${i + 1}: имя «${label}» уже занято другим рядом`);
+      }
+      seen.add(key);
+    });
+
     if (cellsTotal > LIMITS.cellsTotal) {
       throw new HttpError(400, `Всего мест получается ${cellsTotal.toLocaleString('ru-RU')} — больше ${LIMITS.cellsTotal.toLocaleString('ru-RU')} склад не потянет`);
     }
@@ -91,10 +111,11 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
         const rowNum = i + 1;
 
         const rowResult = await client.query(
-          `INSERT INTO warehouse_rows (warehouse_id, row_num, rack_count, tier_count, aisle_after)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id, row_num, rack_count, tier_count, aisle_after`,
+          `INSERT INTO warehouse_rows (warehouse_id, row_num, rack_count, tier_count, aisle_after, label)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, row_num, rack_count, tier_count, aisle_after, label`,
           // Проход после последнего ряда — это уже не проход, а край склада.
-          [warehouseId, rowNum, rackN, tierN, aisleAfter === true && i < configs.length - 1],
+          [warehouseId, rowNum, rackN, tierN, aisleAfter === true && i < configs.length - 1, labels[i]],
         );
         const row = rowResult.rows[0];
 

@@ -259,6 +259,74 @@ async function api(method, path, { token, body } = {}) {
       assert.deepEqual(after.body.map((r) => r.aisle_after), [true, false, false]);
     });
 
+    console.log('');
+    console.log('Имена прямо при постройке');
+    console.log('');
+
+    // Конструктор рисует схему целиком: имена задаются на ней, а не
+    // переименованием по одному после того, как склад уже построен.
+    const builtNamed = await api('POST', '/api/cells/rows', {
+      token,
+      body: {
+        configs: [
+          { rackCount: 2, tierCount: 2, label: 'А' },
+          { rackCount: 2, tierCount: 2, label: 'Б2' },
+          { rackCount: 2, tierCount: 2 },
+        ],
+      },
+    });
+    check('ряды создаются сразу с именами', () => {
+      assert.equal(builtNamed.status, 201, JSON.stringify(builtNamed.body));
+      assert.deepEqual(builtNamed.body.map((r) => r.label), ['А', 'Б2', null]);
+    });
+
+    const dupe = await api('POST', '/api/cells/rows', {
+      token,
+      body: { configs: [{ rackCount: 1, tierCount: 1, label: 'К' }, { rackCount: 1, tierCount: 1, label: 'к' }] },
+    });
+    check('два ряда с одним именем не строятся', () => {
+      assert.equal(dupe.status, 409, JSON.stringify(dupe.body));
+    });
+    check('отказ называет номер ряда', () => {
+      assert.match(dupe.body.error, /Ряд 2/, dupe.body.error);
+    });
+
+    // Отказ обязан случиться ДО первой вставки, иначе на складе осталась бы
+    // половина рядов от неудачной постройки.
+    const stillThere = await api('GET', '/api/cells/rows', { token });
+    check('неудачная постройка не тронула прежнюю схему', () => {
+      assert.deepEqual(stillThere.body.map((r) => r.label), ['А', 'Б2', null]);
+    });
+
+    const tooLongInBuild = await api('POST', '/api/cells/rows', {
+      token, body: { configs: [{ rackCount: 1, tierCount: 1, label: 'Слишком длинное' }] },
+    });
+    check('длинное имя при постройке отклоняется', () => {
+      assert.equal(tooLongInBuild.status, 400, JSON.stringify(tooLongInBuild.body));
+      assert.match(tooLongInBuild.body.error, /Ряд 1/, tooLongInBuild.body.error);
+    });
+
+    const zonesNamed = await api('POST', '/api/dropzones', {
+      token, body: { count: 3, labels: ['ПРМ', null, 'ОТГ'] },
+    });
+    check('зоны создаются сразу с именами', () => {
+      assert.equal(zonesNamed.status, 201, JSON.stringify(zonesNamed.body));
+      assert.deepEqual(zonesNamed.body.map((z) => z.label), ['ПРМ', null, 'ОТГ']);
+    });
+
+    const zoneDupeBuild = await api('POST', '/api/dropzones', {
+      token, body: { count: 2, labels: ['Ц', 'ц'] },
+    });
+    check('две зоны с одним именем не строятся', () => {
+      assert.equal(zoneDupeBuild.status, 409, JSON.stringify(zoneDupeBuild.body));
+    });
+
+    const zonesPlain = await api('POST', '/api/dropzones', { token, body: { count: 2 } });
+    check('без имён зоны создаются как раньше', () => {
+      assert.equal(zonesPlain.status, 201, JSON.stringify(zonesPlain.body));
+      assert.deepEqual(zonesPlain.body.map((z) => z.label), [null, null]);
+    });
+
   } finally {
     server.close();
   }

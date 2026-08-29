@@ -38,20 +38,38 @@ router.get('/', requireAuth, requireRole('owner', 'worker'), async (req, res, ne
 router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { count } = req.body;
+    const { count, labels: rawLabels } = req.body;
     const zoneCount = Math.max(0, parseInt(count, 10) || 0);
     if (zoneCount > MAX_ZONES) throw new HttpError(400, `Зон не больше ${MAX_ZONES}`);
+
+    // Имена приходят вместе с зонами из конструктора: человек называет их на
+    // схеме, а не идёт переименовывать по одной после постройки.
+    const given = Array.isArray(rawLabels) ? rawLabels : [];
+    const labels = [];
+    const seen = new Set();
+    for (let i = 0; i < zoneCount; i++) {
+      let label;
+      try {
+        label = normalizeName(given[i], { what: 'зоны' });
+      } catch (err) {
+        throw new HttpError(err.status || 400, `Зона ${i + 1}: ${err.message}`);
+      }
+      if (label) {
+        const key = label.toLowerCase();
+        if (seen.has(key)) throw new HttpError(409, `Зона ${i + 1}: имя «${label}» уже занято другой зоной`);
+        seen.add(key);
+      }
+      labels.push(label);
+    }
 
     const zones = await withTenantContext({ warehouseId }, async (client) => {
       await client.query(`DELETE FROM dropzones WHERE warehouse_id = $1`, [warehouseId]);
       const created = [];
       for (let i = 1; i <= zoneCount; i++) {
-        // label остаётся пустым: это место под имя, которое задаст владелец.
-        // Пока его нет, зона показывается по номеру.
         const result = await client.query(
-          `INSERT INTO dropzones (warehouse_id, zone_num) VALUES ($1, $2)
+          `INSERT INTO dropzones (warehouse_id, zone_num, label) VALUES ($1, $2, $3)
            RETURNING id, zone_num, label`,
-          [warehouseId, i],
+          [warehouseId, i, labels[i - 1]],
         );
         created.push({ ...result.rows[0], items: [] });
       }
