@@ -86,8 +86,12 @@ async function callDeepseek(apiKey, messages) {
 // findFn — тот же параметр для тестов, что и в orchestrator.js: заглушка
 // вместо реального kladovshchik.findProducts, чтобы проверять поведение
 // объяснения на заранее заданных фактах, без обращения к базе.
-async function ask(apiKey, dbClient, warehouseId, question, findFn = kladovshchik.findProducts) {
-  const messages = [{ role: 'user', content: question }];
+async function ask(apiKey, dbClient, warehouseId, question, findFn = kladovshchik.findProducts, history = []) {
+  // История идёт перед вопросом — именно она позволяет спросить «а в каком
+  // ряду?» вторым сообщением, не повторяя артикул. Дальше по коду в messages
+  // дописываются ходы модели и результаты агентов, поэтому история обязана
+  // лежать в самом начале.
+  const messages = [...history, { role: 'user', content: question }];
 
   const first = await callDeepseek(apiKey, messages);
   const firstMessage = first.choices[0].message;

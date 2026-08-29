@@ -362,6 +362,38 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(afterTiny.fill_pct, 1);
     });
 
+    console.log('');
+    console.log('Переписка с агентами');
+    console.log('');
+
+    // Таблица chat_messages создана отдельной миграцией, а setup-app-role.sql
+    // выдаёт права снимком на момент своего запуска и новые таблицы не
+    // покрывает. Забытый GRANT здесь выглядел бы как «permission denied» на
+    // первом же открытии чата — на этой ловушке проект уже спотыкался.
+    const ownChat = await api('GET', '/api/agents/chat', { token: ownerToken });
+    check('владелец читает свою переписку без ошибки прав', () => {
+      assert.equal(ownChat.status, 200, JSON.stringify(ownChat.body));
+      assert.ok(Array.isArray(ownChat.body), 'ожидался список сообщений');
+    });
+
+    const workerChat = await api('GET', '/api/agents/chat', { token: workerToken });
+    check('работник читает свою переписку, а не чужую', () => {
+      assert.equal(workerChat.status, 200, JSON.stringify(workerChat.body));
+      assert.ok(Array.isArray(workerChat.body));
+    });
+
+    // У продавца нет warehouseId в контексте (см. tenantContext.js), и лезть
+    // в переписку склада ему незачем.
+    const sellerChat = await api('GET', '/api/agents/chat', { token: sellerAToken });
+    check('продавцу переписка склада недоступна', () => {
+      assert.equal(sellerChat.status, 403, JSON.stringify(sellerChat.body));
+    });
+
+    const bigLimit = await api('GET', '/api/agents/chat?limit=99999', { token: ownerToken });
+    check('запрос гигантской истории не валит ручку', () => {
+      assert.equal(bigLimit.status, 200, JSON.stringify(bigLimit.body));
+    });
+
   } catch (err) {
     failures.push({ name: 'SETUP', message: err.message });
     console.log(`\n  SETUP ERROR: ${err.message}`);
