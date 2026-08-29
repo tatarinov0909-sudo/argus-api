@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
 
@@ -54,10 +55,10 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
            VALUES ($1, $2, $3, $4, $5)`,
           [cellBlockId, warehouseId, item.company_id, item.sku, acceptedQty],
         );
-        await client.query(
-          `UPDATE cell_blocks SET state = 'occupied', fill_pct = 100, updated_at = now() WHERE id = $1`,
-          [cellBlockId],
-        );
+        // Процент считается от того, сколько штук в ячейке, а не ставится в
+        // сотню при любом приходе: иначе ячейка с пятью штуками горит на карте
+        // так же, как забитая под завязку.
+        await refreshCellFill(client, cellBlockId);
       }
 
       const recordResult = await client.query(

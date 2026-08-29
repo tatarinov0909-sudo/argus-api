@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
 
@@ -188,17 +189,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
 
       // A block with nothing left in it goes back to being free space, so the
       // map and the receiving-side cell suggestions stay truthful.
-      const remainingInBlock = await client.query(
-        `SELECT COALESCE(SUM(qty), 0) AS qty FROM cell_stock WHERE cell_block_id = $1`,
-        [cellBlockId],
-      );
-      if (Number(remainingInBlock.rows[0].qty) === 0) {
-        await client.query(
-          `UPDATE cell_blocks SET state = 'empty', fill_pct = 0, updated_at = now()
-           WHERE id = $1`,
-          [cellBlockId],
-        );
-      }
+      // Забрали часть — ячейка не пустеет, но и полной больше не считается.
+      // Тот же пересчёт, что и на приёмке: одно место, одна формула.
+      await refreshCellFill(client, cellBlockId);
 
       const recordResult = await client.query(
         `INSERT INTO shipping_records

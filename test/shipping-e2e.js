@@ -328,6 +328,40 @@ async function api(method, path, { token, body } = {}) {
     check('seller cannot read the journal at all', () => {
       assert.equal(sellerJournal.status, 403, JSON.stringify(sellerJournal.body));
     });
+    console.log('');
+    console.log('Заполненность ячейки');
+    console.log('');
+
+    // Раньше приёмка ставила fill_pct = 100 при любом количестве, и карта
+    // красила оранжевым ячейку с горстью товара — то есть сообщала «склад
+    // забит», когда он почти пуст. Процент считается от условной вместимости
+    // в 500 штук (см. src/cells/fill.js).
+    const fillOf = async (blockId) => {
+      const fresh = await api('GET', '/api/cells/rows', { token: ownerToken });
+      return fresh.body.flatMap((r) => r.blocks).find((b) => b.id === blockId);
+    };
+
+    const fillCell = allBlocks[allBlocks.length - 1];
+    await receiveInto(fillCell.id, 'FILL-50', 50, companyAId, stamp + '-f1');
+    const afterSmall = await fillOf(fillCell.id);
+    check('50 штук из 500 — это 10 процентов, а не сто', () => {
+      assert.equal(afterSmall.state, 'occupied');
+      assert.equal(afterSmall.fill_pct, 10);
+    });
+
+    await receiveInto(fillCell.id, 'FILL-REST', 450, companyAId, stamp + '-f2');
+    const afterFull = await fillOf(fillCell.id);
+    check('пятьсот штук заполняют ячейку целиком', () => {
+      assert.equal(afterFull.fill_pct, 100);
+    });
+
+    const tinyCell = allBlocks[allBlocks.length - 2];
+    await receiveInto(tinyCell.id, 'FILL-ONE', 1, companyAId, stamp + '-f3');
+    const afterTiny = await fillOf(tinyCell.id);
+    check('одна штука не показывается как пустая ячейка', () => {
+      assert.equal(afterTiny.fill_pct, 1);
+    });
+
   } catch (err) {
     failures.push({ name: 'SETUP', message: err.message });
     console.log(`\n  SETUP ERROR: ${err.message}`);
