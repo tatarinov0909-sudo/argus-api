@@ -64,8 +64,10 @@ router.post('/orchestrator/ask', requireAuth, requireRole('owner', 'worker'), as
     const findFn = (_client, whId, query) => withTenantContext({ warehouseId: whId }, (client) => (
       kladovshchik.findProducts(client, whId, query)
     ));
-    const answer = await orchestrator.ask(process.env.DEEPSEEK_API_KEY, null, warehouseId, question, findFn);
-    res.json({ answer });
+    const { answer, steps } = await orchestrator.ask(
+      process.env.DEEPSEEK_API_KEY, null, warehouseId, question, findFn,
+    );
+    res.json({ answer, steps });
   } catch (err) {
     next(err);
   }
