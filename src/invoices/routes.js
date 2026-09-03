@@ -11,12 +11,13 @@ const router = express.Router();
 router.get('/', requireAuth, async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
-    // ?direction=in|out — the worker's receiving screen and picking screen are
-    // separate views over the same table. Omitted means "everything", so the
-    // owner's existing all-invoices list keeps working untouched.
+    // ?direction=in|out|return — the worker's receiving, picking, and returns
+    // screens are separate views over the same table. Omitted means
+    // "everything", so the owner's existing all-invoices list keeps working
+    // untouched.
     const { direction } = req.query;
-    if (direction && direction !== 'in' && direction !== 'out') {
-      throw new HttpError(400, 'direction может быть только in или out');
+    if (direction && !['in', 'out', 'return'].includes(direction)) {
+      throw new HttpError(400, 'direction может быть только in, out или return');
     }
     const rows = await withTenantContext(ctx, async (client) => {
       const result = await client.query(
@@ -49,6 +50,33 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       );
       const inv = invoiceResult.rows[0];
       if (!inv) return null;
+
+      // Returns aggregate like outbound does — one declared line can split
+      // across several quality buckets, not just several cells.
+      if (inv.direction === 'return') {
+        const itemsResult = await client.query(
+          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+                  COALESCE(SUM(rr.qty), 0) AS returned_qty,
+                  COALESCE(
+                    json_agg(
+                      json_build_object(
+                        'id', rr.id,
+                        'qty', rr.qty,
+                        'qualityBucket', rr.quality_bucket,
+                        'finishedAt', rr.finished_at
+                      ) ORDER BY rr.finished_at
+                    ) FILTER (WHERE rr.id IS NOT NULL),
+                    '[]'
+                  ) AS buckets
+           FROM invoice_items ii
+           LEFT JOIN return_records rr ON rr.invoice_item_id = ii.id
+           WHERE ii.invoice_id = $1
+           GROUP BY ii.id, ii.name, ii.sku, ii.declared_qty
+           ORDER BY ii.id`,
+          [id],
+        );
+        return { ...inv, items: itemsResult.rows };
+      }
 
       // Inbound keeps the flat one-record-per-item shape it always had.
       // Outbound aggregates instead, because one line can be picked from
@@ -116,8 +144,8 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
     if (!companyId || !number || !Array.isArray(items) || items.length === 0) {
       throw new HttpError(400, 'Укажите компанию, номер накладной и хотя бы одну позицию');
     }
-    if (direction !== 'in' && direction !== 'out') {
-      throw new HttpError(400, 'direction может быть только in или out');
+    if (!['in', 'out', 'return'].includes(direction)) {
+      throw new HttpError(400, 'direction может быть только in, out или return');
     }
     for (const it of items) {
       if (!it.name || !it.sku || it.declaredQty == null) {

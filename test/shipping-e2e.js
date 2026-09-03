@@ -245,10 +245,44 @@ async function api(method, path, { token, body } = {}) {
     });
 
     const doneInvoice = await api('GET', `/api/invoices/${out.body.id}`, { token: ownerToken });
-    check('invoice completed once every line is closed', () => {
-      assert.equal(doneInvoice.body.status, 'completed', doneInvoice.body.status);
+    check('invoice ready (собран) once every line is closed', () => {
+      assert.equal(doneInvoice.body.status, 'ready', doneInvoice.body.status);
       assert.equal(doneInvoice.body.items[0].closed, true);
       assert.equal(doneInvoice.body.items[0].picks.length, 2, 'expected both picks recorded');
+    });
+
+    // ---------- Ship confirmation: собран -> отгружен ----------
+    const freshOut = await api('POST', '/api/invoices', {
+      token: ownerToken,
+      body: {
+        companyId: companyAId, number: `OUT-EARLY-${stamp}`, direction: 'out',
+        items: [{ name: 'Widget', sku: 'SKU-1', declaredQty: 1 }],
+      },
+    });
+    const shipTooEarly = await api('POST', `/api/shipping/${freshOut.body.id}/ship`, { token: ownerToken });
+    check('cannot ship an order that is not fully ready', () => {
+      assert.equal(shipTooEarly.status, 409, JSON.stringify(shipTooEarly.body));
+    });
+
+    const shipInbound = await api('POST', `/api/shipping/${inboundInvoice.id}/ship`, { token: ownerToken });
+    check('cannot ship an inbound invoice', () => {
+      assert.equal(shipInbound.status, 400, JSON.stringify(shipInbound.body));
+    });
+
+    const shipped = await api('POST', `/api/shipping/${out.body.id}/ship`, { token: ownerToken });
+    check('owner can confirm shipment once ready', () => {
+      assert.equal(shipped.status, 200, JSON.stringify(shipped.body));
+      assert.equal(shipped.body.status, 'shipped');
+    });
+
+    const afterShip = await api('GET', `/api/invoices/${out.body.id}`, { token: ownerToken });
+    check('invoice status persists as shipped', () => {
+      assert.equal(afterShip.body.status, 'shipped', afterShip.body.status);
+    });
+
+    const doubleShip = await api('POST', `/api/shipping/${out.body.id}/ship`, { token: ownerToken });
+    check('already-shipped order cannot be shipped again', () => {
+      assert.equal(doubleShip.status, 409, JSON.stringify(doubleShip.body));
     });
 
     const reopen = await api('POST', '/api/shipping', {

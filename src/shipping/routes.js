@@ -247,7 +247,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         });
       }
 
-      // The invoice is done when every line has been explicitly closed.
+      // The invoice is done when every line has been explicitly closed —
+      // 'ready' (собран), not 'completed': picking finished is not the same
+      // event as the truck actually leaving, see POST /:id/ship below.
       const remaining = await client.query(
         `SELECT COUNT(*)::int AS n FROM invoice_items ii
          WHERE ii.invoice_id = $1 AND NOT EXISTS (
@@ -256,12 +258,52 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
          )`,
         [item.invoice_id],
       );
-      const newStatus = remaining.rows[0].n === 0 ? 'completed' : 'in_progress';
+      const newStatus = remaining.rows[0].n === 0 ? 'ready' : 'in_progress';
       await client.query(`UPDATE invoices SET status = $2 WHERE id = $1`, [item.invoice_id, newStatus]);
 
       return { ...recordResult.rows[0], totalPicked, declaredQty: declared };
     });
     res.status(201).json(record);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Marks an order as physically loaded and gone — a separate real-world event
+// from finishing the pick (a fully picked order can sit staged for hours).
+// Owner or worker can confirm it; no further state after this one.
+router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const { id } = req.params;
+
+    const invoice = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await client.query(
+        `SELECT id, number, status, direction FROM invoices WHERE id = $1 AND warehouse_id = $2`,
+        [id, warehouseId],
+      );
+      const inv = result.rows[0];
+      if (!inv) throw new HttpError(404, 'Накладная не найдена');
+      if (inv.direction !== 'out') throw new HttpError(400, 'Эта накладная не на отгрузку');
+      if (inv.status !== 'ready') {
+        throw new HttpError(409, 'Заказ ещё не полностью собран');
+      }
+
+      await client.query(`UPDATE invoices SET status = 'shipped' WHERE id = $1`, [id]);
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `Заказ «${inv.number}» отгружен.`,
+        entityType: 'invoice',
+        entityId: id,
+        actorType: staffKeyId ? 'worker' : 'owner',
+        actorId: staffKeyId || null,
+        status: 'auto',
+      });
+
+      return { id: inv.id, number: inv.number, status: 'shipped' };
+    });
+    res.json(invoice);
   } catch (err) {
     next(err);
   }
