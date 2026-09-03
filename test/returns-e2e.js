@@ -195,6 +195,34 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(returnEntries.length, 3, `got ${returnEntries.length} entries`);
     });
 
+    // ---------- Брак не уезжает клиенту ----------
+    // Брак и ждущий перепаковки товар лежат в обычных ячейках, и до появления
+    // состояния на остатке отгрузка честно предлагала работнику взять их для
+    // клиентского заказа: 5 штук брака в ячейке — «нехватка 0».
+    const outAfterReturn = await api('POST', '/api/invoices', {
+      token: ownerToken,
+      body: {
+        companyId, number: `OUT-AFTER-RET-${stamp}`, direction: 'out',
+        items: [{ name: 'Lemonade', sku: 'SKU-RET', declaredQty: 10 }],
+      },
+    });
+    const sugg = await api('GET', `/api/shipping/suggest/${outAfterReturn.body.items[0].id}`, {
+      token: workerToken,
+    });
+    check('к отбору предлагается только годное, брак не виден', () => {
+      assert.equal(sugg.status, 200, JSON.stringify(sugg.body));
+      assert.equal(sugg.body.totalAvailable, 7, 'на полке 7 годных: 7 из возврата');
+      assert.equal(sugg.body.shortfall, 3, 'о нехватке говорит честно, а не прикрывает её браком');
+    });
+
+    const takeDefective = await api('POST', '/api/shipping', {
+      token: workerToken,
+      body: { invoiceItemId: outAfterReturn.body.items[0].id, pickedQty: 8, cellBlockId: cell.id },
+    });
+    check('взять больше, чем годного в ячейке, нельзя даже вручную', () => {
+      assert.equal(takeDefective.status, 409, JSON.stringify(takeDefective.body));
+    });
+
     // ---------- Tenant isolation on the new table ----------
     const key = await api('POST', `/api/sellers/companies/${companyId}/keys`, { token: ownerToken });
     const seller = await api('POST', '/api/auth/seller/login', {

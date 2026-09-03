@@ -16,7 +16,7 @@ const SYSTEM_PROMPT = `Ты — Оркестратор склада Аргус. 
 // только оборачивают его по-разному (см. orchestrator.js / orchestratorDeepseek.js).
 const FIND_PRODUCTS_TOOL = {
   name: 'find_products',
-  description: 'Ищет товары на складе по артикулу (SKU) или части названия. Возвращает точные остатки и адреса ячеек.',
+  description: 'Ищет товары по артикулу (SKU) или части названия: адреса ячеек, сколько всего и сколько из этого годного (availableQty) — отгрузить можно только годное.',
   parameters: {
     type: 'object',
     properties: {
@@ -77,10 +77,16 @@ const SUGGEST_CELL_TOOL = {
   },
 };
 
+const PICK_LIST_TOOL = {
+  name: 'pick_list',
+  description: 'Лист грузчика: что собирать по всем незакрытым заказам сразу — товар просуммирован, ячейки в порядке обхода, видно нехватку.',
+  parameters: { type: 'object', properties: {} },
+};
+
 // Порядок важен только для читаемости — модель выбирает по описанию.
 const ALL_TOOLS = [
   FIND_PRODUCTS_TOOL, SUGGEST_CELL_TOOL, LIST_INVOICES_TOOL,
-  INVOICE_DETAILS_TOOL, WAREHOUSE_SUMMARY_TOOL, DISCREPANCIES_TOOL,
+  INVOICE_DETAILS_TOOL, WAREHOUSE_SUMMARY_TOOL, DISCREPANCIES_TOOL, PICK_LIST_TOOL,
 ];
 
 // Все инструменты — это работа Кладовщика: приёмка, размещение, отгрузка,

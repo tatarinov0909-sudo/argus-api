@@ -185,6 +185,15 @@ function warehouseIdOf(token) {
       assert.equal(foundByName[0].name, 'Лимонад Лайм');
     });
 
+    check('годное и брак в поиске разделены, а не свалены в одну цифру', () => {
+      // 8 принятых + 3 годных из возврата = 11 к отгрузке; 2 брака лежат
+      // на той же полке, но клиенту не уедут — и в ответе это видно.
+      assert.equal(foundBySku[0].totalQty, 11, JSON.stringify(foundBySku[0]));
+      assert.equal(foundBySku[0].availableQty, 11);
+      assert.equal(foundBySku[0].notForSaleQty, 0, 'брак в этом тесте без ячейки');
+      assert.ok(foundBySku[0].locations.every((l) => l.state === 'годный'));
+    });
+
     const nothing = await run((c) => kladovshchik.findProducts(c, warehouseId, 'ЧЕГО-ТО-НЕТ'));
     check('несуществующий товар остаётся пустым списком', () => {
       assert.equal(nothing.length, 0);

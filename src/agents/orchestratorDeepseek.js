@@ -30,6 +30,7 @@ function taskLabel(name, args) {
     case 'invoice_details': return `посмотреть накладную «${args.number}»`;
     case 'warehouse_summary': return 'проверить состояние склада';
     case 'list_discrepancies': return 'собрать расхождения';
+    case 'pick_list': return 'собрать лист грузчика';
     case 'list_invoices': {
       const kind = { in: 'приёмки', out: 'отгрузки', return: 'возвраты' }[args.direction];
       return kind ? `посмотреть ${kind}` : 'посмотреть накладные';

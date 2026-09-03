@@ -5,6 +5,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
+const { buildPickList, parseInvoiceIds } = require('./pickList');
 
 const router = express.Router();
 
@@ -45,6 +46,7 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
          JOIN cell_blocks cb ON cb.id = cs.cell_block_id
          JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
          WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3 AND cs.qty > 0
+           AND cs.quality = 'good'
          GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.rack_end,
                   cb.tier_start, cb.tier_end
          HAVING SUM(cs.qty) > 0
@@ -104,6 +106,23 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
   }
 });
 
+// «Лист грузчика» — один обход склада на несколько заказов сразу.
+// ?invoiceIds=a,b,c — конкретные заказы; без параметра берутся все, что ждут
+// отбора. Кладовщик здесь именно сводит, а не решает: количество и маршрут —
+// арифметика (см. pickList.js).
+router.get('/pick-list', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const invoiceIds = parseInvoiceIds(req.query.invoiceIds);
+    const list = await withTenantContext({ warehouseId }, (client) => (
+      buildPickList(client, warehouseId, invoiceIds)
+    ));
+    res.json(list);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Worker records one pick: how much was taken out of which cell. Called once
 // per cell visited, with isFinal on the last one to close the line item.
 router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
@@ -150,9 +169,11 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       // cell at once can't both pass the availability check and drive qty
       // negative — the second one waits here and then sees the real remainder.
       const stockResult = await client.query(
+        // quality = 'good': брак и ждущий перепаковки товар физически лежат в
+        // ячейках, но клиенту не уезжают ни при каких условиях.
         `SELECT id, qty FROM cell_stock
          WHERE cell_block_id = $1 AND warehouse_id = $2 AND company_id = $3 AND sku = $4
-           AND qty > 0
+           AND qty > 0 AND quality = 'good'
          ORDER BY updated_at
          FOR UPDATE`,
         [cellBlockId, warehouseId, item.company_id, item.sku],

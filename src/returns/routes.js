@@ -69,10 +69,12 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         );
         if (!blockResult.rows[0]) throw new HttpError(404, 'Ячейка не найдена');
 
+        // Состояние едет в остаток вместе с количеством: брак на полке обязан
+        // отличаться от годного, иначе отгрузка предложит его клиенту.
         await client.query(
-          `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [cellBlockId, warehouseId, item.company_id, item.sku, qty],
+          `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [cellBlockId, warehouseId, item.company_id, item.sku, qty, qualityBucket],
         );
         await refreshCellFill(client, cellBlockId);
       }

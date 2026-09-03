@@ -41,27 +41,39 @@ async function findProducts(client, warehouseId, query) {
     // одна и та же ячейка возвращалась дважды — человек слышал «94 штуки и ещё
     // 9 там же», хотя ячейка одна и в ней 103.
     const stock = await client.query(
-      `SELECT SUM(cs.qty) AS qty, wr.row_num, cb.rack_start, cb.rack_end,
+      `SELECT SUM(cs.qty) AS qty, cs.quality, wr.row_num, cb.rack_start, cb.rack_end,
               cb.tier_start, cb.tier_end
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        WHERE cs.warehouse_id = $1 AND cs.sku = $2
-       GROUP BY cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       GROUP BY cb.id, cs.quality, wr.row_num, cb.rack_start, cb.rack_end,
+                cb.tier_start, cb.tier_end
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
       [warehouseId, p.sku],
     );
+    // Годное и брак считаем раздельно и говорим об этом вслух. Иначе на
+    // вопрос «сколько можно отгрузить» ответ включал бы брак, лежащий на той
+    // же полке, — то есть обещал бы клиенту товар, который ему не уедет.
+    const qualityName = { good: 'годный', defective: 'брак', packaging_defect: 'брак упаковки' };
+    const availableQty = stock.rows
+      .filter((r) => r.quality === 'good')
+      .reduce((sum, r) => sum + Number(r.qty), 0);
+    const totalQty = stock.rows.reduce((sum, r) => sum + Number(r.qty), 0);
     results.push({
       sku: p.sku,
       name: p.name,
       category: p.category,
       weightG: p.weight_g,
-      totalQty: stock.rows.reduce((sum, r) => sum + Number(r.qty), 0),
+      totalQty,
+      availableQty,
+      notForSaleQty: totalQty - availableQty,
       locations: stock.rows.map((r) => ({
         row: r.row_num,
         rackFrom: r.rack_start, rackTo: r.rack_end,
         tierFrom: r.tier_start, tierTo: r.tier_end,
         qty: Number(r.qty),
+        state: qualityName[r.quality] || r.quality,
       })),
     });
   }
@@ -218,6 +230,16 @@ async function warehouseSummary(client, warehouseId) {
      FROM cell_stock WHERE warehouse_id = $1`,
     [warehouseId],
   );
+  // Сколько лежит В КАКОМ состоянии — это про сейчас, в отличие от разбора
+  // возвратов ниже, который про историю. Владельцу нужны обе цифры: «сколько
+  // брака приехало за всё время» и «сколько брака занимает полки прямо
+  // сейчас» — это разные вопросы.
+  const byQuality = await client.query(
+    `SELECT quality, COALESCE(SUM(qty), 0) AS qty
+     FROM cell_stock WHERE warehouse_id = $1 AND qty > 0
+     GROUP BY quality`,
+    [warehouseId],
+  );
   const returns = await client.query(
     `SELECT quality_bucket, COALESCE(SUM(qty), 0) AS qty
      FROM return_records WHERE warehouse_id = $1
@@ -239,6 +261,9 @@ async function warehouseSummary(client, warehouseId) {
     averageFillOfOccupiedPct: c.avg_fill,
     distinctSkus: stock.rows[0].skus,
     totalUnits: Number(stock.rows[0].units),
+    onShelvesByState: byQuality.rows.map((r) => ({
+      state: bucketLabel[r.quality] || r.quality, qty: Number(r.qty),
+    })),
     openDocuments: openDocs.rows[0].n,
     returned: returns.rows.map((r) => ({
       state: bucketLabel[r.quality_bucket] || r.quality_bucket, qty: Number(r.qty),
@@ -263,6 +288,27 @@ async function listDiscrepancies(client, warehouseId, { limit = 15 } = {}) {
   }));
 }
 
+// «Что собирать» — тот же лист грузчика, что и у работника на экране, только
+// пересказанный словами. Живёт в shipping/pickList.js: одно правило на оба
+// входа, чтобы агент не отвечал по одной логике, а экран показывал другую.
+async function pickList(client, warehouseId) {
+  const { buildPickList } = require('../shipping/pickList');
+  const list = await buildPickList(client, warehouseId, []);
+  return {
+    orders: list.orders,
+    totalUnits: list.totalUnits,
+    cellsToVisit: list.cellsToVisit,
+    lines: list.lines.map((l) => ({
+      sku: l.sku,
+      name: l.name,
+      needQty: l.needQty,
+      shortfall: l.shortfall,
+      cells: l.cells.map((c) => ({ cell: c.label, take: c.take })),
+      forOrders: l.perOrder.map((o) => ({ order: o.invoiceNumber, qty: o.qty })),
+    })),
+  };
+}
+
 // Единственное место, где имя инструмента превращается в вызов. Модель называет
 // имя и аргументы, а что выполнится — решает эта таблица: имя не из списка
 // просто не выполняется. Транзакцию открывает вызывающий (см. routes.js) —
@@ -280,6 +326,8 @@ function runTool(client, warehouseId, name, args = {}) {
       return invoiceDetails(client, warehouseId, String(args.number || ''));
     case 'warehouse_summary':
       return warehouseSummary(client, warehouseId);
+    case 'pick_list':
+      return pickList(client, warehouseId);
     case 'list_discrepancies':
       return listDiscrepancies(client, warehouseId, {});
     default:
@@ -289,6 +337,6 @@ function runTool(client, warehouseId, name, args = {}) {
 
 module.exports = {
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary,
-  listDiscrepancies, runTool,
+  listDiscrepancies, pickList, runTool,
 };
 

@@ -4,6 +4,8 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
 const { CELL_CAPACITY_UNITS } = require('./fill');
+const { moveStock } = require('./move');
+const journal = require('../journal/repository');
 
 const router = express.Router();
 
@@ -412,6 +414,60 @@ router.post('/blocks/:id/split', requireAuth, requireRole('owner'), async (req, 
       return created;
     });
     res.status(201).json(cells);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const QUALITY_LABEL = {
+  good: 'годный',
+  defective: 'брак',
+  packaging_defect: 'брак упаковки',
+};
+
+// Переставить товар в другую ячейку и/или сменить его состояние.
+// Главный случай — перепаковка: «брак упаковки» после перепаковки становится
+// годным и возвращается в продажу. Работник, а не владелец: это физическое
+// действие на складе, как приёмка и отбор.
+router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const {
+      sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality = 'good', toQuality,
+    } = req.body;
+
+    for (const q of [fromQuality, toQuality].filter(Boolean)) {
+      if (!QUALITY_LABEL[q]) {
+        throw new HttpError(400, 'Состояние может быть good, defective или packaging_defect');
+      }
+    }
+
+    const moved = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await moveStock(client, warehouseId, {
+        sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality, toQuality,
+      });
+
+      const changedState = result.toQuality !== result.fromQuality;
+      const changedCell = result.toCellBlockId !== result.fromCellBlockId;
+      const parts = [];
+      if (changedState) {
+        parts.push(`состояние: ${QUALITY_LABEL[result.fromQuality]} → ${QUALITY_LABEL[result.toQuality]}`);
+      }
+      if (changedCell) parts.push('переставил в другую ячейку');
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `Переместил «${result.sku}», ${result.qty} шт. — ${parts.join(', ')}.`,
+        entityType: 'cell_block',
+        entityId: result.toCellBlockId,
+        actorType: 'worker',
+        actorId: staffKeyId,
+        status: 'auto',
+      });
+
+      return result;
+    });
+    res.status(201).json(moved);
   } catch (err) {
     next(err);
   }
