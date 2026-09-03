@@ -9,8 +9,10 @@ rationale (why this schema, why RLS, what's deliberately deferred to later phase
 ## Stack
 
 Node.js + Express, PostgreSQL with Row-Level Security for tenant isolation, JWT auth.
-The static frontend (separate repo, `C:\Users\tatar\Desktop\argus-1`) stays where it
-is on reg.ru shared hosting and calls this API at `https://api.argus-ai.online`.
+The static frontend is two separate repos — [argus-product](https://github.com/tatarinov0909-sudo/argus-product)
+(the working app: owner cabinet, worker screen, seller access) and
+[argus-landing](https://github.com/tatarinov0909-sudo/argus-landing) (marketing page only) —
+both on reg.ru shared hosting, calling this API at `https://api.argus-ai.online`.
 
 ## Local setup
 
