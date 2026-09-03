@@ -61,21 +61,25 @@ router.post('/orchestrator/ask', requireAuth, requireRole('owner', 'worker'), as
     const authorId = chatHistory.authorIdFromAuth(req.auth);
 
     // Историю читаем ДО обращения к модели и отдельной короткой транзакцией —
-    // по той же причине, что и findFn ниже: соединение с базой не должно
+    // по той же причине, что и вызовы инструментов ниже: соединение с базой не должно
     // висеть открытым, пока мы ждём ответа по сети.
     const past = await withTenantContext({ warehouseId }, (client) => (
       chatHistory.loadRecent(client, warehouseId, authorId)
     ));
 
-    // Каждый вызов findFn открывает свою короткую транзакцию — БД-соединение
+    // Каждый вызов инструмента открывает свою короткую транзакцию — БД-соединение
     // не держится открытым на время внешних HTTP-вызовов к DeepSeek (которые
     // могут идти секундами); иначе под конкурентной нагрузкой это вычерпывает
     // пул соединений и останавливает вообще все остальные ручки.
-    const findFn = (_client, whId, query) => withTenantContext({ warehouseId: whId }, (client) => (
-      kladovshchik.findProducts(client, whId, query)
+    //
+    // Что именно выполнится по имени инструмента — решает kladovshchik.runTool,
+    // не модель: имя не из списка просто не выполняется.
+    const runTool = (name, args) => withTenantContext({ warehouseId }, (client) => (
+      kladovshchik.runTool(client, warehouseId, name, args)
     ));
+
     const { answer, steps } = await orchestrator.ask(
-      process.env.DEEPSEEK_API_KEY, null, warehouseId, question, findFn,
+      process.env.DEEPSEEK_API_KEY, null, warehouseId, question, runTool,
       chatHistory.toModelMessages(past),
     );
 

@@ -3,14 +3,15 @@
 // нужного агента (сейчас только Кладовщика), получает сухие факты из БД
 // и превращает их в ответ. Сам ничего не решает и не считает — только
 // объясняет то, что уже вычислено правилами.
-const kladovshchik = require('./kladovshchik');
-const { SYSTEM_PROMPT, FIND_PRODUCTS_TOOL } = require('./orchestratorPrompt');
+const { SYSTEM_PROMPT, ALL_TOOLS, AGENT_BY_TOOL } = require('./orchestratorPrompt');
 
-const TOOLS = [{
-  name: FIND_PRODUCTS_TOOL.name,
-  description: FIND_PRODUCTS_TOOL.description,
-  input_schema: FIND_PRODUCTS_TOOL.parameters,
-}];
+// Anthropic называет схему input_schema, DeepSeek — parameters; сам JSON Schema
+// внутри один и тот же (см. orchestratorPrompt.js).
+const TOOLS = ALL_TOOLS.map((t) => ({
+  name: t.name,
+  description: t.description,
+  input_schema: t.parameters,
+}));
 
 function textOf(response) {
   return response.content
@@ -19,10 +20,13 @@ function textOf(response) {
     .join('\n');
 }
 
-// findFn — параметр для тестов: подставляют заглушку вместо реального
-// kladovshchik.findProducts, чтобы проверять поведение объяснения на
-// заранее заданных фактах, без обращения к базе.
-async function ask(anthropic, dbClient, warehouseId, question, findFn = kladovshchik.findProducts) {
+// runTool(name, args) — единственный способ дотянуться до данных; тот же
+// контракт, что и в orchestratorDeepseek.js, чтобы обе версии оставались
+// взаимозаменяемыми. Тесты подставляют заглушку с заранее заданными фактами.
+async function ask(anthropic, dbClient, warehouseId, question, runTool) {
+  if (typeof runTool !== 'function') {
+    throw new Error('orchestrator.ask: не передан runTool — агенту нечем взять данные');
+  }
   const messages = [{ role: 'user', content: question }];
 
   const first = await anthropic.messages.create({
@@ -34,7 +38,7 @@ async function ask(anthropic, dbClient, warehouseId, question, findFn = kladovsh
   });
 
   if (first.stop_reason !== 'tool_use') {
-    return textOf(first);
+    return { answer: textOf(first), steps: [] };
   }
 
   // Модель может вызвать инструмент несколько раз параллельно в одном ходу
@@ -42,12 +46,21 @@ async function ask(anthropic, dbClient, warehouseId, question, findFn = kladovsh
   // API требует tool_result на КАЖДЫЙ tool_use в одном следующем сообщении —
   // отправка только первого ломает запрос целиком.
   const toolUses = first.content.filter((b) => b.type === 'tool_use');
+  const steps = [];
   const toolResults = await Promise.all(
-    toolUses.map(async (tu) => ({
-      type: 'tool_result',
-      tool_use_id: tu.id,
-      content: JSON.stringify(await findFn(dbClient, warehouseId, tu.input.query)),
-    })),
+    toolUses.map(async (tu) => {
+      const result = await runTool(tu.name, tu.input);
+      steps.push({
+        agent: AGENT_BY_TOOL[tu.name] || 'Кладовщик',
+        task: tu.name,
+        found: Array.isArray(result) ? result.length : null,
+      });
+      return {
+        type: 'tool_result',
+        tool_use_id: tu.id,
+        content: JSON.stringify(result),
+      };
+    }),
   );
 
   messages.push({ role: 'assistant', content: first.content });
@@ -64,7 +77,10 @@ async function ask(anthropic, dbClient, warehouseId, question, findFn = kladovsh
   // Модель теоретически может запросить инструмент и на втором ходу — этот
   // слой второй раунд не поддерживает, честно говорим об этом, а не отдаём
   // пустой ответ.
-  return textOf(second) || 'Не удалось до конца сформулировать ответ — уточните вопрос.';
+  return {
+    answer: textOf(second) || 'Не удалось до конца сформулировать ответ — уточните вопрос.',
+    steps,
+  };
 }
 
 module.exports = { ask };

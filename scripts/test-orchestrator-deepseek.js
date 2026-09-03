@@ -20,7 +20,7 @@ async function main() {
     const stubFind = async () => c.mockResults;
     let answer;
     try {
-      answer = await ask(process.env.DEEPSEEK_API_KEY, null, null, c.question, stubFind);
+      ({ answer } = await ask(process.env.DEEPSEEK_API_KEY, null, null, c.question, stubFind));
     } catch (e) {
       console.log(`\n[ОШИБКА] ${c.name}: ${e.message}`);
       continue;
