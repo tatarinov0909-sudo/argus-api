@@ -24,7 +24,8 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
                 cb.state, cb.fill_pct,
                 COALESCE(json_agg(json_build_object(
-                  'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty
+                  'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
+                  'quality', cs.quality
                 ) ORDER BY cs.updated_at) FILTER (WHERE cs.id IS NOT NULL), '[]') AS stock
          FROM cell_blocks cb
          LEFT JOIN cell_stock cs ON cs.cell_block_id = cb.id
