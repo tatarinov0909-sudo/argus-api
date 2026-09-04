@@ -37,12 +37,21 @@ router.get('/kladovshchik/suggest-cell', requireAuth, requireRole('owner', 'work
   try {
     const sku = req.query.sku?.trim();
     if (!sku) throw new HttpError(400, 'Укажите ?sku= — для какого товара подобрать ячейку');
+    // Компания необязательна, но с ней подсказка идёт туда, где у этого
+    // продавца уже сложилась зона, а не куда попало.
+    const companyId = req.query.companyId?.trim() || null;
 
-    const { warehouseId } = req.auth;
-    const options = await withTenantContext({ warehouseId }, (client) => (
-      kladovshchik.suggestCells(client, warehouseId, sku)
-    ));
-    res.json({ options });
+    const { warehouseId, staffKeyId } = req.auth;
+    const result = await withTenantContext({ warehouseId }, async (client) => {
+      const options = await kladovshchik.suggestCells(client, warehouseId, sku, companyId);
+      // Что предложили — записываем сразу: потом эту же подсказку уже не
+      // пересчитать, склад изменится.
+      const suggestionId = await kladovshchik.recordSuggestion(client, warehouseId, {
+        sku, companyId, workerKeyId: staffKeyId, options,
+      });
+      return { options, suggestionId };
+    });
+    res.json(result);
   } catch (err) {
     next(err);
   }

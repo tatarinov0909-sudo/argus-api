@@ -91,33 +91,69 @@ function formatBlockLabel(rowNum, block) {
 // потом — просто свободную. Про габариты (влезет/не влезет) правила пока
 // нет — у товаров почти всегда пустые размеры (см. argus_1c_sync_status),
 // добавится само, когда данные появятся.
-async function suggestCells(client, warehouseId, sku, limit = 3) {
+async function suggestCells(client, warehouseId, sku, companyId = null, limit = 3) {
+  const options = [];
+
+  // 1. Тот же артикул. Не размазывать один товар по складу — работник идёт за
+  //    ним в одно место, а не собирает по всему залу.
   const sameSku = await client.query(
     `SELECT DISTINCT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      FROM cell_stock cs
      JOIN cell_blocks cb ON cb.id = cs.cell_block_id
      JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-     WHERE cs.warehouse_id = $1 AND cs.sku = $2
+     WHERE cs.warehouse_id = $1 AND cs.sku = $2 AND cs.quality = 'good'
      ORDER BY wr.row_num, cb.rack_start, cb.tier_start
      LIMIT $3`,
     [warehouseId, sku, limit],
   );
+  for (const b of sameSku.rows) {
+    options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'same_sku' });
+  }
 
-  const options = sameSku.rows.map((b) => ({
-    blockId: b.id,
-    label: formatBlockLabel(b.row_num, b),
-    reason: 'same_sku',
-  }));
+  // 2. Свободная ячейка ТАМ, ГДЕ УЖЕ ЛЕЖИТ ТОВАР ЭТОГО ПРОДАВЦА.
+  //
+  //    Аргус приходит на склад, который год работал по своему порядку: у
+  //    продавцов сложились свои ряды, и часто по причинам, которых в базе нет.
+  //    Поэтому сначала повторяем чужой порядок и только потом предлагаем свой.
+  //    Ряды считаем по тому, где у этого продавца больше всего занятых ячеек, —
+  //    это и есть его зона, как её видит склад, а не как её придумали мы.
+  if (companyId && options.length < limit) {
+    const nearCompany = await client.query(
+      `WITH company_rows AS (
+         SELECT wr.id AS row_id, COUNT(DISTINCT cs.cell_block_id) AS cells
+         FROM cell_stock cs
+         JOIN cell_blocks cb ON cb.id = cs.cell_block_id
+         JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+         WHERE cs.warehouse_id = $1 AND cs.company_id = $2
+         GROUP BY wr.id
+       )
+       SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       FROM cell_blocks cb
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+       JOIN company_rows crw ON crw.row_id = wr.id
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty'
+         AND cb.id <> ALL($4::uuid[])
+       ORDER BY crw.cells DESC, wr.row_num, cb.rack_start, cb.tier_start
+       LIMIT $3`,
+      [warehouseId, companyId, limit - options.length, options.map((o) => o.blockId)],
+    );
+    for (const b of nearCompany.rows) {
+      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'near_company' });
+    }
+  }
 
+  // 3. Просто свободная. Запасной вариант: новый товар нового продавца, или
+  //    склад, который начинает с нуля и своего порядка ещё не нажил.
   if (options.length < limit) {
     const empty = await client.query(
       `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        WHERE cb.warehouse_id = $1 AND cb.state = 'empty'
+         AND cb.id <> ALL($3::uuid[])
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $2`,
-      [warehouseId, limit - options.length],
+      [warehouseId, limit - options.length, options.map((o) => o.blockId)],
     );
     for (const b of empty.rows) {
       options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'empty' });
@@ -125,6 +161,30 @@ async function suggestCells(client, warehouseId, sku, limit = 3) {
   }
 
   return options;
+}
+
+// Запись подсказки в момент выдачи. Пересчитать её потом нельзя — склад к тому
+// времени уже другой, — а без неё не узнать, соглашаются с ней или обходят.
+async function recordSuggestion(client, warehouseId, { sku, companyId, workerKeyId, options }) {
+  const result = await client.query(
+    `INSERT INTO cell_suggestions (warehouse_id, company_id, sku, options, worker_key_id)
+     VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id`,
+    [warehouseId, companyId || null, sku, JSON.stringify(options), workerKeyId || null],
+  );
+  return result.rows[0].id;
+}
+
+// Чем кончилось: какую ячейку работник выбрал на самом деле. Тихо ничего не
+// делает, если ссылки на подсказку нет, — приёмка не должна падать из-за того,
+// что у работника открыт старый экран.
+async function recordSuggestionOutcome(client, warehouseId, suggestionId, chosenCellBlockId) {
+  if (!suggestionId) return;
+  await client.query(
+    `UPDATE cell_suggestions
+     SET chosen_cell_block_id = $3, decided_at = now()
+     WHERE id = $1 AND warehouse_id = $2 AND decided_at IS NULL`,
+    [suggestionId, warehouseId, chosenCellBlockId || null],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +402,6 @@ function runTool(client, warehouseId, name, args = {}) {
 
 module.exports = {
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary,
-  listDiscrepancies, pickList, runTool,
+  listDiscrepancies, pickList, runTool, recordSuggestion, recordSuggestionOutcome,
 };
 

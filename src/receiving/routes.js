@@ -4,6 +4,7 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
+const kladovshchik = require('../agents/kladovshchik');
 const outbox = require('../sync/outbox');
 
 const router = express.Router();
@@ -15,7 +16,9 @@ const router = express.Router();
 router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const { invoiceItemId, acceptedQty, cellBlockId, pausedMs, pauseReasons } = req.body;
+    const {
+      invoiceItemId, acceptedQty, cellBlockId, pausedMs, pauseReasons, suggestionId,
+    } = req.body;
     if (!invoiceItemId || acceptedQty == null) {
       throw new HttpError(400, 'Не хватает данных о принятой позиции');
     }
@@ -101,6 +104,10 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         company: { id: item.company_id, external_id: item.company_external_id },
         actualQty: acceptedQty,
       });
+
+      // Чем кончилась подсказка: согласился работник или положил по-своему.
+      // Выводов пока никаких — сначала факты, потом правило.
+      await kladovshchik.recordSuggestionOutcome(client, warehouseId, suggestionId, cellBlockId);
 
       const remaining = await client.query(
         `SELECT COUNT(*)::int AS n FROM invoice_items ii
