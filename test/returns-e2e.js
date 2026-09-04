@@ -156,11 +156,34 @@ async function api(method, path, { token, body } = {}) {
 
     const defectivePick = await api('POST', '/api/returns', {
       token: workerToken,
-      body: { invoiceItemId: itemId, qty: 2, qualityBucket: 'defective' },
+      body: {
+        invoiceItemId: itemId, qty: 2, qualityBucket: 'defective',
+        defectNote: 'Раздавлена коробка, потёк сироп',
+      },
     });
     check('defective bucket accepted without a cell', () => {
       assert.equal(defectivePick.status, 201, JSON.stringify(defectivePick.body));
       assert.equal(defectivePick.body.cell_block_id, null);
+    });
+
+    // ---------- Описание дефекта ----------
+    // «2 шт брак» без причины продавцу решать не помогает: вернуть товар себе
+    // на производство или утилизировать — разные решения.
+    check('причина брака сохраняется вместе с количеством', () => {
+      assert.equal(defectivePick.status, 201, JSON.stringify(defectivePick.body));
+    });
+
+    const withNote = await api('GET', `/api/invoices/${ret.body.id}`, { token: ownerToken });
+    check('причина видна в накладной', () => {
+      const bucket = withNote.body.items[0].buckets.find((b) => b.qualityBucket === 'defective');
+      assert.ok(bucket, JSON.stringify(withNote.body.items[0].buckets));
+      assert.equal(bucket.defectNote, 'Раздавлена коробка, потёк сироп');
+    });
+
+    const journalWithNote = await api('GET', '/api/journal', { token: ownerToken });
+    check('причина уходит в журнал владельцу', () => {
+      const entry = journalWithNote.body.find((e) => e.action_text.includes('Раздавлена коробка'));
+      assert.ok(entry, 'в журнале нет записи с причиной');
     });
 
     const overshoot = await api('POST', '/api/returns', {

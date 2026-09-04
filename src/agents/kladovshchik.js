@@ -187,7 +187,8 @@ async function invoiceDetails(client, warehouseId, number) {
     `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
             (SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS accepted,
             (SELECT SUM(sr.picked_qty) FROM shipping_records sr WHERE sr.invoice_item_id = ii.id) AS picked,
-            (SELECT json_agg(json_build_object('bucket', ret.quality_bucket, 'qty', ret.qty))
+            (SELECT json_agg(json_build_object('bucket', ret.quality_bucket, 'qty', ret.qty,
+                                               'defectNote', ret.defect_note))
                FROM return_records ret WHERE ret.invoice_item_id = ii.id) AS buckets
      FROM invoice_items ii
      WHERE ii.invoice_id = $1
@@ -207,7 +208,11 @@ async function invoiceDetails(client, warehouseId, number) {
       if (doc.direction === 'out') row.pickedQty = it.picked === null ? null : Number(it.picked);
       if (doc.direction === 'return') {
         row.sorted = (it.buckets || []).map((b) => ({
-          state: bucketLabel[b.bucket] || b.bucket, qty: Number(b.qty),
+          state: bucketLabel[b.bucket] || b.bucket,
+          qty: Number(b.qty),
+          // Причина брака — то, ради чего продавец вообще смотрит в возврат:
+          // по ней он решает, вернуть товар себе или утилизировать.
+          defect: b.defectNote || null,
         }));
       }
       return row;

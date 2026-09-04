@@ -22,7 +22,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const {
-      invoiceItemId, qty, qualityBucket, cellBlockId, pausedMs, pauseReasons,
+      invoiceItemId, qty, qualityBucket, cellBlockId, pausedMs, pauseReasons, defectNote,
     } = req.body;
     if (!invoiceItemId || qty == null || !qualityBucket) {
       throw new HttpError(400, 'Нужны позиция накладной, количество и категория качества');
@@ -33,6 +33,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     if (Number(qty) <= 0) {
       throw new HttpError(400, 'Количество должно быть больше нуля');
     }
+    // Описание дефекта — свободный текст работника, поэтому режем длину:
+    // в журнал и продавцу это уходит целиком, и полотно там никому не нужно.
+    const note = typeof defectNote === 'string' ? defectNote.trim().slice(0, 300) : null;
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
       const itemResult = await client.query(
@@ -82,12 +85,12 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       const recordResult = await client.query(
         `INSERT INTO return_records
            (invoice_item_id, warehouse_id, company_id, quality_bucket, qty, cell_block_id,
-            worker_key_id, paused_ms, pause_reasons)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         RETURNING id, quality_bucket, qty, cell_block_id, finished_at, paused_ms`,
+            worker_key_id, paused_ms, pause_reasons, defect_note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id, quality_bucket, qty, cell_block_id, finished_at, paused_ms, defect_note`,
         [
           invoiceItemId, warehouseId, item.company_id, qualityBucket, qty, cellBlockId || null,
-          staffKeyId, pausedMs || 0, JSON.stringify(pauseReasons || []),
+          staffKeyId, pausedMs || 0, JSON.stringify(pauseReasons || []), note || null,
         ],
       );
 
@@ -95,7 +98,10 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
-        actionText: `Разобрал возврат «${item.name}» (${item.sku}): ${qty} шт. — ${BUCKET_LABEL[qualityBucket]}.`,
+        // Причина едет в журнал вместе с количеством: владельцу и продавцу
+        // «2 шт брак» без причины решать не помогает.
+        actionText: `Разобрал возврат «${item.name}» (${item.sku}): ${qty} шт. — ${BUCKET_LABEL[qualityBucket]}.`
+          + (note ? ` Дефект: ${note}` : ''),
         entityType: 'invoice_item',
         entityId: invoiceItemId,
         actorType: 'worker',

@@ -63,6 +63,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
                         'id', rr.id,
                         'qty', rr.qty,
                         'qualityBucket', rr.quality_bucket,
+                        'defectNote', rr.defect_note,
                         'finishedAt', rr.finished_at
                       ) ORDER BY rr.finished_at
                     ) FILTER (WHERE rr.id IS NOT NULL),
