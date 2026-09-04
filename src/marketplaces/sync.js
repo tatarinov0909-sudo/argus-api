@@ -30,13 +30,25 @@ async function loadMapping(client, warehouseId, companyId, marketplace) {
   const byNm = new Map();
   const byArticle = new Map();
   const byBarcode = new Map();
+  // Одна карточка площадки может закрывать два наших кода — на живой матрице
+  // так и оказалось. Номер карточки в этом случае ни на что не указывает
+  // однозначно, и угадывать нельзя: выберем не тот товар — отгрузим не то.
+  // Такой номер просто перестаёт быть ключом, решает артикул или штрихкод.
+  const ambiguous = new Set();
   for (const row of r.rows) {
-    if (row.mp_sku) byNm.set(String(row.mp_sku), row.sku);
+    if (row.mp_sku) {
+      const key = String(row.mp_sku);
+      if (byNm.has(key) && byNm.get(key) !== row.sku) ambiguous.add(key);
+      byNm.set(key, row.sku);
+    }
     if (row.mp_article) byArticle.set(String(row.mp_article), row.sku);
     if (row.mp_barcode) byBarcode.set(String(row.mp_barcode), row.sku);
   }
+  for (const key of ambiguous) byNm.delete(key);
   return (order) => {
     if (order.nmId && byNm.has(order.nmId)) return byNm.get(order.nmId);
+    // дальше — артикул и штрихкод: они же выручают, когда номер оказался общим
+    // на два товара и потому выброшен выше.
     if (order.article && byArticle.has(order.article)) return byArticle.get(order.article);
     for (const bc of order.barcodes) if (byBarcode.has(bc)) return byBarcode.get(bc);
     return null;

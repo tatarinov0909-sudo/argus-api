@@ -190,6 +190,17 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       [warehouseId, companyId],
     ));
 
+    // Живая матрица принесла два случая, которых не было в плане: одна карточка
+    // на два наших товара и товар вообще без карточки (компонент набора).
+    await run((c) => c.query(
+      `INSERT INTO product_marketplace_skus
+         (warehouse_id, company_id, sku, marketplace, mp_sku, mp_article, mp_barcode)
+       VALUES ($1, $2, 'PB-X1', 'wb', '444', 'ART-X1', '2000000000046'),
+              ($1, $2, 'PB-X2', 'wb', '444', 'ART-X2', '2000000000053'),
+              ($1, $2, 'PB-D',  'wb', NULL,  'ART-D',  '2000000000060')`,
+      [warehouseId, companyId],
+    ));
+
     const resolve = await run((c) => sync.loadMapping(c, warehouseId, companyId, 'wb'));
     check('номер карточки важнее артикула', () => {
       // Если площадка прислала оба и они указывают на разное — верим номеру.
@@ -203,6 +214,16 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
     });
     check('незнакомый товар остаётся неопознанным, а не подставляется наугад', () => {
       assert.equal(resolve({ nmId: '999', article: 'НЕТ', barcodes: ['777'] }), null);
+    });
+    check('общая на два товара карточка не решает — решает артикул', () => {
+      assert.equal(resolve({ nmId: '444', article: 'ART-X2', barcodes: [] }), 'PB-X2');
+      assert.equal(resolve({ nmId: '444', article: 'ART-X1', barcodes: [] }), 'PB-X1');
+    });
+    check('по одной только общей карточке товар не угадывается', () => {
+      assert.equal(resolve({ nmId: '444', article: 'НЕТ', barcodes: [] }), null);
+    });
+    check('компонент набора без карточки находится по артикулу', () => {
+      assert.equal(resolve({ nmId: null, article: 'ART-D', barcodes: [] }), 'PB-D');
     });
 
     // ---------- Заказы превращаются в накладные ----------

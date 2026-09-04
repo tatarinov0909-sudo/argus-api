@@ -31,15 +31,22 @@ if (!file || !warehouseId || !companyId) {
 }
 
 const all = JSON.parse(fs.readFileSync(file, 'utf8')).items || [];
-// mp_sku — номер карточки на площадке, и на нём же построена уникальность
-// строки. Без него строку некуда положить: артикул и штрихкод продавец меняет,
-// номер карточки — нет. Товар без номера почти наверняка на площадке и не
-// продаётся, но сказать об этом надо вслух.
-const items = all.filter((i) => i.sku && i.marketplace && i.mpSku);
-const noMpSku = all.filter((i) => i.sku && i.marketplace && !i.mpSku);
-if (noMpSku.length) {
-  console.log(`Без номера карточки на площадке, пропущены (${noMpSku.length}):`);
-  for (const i of noMpSku.slice(0, 10)) console.log(`  ${i.sku}  ${i.mpArticle || ''}`);
+
+// Номер карточки у Wildberries всегда числовой. В матрице на его месте у
+// компонентов наборов стоит подпись «--- нет МП ---»: такой товар на площадке
+// не продаётся отдельно. Принять её за номер значит схлопнуть все такие
+// товары в одну строку — на первой загрузке ровно это и случилось с 46 из них.
+const cardNumber = (v) => (v && /^[0-9]+$/.test(String(v).trim()) ? String(v).trim() : null);
+
+const items = all
+  .filter((i) => i.sku && i.marketplace)
+  .map((i) => ({ ...i, mpSku: cardNumber(i.mpSku) }))
+  .filter((i) => i.mpSku || i.mpArticle || i.mpBarcode);
+
+const noCard = items.filter((i) => !i.mpSku).length;
+if (noCard) {
+  console.log(`Без карточки на площадке (компоненты наборов): ${noCard} — `
+    + 'сохраняем по артикулу и штрихкоду');
 }
 
 if (!items.length) {
@@ -72,8 +79,10 @@ if (!items.length) {
     for (const it of items) {
       const existing = await client.query(
         `SELECT sku, mp_article, mp_barcode FROM product_marketplace_skus
-         WHERE warehouse_id = $1 AND marketplace = $2 AND mp_sku = $3`,
-        [warehouseId, it.marketplace, it.mpSku],
+         WHERE warehouse_id = $1 AND marketplace = $2
+           AND COALESCE(mp_sku, '') = COALESCE($3, '')
+           AND COALESCE(mp_article, '') = COALESCE($4, '')`,
+        [warehouseId, it.marketplace, it.mpSku, it.mpArticle || null],
       );
       const before = existing.rows[0];
       const same = before
@@ -88,10 +97,9 @@ if (!items.length) {
         `INSERT INTO product_marketplace_skus
            (warehouse_id, company_id, sku, marketplace, mp_sku, mp_article, mp_barcode)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (warehouse_id, marketplace, mp_sku)
+         ON CONFLICT (warehouse_id, marketplace, COALESCE(mp_sku, ''), COALESCE(mp_article, ''))
          DO UPDATE SET sku = EXCLUDED.sku,
                        company_id = EXCLUDED.company_id,
-                       mp_article = EXCLUDED.mp_article,
                        mp_barcode = EXCLUDED.mp_barcode,
                        updated_at = now()`,
         [warehouseId, companyId, it.sku, it.marketplace,
