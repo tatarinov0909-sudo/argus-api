@@ -18,6 +18,7 @@ const returnRoutes = require('./returns/routes');
 const journalRoutes = require('./journal/routes');
 const syncRoutes = require('./sync/routes');
 const agentRoutes = require('./agents/routes');
+const alertRoutes = require('./alerts/routes');
 
 function createApp() {
   const app = express();
@@ -44,6 +45,7 @@ function createApp() {
   app.use('/api/journal', journalRoutes);
   app.use('/api/sync', syncRoutes);
   app.use('/api/agents', agentRoutes);
+  app.use('/api/alerts', alertRoutes);
 
   app.use(errorHandler);
 
