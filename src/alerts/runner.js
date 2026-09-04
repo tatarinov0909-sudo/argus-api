@@ -70,12 +70,18 @@ async function maybeDigest(client, warehouseId) {
   if (now.getUTCHours() < DIGEST_HOUR_MSK) return null;
   const today = now.toISOString().slice(0, 10);
 
+  // Дату читаем строкой, а не через JS-Date. Колонка типа DATE приезжает в
+  // node-postgres как полночь ПО МЕСТНОМУ времени, и toISOString() сдвигает её
+  // на день назад для любой зоны восточнее Гринвича: сводка, записанная
+  // сегодня, читалась как вчерашняя, и «Доброе утро» уходило бы владельцу
+  // каждые десять минут. Ровно тот спам, против которого всё и строилось.
   const run = await client.query(
-    `SELECT last_digest_on FROM alert_runs WHERE warehouse_id = $1`,
+    `SELECT to_char(last_digest_on, 'YYYY-MM-DD') AS last_digest_on
+     FROM alert_runs WHERE warehouse_id = $1`,
     [warehouseId],
   );
   const last = run.rows[0]?.last_digest_on;
-  if (last && new Date(last).toISOString().slice(0, 10) >= today) return null;
+  if (last && last >= today) return null;
 
   const openRows = await client.query(
     `SELECT text FROM alerts WHERE warehouse_id = $1 AND resolved_at IS NULL
@@ -100,14 +106,12 @@ async function maybeDigest(client, warehouseId) {
   if (w.to_receive) parts.push(`${w.to_receive} на приёмку`);
   if (w.to_sort) parts.push(`${w.to_sort} на разбор возврата`);
 
-  // Ни работы, ни открытых тревог — писать не о чем.
-  if (parts.length === 0 && openRows.rows.length === 0) {
-    await client.query(
-      `UPDATE alert_runs SET last_digest_on = $2::date WHERE warehouse_id = $1`,
-      [warehouseId, today],
-    );
-    return null;
-  }
+  // Ни работы, ни открытых тревог — писать не о чем. И день при этом НЕ
+  // помечаем сделанным: проверки идут каждые десять минут круглосуточно, и
+  // первая же из них после семи утра застаёт склад спокойным. Если бы она
+  // сжигала день, сводка не приходила бы никогда — проблемы появляются к
+  // девяти, а «на сегодня уже отчитались» стояло бы с рассвета.
+  if (parts.length === 0 && openRows.rows.length === 0) return null;
 
   const lines = [];
   lines.push(parts.length > 0 ? `Доброе утро. Сегодня: ${parts.join(', ')}.` : 'Доброе утро. Новой работы на сегодня нет.');

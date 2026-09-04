@@ -58,9 +58,15 @@ router.get('/kladovshchik/suggest-cell', requireAuth, requireRole('owner', 'work
 });
 
 // Единственная точка входа для человека — он пишет сюда, никогда напрямую
-// агенту. Та же роль, что и у kladovshchik/find: владелец и работник склада,
-// не продавец (у продавца нет warehouseId в токене).
-router.post('/orchestrator/ask', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+// агенту.
+//
+// ТОЛЬКО ВЛАДЕЛЕЦ. Работник склада к чату доступа не имеет — это решение о
+// продукте, а не недоделанный интерфейс: руки заняты, телефон в держателе,
+// печатать некогда. До работника агент доходит подсказками прямо в экране
+// приёмки и отбора (loader.html), и если ему что-то понадобится спросить —
+// это будет кнопка, а не переписка. Раньше здесь стояла и роль worker, хотя
+// экрана для неё не существовало: дверь без ручки, но незапертая.
+router.post('/orchestrator/ask', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const question = req.body?.question?.trim();
     if (!question) throw new HttpError(400, 'Укажите question — вопрос к Оркестратору');
@@ -110,8 +116,9 @@ router.post('/orchestrator/ask', requireAuth, requireRole('owner', 'worker'), as
 });
 
 // Переписка для показа при открытии вкладки: без неё чат каждый раз начинался
-// с чистого экрана, даже если разговор был минуту назад.
-router.get('/chat', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+// с чистого экрана, даже если разговор был минуту назад. Владельцу — по той же
+// причине, что и сам чат выше.
+router.get('/chat', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const authorId = chatHistory.authorIdFromAuth(req.auth);

@@ -410,10 +410,19 @@ async function api(method, path, { token, body } = {}) {
       assert.ok(Array.isArray(ownChat.body), 'ожидался список сообщений');
     });
 
+    // Работник к чату доступа не имеет вовсе — это решение о продукте: руки
+    // заняты, телефон в держателе, агент доходит до него подсказками в экране.
+    // Раньше сюда пускало, просто экрана не было: дверь без ручки, но незапертая.
     const workerChat = await api('GET', '/api/agents/chat', { token: workerToken });
-    check('работник читает свою переписку, а не чужую', () => {
-      assert.equal(workerChat.status, 200, JSON.stringify(workerChat.body));
-      assert.ok(Array.isArray(workerChat.body));
+    check('работнику переписка недоступна по правам, а не отсутствием кнопки', () => {
+      assert.equal(workerChat.status, 403, JSON.stringify(workerChat.body));
+    });
+
+    const workerAsk = await api('POST', '/api/agents/orchestrator/ask', {
+      token: workerToken, body: { question: 'где лежит SKU-1?' },
+    });
+    check('и спросить агента напрямую он тоже не может', () => {
+      assert.equal(workerAsk.status, 403, JSON.stringify(workerAsk.body));
     });
 
     // У продавца нет warehouseId в контексте (см. tenantContext.js), и лезть
