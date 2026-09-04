@@ -14,6 +14,7 @@ const productRoutes = require('./products/routes');
 const invoiceRoutes = require('./invoices/routes');
 const receivingRoutes = require('./receiving/routes');
 const shippingRoutes = require('./shipping/routes');
+const kitRoutes = require('./kits/routes');
 const returnRoutes = require('./returns/routes');
 const journalRoutes = require('./journal/routes');
 const syncRoutes = require('./sync/routes');
@@ -41,6 +42,7 @@ function createApp() {
   app.use('/api/invoices', invoiceRoutes);
   app.use('/api/receiving', receivingRoutes);
   app.use('/api/shipping', shippingRoutes);
+  app.use('/api/kits', kitRoutes);
   app.use('/api/returns', returnRoutes);
   app.use('/api/journal', journalRoutes);
   app.use('/api/sync', syncRoutes);

@@ -8,6 +8,8 @@
 // существовал на полке, но на вопрос «где он?» Кладовщик отвечал «не найдено».
 // На живой базе таких артикулов было двое из 633 — редко, но именно про такой
 // товар и спрашивают, когда он потерялся.
+const { kitInfo } = require('../kits/kits');
+
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
     `SELECT p.sku, p.name, p.category, p.weight_g
@@ -60,6 +62,20 @@ async function findProducts(client, warehouseId, query) {
       .filter((r) => r.quality === 'good')
       .reduce((sum, r) => sum + Number(r.qty), 0);
     const totalQty = stock.rows.reduce((sum, r) => sum + Number(r.qty), 0);
+    // Набор на вопрос «сколько есть» отвечает дважды: сколько лежит готовым и
+    // сколько можно собрать из компонентов. Без второго числа Кладовщик врёт
+    // владельцу «ноль» ровно в тот момент, когда собрать можно двадцать.
+    // Отдельным инструментом это делать нельзя — каждый инструмент дорожает
+    // вопрос примерно на 2.7%; здесь это лишний запрос, а не лишний вызов модели.
+    const kitOwner = await client.query(
+      `SELECT DISTINCT company_id FROM product_kits
+       WHERE warehouse_id = $1 AND kit_sku = $2 LIMIT 1`,
+      [warehouseId, p.sku],
+    );
+    const kit = kitOwner.rows[0]
+      ? await kitInfo(client, warehouseId, kitOwner.rows[0].company_id, p.sku)
+      : null;
+
     results.push({
       sku: p.sku,
       name: p.name,
@@ -68,6 +84,11 @@ async function findProducts(client, warehouseId, query) {
       totalQty,
       availableQty,
       notForSaleQty: totalQty - availableQty,
+      kit: kit && {
+        buildable: kit.buildable,
+        limitedBy: kit.limitedBy,
+        components: kit.components,
+      },
       locations: stock.rows.map((r) => ({
         row: r.row_num,
         rackFrom: r.rack_start, rackTo: r.rack_end,

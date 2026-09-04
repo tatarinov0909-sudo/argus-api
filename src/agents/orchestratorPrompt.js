@@ -16,7 +16,7 @@ const SYSTEM_PROMPT = `Ты — Оркестратор склада Аргус. 
 // только оборачивают его по-разному (см. orchestrator.js / orchestratorDeepseek.js).
 const FIND_PRODUCTS_TOOL = {
   name: 'find_products',
-  description: 'Ищет товары по артикулу (SKU) или части названия: адреса ячеек, сколько всего и сколько из этого годного (availableQty) — отгрузить можно только годное.',
+  description: 'Ищет товары по артикулу (SKU) или части названия: адреса ячеек, сколько всего и сколько из этого годного (availableQty) — отгрузить можно только годное. Если товар — набор, приходит поле kit: buildable (сколько наборов можно собрать из компонентов) и limitedBy (каких компонентов не хватает).',
   parameters: {
     type: 'object',
     properties: {
