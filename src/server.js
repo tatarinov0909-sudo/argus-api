@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { createApp } = require('./app');
 const alerts = require('./alerts/runner');
+const marketplaces = require('./marketplaces/runner');
 
 const app = createApp();
 const port = process.env.PORT || 3000;
@@ -9,4 +10,6 @@ app.listen(port, () => {
   // Сторож живёт в процессе приложения: меньше отдельных деталей, которые
   // могут тихо умереть по одной. Ходит ли он — видно по last_run_at.
   alerts.start();
+  // Опрос площадок — только чтение: заказы забираем, ничего не меняем.
+  marketplaces.start();
 });
