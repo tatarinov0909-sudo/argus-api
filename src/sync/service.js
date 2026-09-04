@@ -215,13 +215,19 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
       continue;
     }
 
+    // source = '1c' во всех трёх запросах ниже — граница между источниками.
+    // Внешний номер уникален теперь по тройке (склад, источник, номер), и без
+    // этого условия обмен нашёл бы заказ, приехавший с маркетплейса, и
+    // переписал бы его как свой. Один заказ — один источник, это решение
+    // принято отдельно и здесь оно исполняется.
     const existing = await client.query(
-      `SELECT id, status FROM invoices WHERE warehouse_id = $1 AND external_id = $2`,
+      `SELECT id, status FROM invoices
+       WHERE warehouse_id = $1 AND source = '1c' AND external_id = $2`,
       [warehouseId, externalId],
     );
     const found = existing.rows[0] || (await client.query(
       `SELECT id, status FROM invoices
-       WHERE warehouse_id = $1 AND number = $2 AND external_id IS NULL`,
+       WHERE warehouse_id = $1 AND source = '1c' AND number = $2 AND external_id IS NULL`,
       [warehouseId, number],
     )).rows[0];
 
@@ -247,8 +253,8 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
     }
 
     const inserted = await client.query(
-      `INSERT INTO invoices (warehouse_id, company_id, number, direction, external_id)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      `INSERT INTO invoices (warehouse_id, company_id, number, direction, external_id, source)
+       VALUES ($1, $2, $3, $4, $5, '1c') RETURNING id`,
       [warehouseId, companyId, number, direction, externalId],
     );
     await insertItems(client, warehouseId, companyId, inserted.rows[0].id, rec.items);
