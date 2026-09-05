@@ -7,6 +7,7 @@
 
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
+const { withTenantContext } = require('../src/db/pool');
 
 const PORT = 3993;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -119,6 +120,21 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(repack.body.toQuality, 'good');
     });
 
+    // Перепаковка тоже двигает остаток без накладной — значит должна оставлять
+    // след с работником, иначе «кто это сделал» узнать неоткуда.
+    const whId = JSON.parse(Buffer.from(ownerToken.split('.')[1], 'base64').toString('utf8')).warehouseId;
+    const repackTrail = await withTenantContext({ warehouseId: whId }, (c) => c.query(
+      `SELECT kind, sku, qty, details, worker_key_id FROM stock_operations
+       WHERE warehouse_id = $1 AND sku = 'PB-A'`,
+      [whId],
+    ));
+    check('перепаковка оставляет след, и в нём виден работник', () => {
+      assert.equal(repackTrail.rows.length, 1, 'операция не записана');
+      assert.equal(repackTrail.rows[0].kind, 'repack', 'перепаковку записали как перестановку');
+      assert.ok(repackTrail.rows[0].worker_key_id, 'работник не записан');
+      assert.equal(repackTrail.rows[0].details.fromQuality, 'packaging_defect');
+    });
+
     const afterRepack = await api('GET', `/api/shipping/suggest/${outForPack.body.items[0].id}`, { token: workerToken });
     check('после перепаковки товар вернулся в продажу', () => {
       assert.equal(afterRepack.body.totalAvailable, 6, JSON.stringify(afterRepack.body.cells));
@@ -174,9 +190,7 @@ async function api(method, path, { token, body } = {}) {
 
     // Брак на полке виден отдельно от годного — иначе «сколько можно
     // отгрузить» включало бы товар, который клиенту не уедет.
-    const { withTenantContext } = require('../src/db/pool');
     const kladovshchik = require('../src/agents/kladovshchik');
-    const whId = JSON.parse(Buffer.from(ownerToken.split('.')[1], 'base64').toString('utf8')).warehouseId;
     const found = await withTenantContext({ warehouseId: whId }, (c) => (
       kladovshchik.findProducts(c, whId, 'PB-A')
     ));

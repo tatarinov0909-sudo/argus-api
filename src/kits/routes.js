@@ -26,10 +26,12 @@ router.get('/:companyId/:kitSku', requireAuth, requireRole('owner', 'worker'), a
 // Собрать наборы: компоненты уходят с полки, наборы ложатся в ячейку.
 router.post('/assemble', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
   try {
-    const { warehouseId } = req.auth;
+    const { warehouseId, staffKeyId } = req.auth;
     const { companyId, kitSku, qty, toCellBlockId } = req.body;
     const result = await withTenantContext({ warehouseId }, (client) => (
-      kits.assembleKit(client, warehouseId, { companyId, kitSku, qty, toCellBlockId })
+      kits.assembleKit(client, warehouseId, {
+        companyId, kitSku, qty, toCellBlockId, workerKeyId: staffKeyId || null,
+      })
     ));
     res.status(201).json(result);
   } catch (err) {

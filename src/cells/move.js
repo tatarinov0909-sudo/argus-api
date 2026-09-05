@@ -15,7 +15,8 @@ const { refreshCellFill } = require('./fill');
 // транзакции. Ошибиться в меньшую сторону нельзя (FOR UPDATE + проверка), в
 // большую — тем более.
 async function moveStock(client, warehouseId, {
-  sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality = 'good', toQuality,
+  sku, companyId, fromCellBlockId, toCellBlockId, qty,
+  fromQuality = 'good', toQuality, workerKeyId = null,
 }) {
   const amount = Number(qty);
   if (!sku || !fromCellBlockId || !amount) {
@@ -82,6 +83,19 @@ async function moveStock(client, warehouseId, {
 
   await refreshCellFill(client, fromCellBlockId);
   if (targetCell !== fromCellBlockId) await refreshCellFill(client, targetCell);
+
+  // След операции: у перепаковки и перестановки тоже нет накладной, а остаток
+  // они двигают. Перепаковку отличаем от простой перестановки по тому, менялось
+  // ли состояние товара — для продавца это разные события.
+  await client.query(
+    `INSERT INTO stock_operations
+       (warehouse_id, company_id, kind, sku, qty,
+        from_cell_block_id, to_cell_block_id, details, worker_key_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [warehouseId, movedCompanyId, targetQuality === fromQuality ? 'move' : 'repack',
+      sku, amount, fromCellBlockId, targetCell,
+      JSON.stringify({ fromQuality, toQuality: targetQuality }), workerKeyId],
+  );
 
   return {
     sku, qty: amount, fromQuality, toQuality: targetQuality,

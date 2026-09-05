@@ -446,6 +446,7 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
     const moved = await withTenantContext({ warehouseId }, async (client) => {
       const result = await moveStock(client, warehouseId, {
         sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality, toQuality,
+        workerKeyId: req.auth.staffKeyId || null,
       });
 
       const changedState = result.toQuality !== result.fromQuality;

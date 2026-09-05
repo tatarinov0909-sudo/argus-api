@@ -116,7 +116,7 @@ async function consume(client, warehouseId, companyId, sku, qty) {
 // Проверяем ВСЕ компоненты до первого списания: остановиться на середине —
 // значит развалить пригодный к продаже товар и не собрать ничего.
 async function assembleKit(client, warehouseId, {
-  companyId, kitSku, qty, toCellBlockId,
+  companyId, kitSku, qty, toCellBlockId, workerKeyId = null,
 }) {
   const amount = Number(qty);
   if (!companyId || !kitSku || !toCellBlockId) {
@@ -156,6 +156,18 @@ async function assembleKit(client, warehouseId, {
   // Пересчитываем заполненность и у ячейки назначения, и у каждой, откуда
   // забирали: иначе карта склада продолжит красить занятыми опустевшие ячейки.
   for (const id of cellsTouched) await refreshCellFill(client, id);
+
+  // След операции. У сборки нет накладной, к которой можно привязаться, —
+  // значит без этой записи остаток меняется, а кто и когда, неизвестно. Ровно
+  // на это упирается любой спор о недостаче.
+  await client.query(
+    `INSERT INTO stock_operations
+       (warehouse_id, company_id, kind, sku, qty, to_cell_block_id, details, worker_key_id)
+     VALUES ($1, $2, 'kit_assemble', $3, $4, $5, $6, $7)`,
+    [warehouseId, companyId, kitSku, amount, toCellBlockId,
+      JSON.stringify({ components: parts.map((p) => ({ sku: p.sku, taken: p.perKit * amount })) }),
+      workerKeyId],
+  );
 
   return { kitSku, qty: amount, toCellBlockId, components: parts.map((p) => ({
     sku: p.sku, name: p.name, taken: p.perKit * amount,

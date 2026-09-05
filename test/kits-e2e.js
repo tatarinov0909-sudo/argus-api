@@ -216,6 +216,34 @@ async function expectFails(run) {
       assert.equal(kitCell.rows[0].cell_block_id, c4.id);
     });
 
+    // ---------- След операции ----------
+    // Сборка двигает остаток и не привязана ни к какой накладной. Без записи
+    // «кто и когда» спор о недостаче упирается в ничто.
+    const trail = await run((c) => c.query(
+      `SELECT kind, sku, qty, to_cell_block_id, details, worker_key_id
+       FROM stock_operations WHERE warehouse_id = $1 AND kind = 'kit_assemble'`,
+      [warehouseId],
+    ));
+    check('сборка оставляет след: что, сколько и куда', () => {
+      assert.equal(trail.rows.length, 1, 'операция не записана');
+      assert.equal(trail.rows[0].sku, KIT);
+      assert.equal(Number(trail.rows[0].qty), 3);
+      assert.equal(trail.rows[0].to_cell_block_id, c4.id);
+    });
+    check('и главное — кто её сделал', () => {
+      assert.ok(trail.rows[0].worker_key_id, 'работник не записан');
+    });
+    check('в следе виден и состав, который разобрали', () => {
+      const comps = trail.rows[0].details.components || [];
+      assert.equal(comps.length, 2, JSON.stringify(trail.rows[0].details));
+      const oat = comps.find((x) => x.sku === 'PB-OAT');
+      assert.equal(oat.taken, 6, 'списанное количество в следе не сходится');
+    });
+    check('неудачная сборка следа не оставляет', () => {
+      // Та, что упала на нехватке компонентов, выше по тесту.
+      assert.equal(trail.rows.length, 1, 'записана операция, которой не было');
+    });
+
     const afterBuild = await api('GET', `/api/kits/${companyId}/${KIT}`, { token: ownerToken });
     check('после сборки собрать можно меньше — компоненты кончаются', () => {
       assert.equal(afterBuild.body.buildable, 1, JSON.stringify(afterBuild.body.components));
