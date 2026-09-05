@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
+const { tenantContextFromAuth } = require('../auth/tenantContext');
 
 const router = express.Router();
 
@@ -24,6 +25,59 @@ router.get('/companies', requireAuth, requireRole('owner'), async (req, res, nex
       return result.rows;
     });
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Настоящий остаток продавца — то, что лежит в ячейках прямо сейчас.
+//
+// До этого кабинет складывал приёмки нарастающим итогом и называл это
+// остатком. Пока склад только принимал, цифра почти совпадала; с первой же
+// отгрузкой она расходится навсегда и больше никогда не сойдётся. Показывать
+// продавцу «сколько всего привезли» под словом «остаток» — врать ему каждый
+// день.
+//
+// Область видимости решает Postgres: контекст продавца выставляет только его
+// компанию, и политика на cell_stock пропускает ровно его строки. Никакой
+// фильтрации «руками» здесь нет намеренно — на такой фильтрации проект уже
+// однажды получил утечку между компаниями.
+router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, res, next) => {
+  try {
+    const ctx = tenantContextFromAuth(req.auth);
+    // Владелец смотрит глазами конкретного продавца — иначе он увидел бы
+    // склад целиком, а вопрос здесь другой: «что видит мой клиент».
+    const companyId = req.auth.role === 'owner' ? req.query.companyId : req.auth.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+
+    const rows = await withTenantContext(ctx, async (client) => {
+      const result = await client.query(
+        `SELECT cs.sku,
+                COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
+                                  WHERE ii.company_id = cs.company_id AND ii.sku = cs.sku
+                                  ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
+                SUM(cs.qty) FILTER (WHERE cs.quality = 'good') AS good_qty,
+                SUM(cs.qty) FILTER (WHERE cs.quality <> 'good') AS bad_qty,
+                count(DISTINCT cs.cell_block_id) AS cells
+         FROM cell_stock cs
+         LEFT JOIN products p ON p.company_id = cs.company_id AND p.sku = cs.sku
+         WHERE cs.company_id = $1 AND cs.qty > 0
+         GROUP BY cs.sku, cs.company_id, p.name
+         ORDER BY name`,
+        [companyId],
+      );
+      return result.rows;
+    });
+
+    res.json(rows.map((r) => ({
+      sku: r.sku,
+      name: r.name,
+      // Годное и негодное раздельно: «на складе 40» без оговорки, что 8 из них
+      // брак, — это обещание отгрузить то, что отгружено не будет.
+      qty: Number(r.good_qty || 0),
+      notForSale: Number(r.bad_qty || 0),
+      cells: Number(r.cells),
+    })));
   } catch (err) {
     next(err);
   }
