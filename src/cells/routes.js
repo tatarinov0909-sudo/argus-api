@@ -22,7 +22,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
       );
       const blocksResult = await client.query(
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
-                cb.state, cb.fill_pct,
+                cb.state, cb.fill_pct, cb.label,
                 COALESCE(json_agg(json_build_object(
                   'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
                   'quality', cs.quality

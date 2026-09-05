@@ -46,13 +46,13 @@ async function findProducts(client, warehouseId, query) {
     // одна и та же ячейка возвращалась дважды — человек слышал «94 штуки и ещё
     // 9 там же», хотя ячейка одна и в ней 103.
     const stock = await client.query(
-      `SELECT SUM(cs.qty) AS qty, cs.quality, wr.row_num, cb.rack_start, cb.rack_end,
+      `SELECT SUM(cs.qty) AS qty, cs.quality, wr.row_num, cb.label, cb.rack_start, cb.rack_end,
               cb.tier_start, cb.tier_end
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        WHERE cs.warehouse_id = $1 AND cs.sku = $2
-       GROUP BY cb.id, cs.quality, wr.row_num, cb.rack_start, cb.rack_end,
+       GROUP BY cb.id, cs.quality, wr.row_num, cb.label, cb.rack_start, cb.rack_end,
                 cb.tier_start, cb.tier_end
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
       [warehouseId, p.sku],
@@ -125,6 +125,7 @@ async function findProducts(client, warehouseId, query) {
       })),
       locations: stock.rows.map((r) => ({
         row: r.row_num,
+        label: r.label || null,
         rackFrom: r.rack_start, rackTo: r.rack_end,
         tierFrom: r.tier_start, tierTo: r.tier_end,
         qty: Number(r.qty),
@@ -136,6 +137,10 @@ async function findProducts(client, warehouseId, query) {
 }
 
 function formatBlockLabel(rowNum, block) {
+  // Если у ячейки есть собственное имя — оно и есть ответ. На стеллаже висит
+  // «01-10-015», и назвать её «1.15.2» значит заставить работника переводить
+  // наши координаты в то, что он видит глазами.
+  if (block.label) return block.label;
   const rackPart = block.rack_start === block.rack_end ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
   const tierPart = block.tier_start === block.tier_end ? block.tier_start : `${block.tier_start}–${block.tier_end}`;
   return `${rowNum}.${rackPart}.${tierPart}`;
