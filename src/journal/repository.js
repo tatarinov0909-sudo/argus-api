@@ -28,7 +28,10 @@ async function createEntry(client, {
   return result.rows[0];
 }
 
-async function listEntries(client, warehouseId, { limit = 200 } = {}) {
+// cellBlockId / invoiceId — обратный ход: «что происходило в этой ячейке» и
+// «что происходило с этой накладной». Из записи уже можно уйти к месту и к
+// документу; отсюда можно вернуться и посмотреть всю их историю.
+async function listEntries(client, warehouseId, { limit = 200, cellBlockId = null, invoiceId = null } = {}) {
   // Номер накладной и адрес ячейки собираем здесь, а не на клиенте: иначе
   // кабинету пришлось бы держать в памяти всю карту склада только ради подписи.
   const result = await client.query(
@@ -46,8 +49,10 @@ async function listEntries(client, warehouseId, { limit = 200 } = {}) {
      LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
      LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE je.warehouse_id = $1
+       AND ($3::uuid IS NULL OR je.cell_block_id = $3::uuid)
+       AND ($4::uuid IS NULL OR je.invoice_id = $4::uuid)
      ORDER BY je.created_at DESC LIMIT $2`,
-    [warehouseId, limit],
+    [warehouseId, limit, cellBlockId, invoiceId],
   );
   return result.rows;
 }

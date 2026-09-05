@@ -219,6 +219,30 @@ async function api(method, path, { token, body } = {}) {
     });
     // Запись должна вести к документу и к месту, иначе журнал остаётся текстом:
     // прочитать про ячейку можно, а пойти в неё — нет.
+    // Обратный ход: из ячейки и из накладной — вся их история.
+    const cellId = returnEntries.find((e) => e.cell_block_id)?.cell_block_id;
+    const byCell = cellId
+      ? await api('GET', `/api/journal?cellBlockId=${cellId}`, { token: ownerToken })
+      : null;
+    const byInvoice = await api('GET',
+      `/api/journal?invoiceId=${returnEntries[0].invoice_id}`, { token: ownerToken });
+    const badId = await api('GET', '/api/journal?cellBlockId=не-uuid', { token: ownerToken });
+
+    check('история одной ячейки отдаётся отдельно', () => {
+      assert.ok(byCell, 'ни одна запись не знает ячейки');
+      assert.equal(byCell.status, 200, JSON.stringify(byCell.body));
+      assert.ok(byCell.body.length >= 1);
+      assert.ok(byCell.body.every((e) => e.cell_block_id === cellId),
+        'в историю ячейки попали чужие записи');
+    });
+    check('история одной накладной тоже', () => {
+      assert.equal(byInvoice.status, 200, JSON.stringify(byInvoice.body));
+      assert.ok(byInvoice.body.length >= 3, 'записей по накладной меньше, чем было событий');
+    });
+    check('мусор вместо идентификатора отклоняется, а не ищется', () => {
+      assert.equal(badId.status, 400, JSON.stringify(badId.body));
+    });
+
     check('из записи журнала видно накладную и ячейку', () => {
       const withCell = returnEntries.filter((e) => e.cell_block_id);
       assert.ok(withCell.length >= 1, 'ни одна запись не знает своей ячейки');

@@ -11,7 +11,21 @@ const router = express.Router();
 router.get('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const entries = await withTenantContext({ warehouseId }, (client) => repository.listEntries(client, warehouseId));
+    // ?cellBlockId= / ?invoiceId= — история одного места или одного документа.
+    // Фильтруем в базе, а не в кабинете: в ленте лежат последние 200 записей,
+    // и старая история ячейки в них попросту не попадёт.
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const one = (v, name) => {
+      if (!v) return null;
+      if (!uuid.test(String(v))) throw new HttpError(400, `Некорректный ${name}`);
+      return String(v);
+    };
+    const cellBlockId = one(req.query.cellBlockId, 'cellBlockId');
+    const invoiceId = one(req.query.invoiceId, 'invoiceId');
+
+    const entries = await withTenantContext({ warehouseId }, (client) => (
+      repository.listEntries(client, warehouseId, { cellBlockId, invoiceId })
+    ));
     res.json(entries);
   } catch (err) {
     next(err);
