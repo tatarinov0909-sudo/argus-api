@@ -79,6 +79,15 @@ async function findProducts(client, warehouseId, query) {
       ? await kitInfo(client, warehouseId, kitOwner.rows[0].company_id, p.sku)
       : null;
 
+    // Адрес из 1С. Пока приёмка через Аргус не пошла, это ЕДИНСТВЕННЫЙ ответ
+    // на вопрос «где лежит»: у владельца адресное хранение ведётся годами,
+    // а наши ячейки наполняются только тем, что работник положил сам.
+    const cells1c = await client.query(
+      `SELECT cell_name, qty FROM product_cells_1c
+       WHERE warehouse_id = $1 AND sku = $2 ORDER BY cell_name`,
+      [warehouseId, p.sku],
+    );
+
     results.push({
       sku: p.sku,
       name: p.name,
@@ -106,6 +115,14 @@ async function findProducts(client, warehouseId, query) {
         limitedBy: kit.limitedBy,
         components: kit.components,
       },
+      // Два ответа на «где лежит», и они намеренно раздельные: cells1c —
+      // что говорит учёт владельца, locations — что Аргус видел своими
+      // глазами. Схлопывать их в один список нельзя: разошлись — значит
+      // товар переставили и не записали, и это нужно заметить, а не спрятать.
+      cells1c: cells1c.rows.map((r) => ({
+        cell: r.cell_name,
+        qty: r.qty === null || r.qty === undefined ? null : Number(r.qty),
+      })),
       locations: stock.rows.map((r) => ({
         row: r.row_num,
         rackFrom: r.rack_start, rackTo: r.rack_end,

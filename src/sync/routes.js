@@ -245,6 +245,7 @@ router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandl
 // Остатки: то, чего в обмене не было вовсе, из-за чего Аргус ничего не знал о
 // складе по-настоящему.
 router.post('/push/stock', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertStock));
+router.post('/push/cells', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertCells1c));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 

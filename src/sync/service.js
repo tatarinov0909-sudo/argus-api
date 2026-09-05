@@ -103,6 +103,61 @@ function numeric(value) {
 //
 // Обмен идёт пачками и повторяется по расписанию, поэтому это именно снимок:
 // каждый раз перезаписываем, а не прибавляем.
+// Адреса хранения из 1С: товар лежит в такой-то ячейке.
+//
+// Снимок, а не журнал: 1С присылает текущую раскладку целиком по каждому
+// товару, поэтому прежние строки этого товара сначала удаляем. Иначе позиция,
+// которую переставили из А-01 в Б-07, осталась бы числиться в обеих —
+// а «лежит в двух местах» хуже, чем «не знаем, где лежит».
+async function upsertCells1c(client, warehouseId, records, options = {}) {
+  const results = [];
+
+  // Чистим оптом по товарам из этой пачки, а не по всему складу: выгрузка
+  // идёт партиями, и wipe на каждой партии стирал бы результат предыдущей.
+  const skus = [...new Set(records.map((r) => r.sku?.trim()).filter(Boolean))];
+  if (skus.length > 0) {
+    await client.query(
+      'DELETE FROM product_cells_1c WHERE warehouse_id = $1 AND sku = ANY($2::text[])',
+      [warehouseId, skus],
+    );
+  }
+
+  for (const rec of records) {
+    const sku = rec.sku?.trim();
+    const cellName = typeof rec.cell === 'string' ? rec.cell.trim() : '';
+    if (!sku || !cellName) {
+      results.push({ sku: sku || null, status: 'error', error: 'sku и cell обязательны' });
+      continue;
+    }
+
+    const companyId = (await resolveCompany(client, warehouseId, rec.companyExternalId))
+      || options.defaultCompanyId || null;
+
+    // Как и у остатка: адрес кладётся к существующей карточке и сам её
+    // не создаёт, иначе в Аргусе заведётся товар, которого никто не выгружал.
+    const known = await client.query(
+      `SELECT 1 FROM products WHERE warehouse_id = $1 AND sku = $2
+         AND ($3::uuid IS NULL OR company_id = $3::uuid)`,
+      [warehouseId, sku, companyId],
+    );
+    if (known.rows.length === 0) {
+      results.push({ sku, status: 'error', error: 'Товар не найден — сначала выгрузите номенклатуру' });
+      continue;
+    }
+
+    await client.query(
+      `INSERT INTO product_cells_1c (warehouse_id, company_id, sku, cell_name, qty, synced_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (warehouse_id, sku, cell_name)
+       DO UPDATE SET qty = EXCLUDED.qty, synced_at = now(), company_id = EXCLUDED.company_id`,
+      [warehouseId, companyId, sku, cellName, numeric(rec.qty)],
+    );
+    results.push({ sku, status: 'updated', cell: cellName });
+  }
+
+  return results;
+}
+
 async function upsertStock(client, warehouseId, records, options = {}) {
   const results = [];
   const now = new Date();
@@ -350,6 +405,7 @@ async function insertItems(client, warehouseId, companyId, invoiceId, items) {
 
 module.exports = {
   upsertStock,
+  upsertCells1c,
   signIntegrationToken,
   generateKeyCode,
   upsertCompanies,
