@@ -113,6 +113,42 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(afterReceive.body[0].cells, 1);
     });
 
+    // ---------- Товар, который числится в 1С, но у нас ещё не принят ----------
+    // Ради этого случая запрос и переписан: пока он строился от ячеек, такой
+    // товар не показывался вовсе — а на живом складе это ВСЕ 1 353 позиции,
+    // потому что приёмки через Аргус ещё не было ни одной.
+    const syncKey = await api('POST', '/api/sync/keys', {
+      token: ownerToken, body: { label: 'Тест остатков' },
+    });
+    const syncToken = (await api('POST', '/api/sync/auth', {
+      body: { keyCode: syncKey.body.key_code },
+    })).body.token;
+    const pushAs = (path, records) => api('POST', path, {
+      token: syncToken, body: { defaultCompanyName: 'Альфа', records },
+    });
+    await pushAs('/api/sync/push/products', [
+      { externalId: 'p-only1c', sku: 'PB-ONLY-1C', name: 'Только в 1С' },
+    ]);
+    await pushAs('/api/sync/push/stock', [{ sku: 'PB-ONLY-1C', qty: 700 }]);
+
+    const withSync = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    check('товар из 1С виден, даже если по ячейкам его у нас нет', () => {
+      const row = withSync.body.find((r) => r.sku === 'PB-ONLY-1C');
+      assert.ok(row, 'товар с остатком 1С не показан: ' + JSON.stringify(withSync.body));
+      assert.equal(row.qtyIn1c, 700);
+      assert.equal(row.qty, 0, 'остаток 1С молча записали в ячейки');
+      assert.equal(row.cells, 0);
+    });
+    check('и видно, когда 1С это сказала', () => {
+      const row = withSync.body.find((r) => r.sku === 'PB-ONLY-1C');
+      assert.ok(row.stockAt, 'без отметки времени «ноль» не отличить от «обмен молчит»');
+    });
+    check('у принятого товара обе цифры рядом, а не вместо друг друга', () => {
+      const row = withSync.body.find((r) => r.sku === 'PB-A');
+      assert.equal(row.qty, 100, 'ячейки потерялись');
+      assert.equal(row.qtyIn1c, null, 'взялась цифра 1С, которой не было');
+    });
+
     // ---------- Главное: отгрузка уменьшает остаток ----------
     const order = await api('POST', '/api/invoices', {
       token: ownerToken,

@@ -51,18 +51,34 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, re
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
 
     const rows = await withTenantContext(ctx, async (client) => {
+      // Два независимых факта об одном товаре, и ни один не подменяет другой:
+      // сколько числится в 1С и сколько Аргус физически разложил по ячейкам.
+      // Поэтому FULL JOIN: товар может числиться в 1С и ещё не быть принят
+      // у нас, а может лежать в ячейке, но не приехать из обмена. Обычный
+      // JOIN от cell_stock прятал первый случай — а сегодня это ВСЕ товары.
       const result = await client.query(
-        `SELECT cs.sku,
+        `WITH cells AS (
+           SELECT sku,
+                  SUM(qty) FILTER (WHERE quality = 'good') AS good_qty,
+                  SUM(qty) FILTER (WHERE quality <> 'good') AS bad_qty,
+                  count(DISTINCT cell_block_id) AS cells
+           FROM cell_stock
+           WHERE company_id = $1 AND qty > 0
+           GROUP BY sku
+         ), prod AS (
+           SELECT sku, name, stock_qty_1c, stock_at
+           FROM products
+           WHERE company_id = $1 AND COALESCE(stock_qty_1c, 0) <> 0
+         )
+         SELECT COALESCE(p.sku, c.sku) AS sku,
                 COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
-                                  WHERE ii.company_id = cs.company_id AND ii.sku = cs.sku
-                                  ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
-                SUM(cs.qty) FILTER (WHERE cs.quality = 'good') AS good_qty,
-                SUM(cs.qty) FILTER (WHERE cs.quality <> 'good') AS bad_qty,
-                count(DISTINCT cs.cell_block_id) AS cells
-         FROM cell_stock cs
-         LEFT JOIN products p ON p.company_id = cs.company_id AND p.sku = cs.sku
-         WHERE cs.company_id = $1 AND cs.qty > 0
-         GROUP BY cs.sku, cs.company_id, p.name
+                                  WHERE ii.company_id = $1 AND ii.sku = c.sku
+                                  ORDER BY ii.id DESC LIMIT 1),
+                         COALESCE(p.sku, c.sku)) AS name,
+                c.good_qty, c.bad_qty, c.cells,
+                p.stock_qty_1c, p.stock_at
+         FROM prod p
+         FULL JOIN cells c ON c.sku = p.sku
          ORDER BY name`,
         [companyId],
       );
@@ -76,7 +92,12 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, re
       // брак, — это обещание отгрузить то, что отгружено не будет.
       qty: Number(r.good_qty || 0),
       notForSale: Number(r.bad_qty || 0),
-      cells: Number(r.cells),
+      cells: Number(r.cells || 0),
+      // Цифра из 1С склада и время, когда она пришла. Без времени нельзя
+      // отличить «на складе ноль» от «обмен молчит вторую неделю».
+      qtyIn1c: r.stock_qty_1c === null || r.stock_qty_1c === undefined
+        ? null : Number(r.stock_qty_1c),
+      stockAt: r.stock_at || null,
     })));
   } catch (err) {
     next(err);
