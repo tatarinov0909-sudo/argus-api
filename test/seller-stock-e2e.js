@@ -178,6 +178,29 @@ async function api(method, path, { token, body } = {}) {
     check('работнику остаток продавца не показывают', () => {
       assert.equal(worker.status, 403, JSON.stringify(worker.body));
     });
+
+    // ---------- Отзыв ключа действует сразу ----------
+    // Раньше отзыв закрывал только вход, а выданный токен жил до конца срока —
+    // до 45 минут. Отзывают ключ обычно тогда, когда этих минут и нет.
+    await api('PATCH', `/api/sellers/keys/${alphaKey.body.id}/toggle`, { token: ownerToken });
+    await new Promise((r) => setTimeout(r, 2100)); // короткий кэш проверки ключа
+
+    const afterRevoke = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    check('после отзыва ключа старый токен перестаёт работать', () => {
+      assert.equal(afterRevoke.status, 401, JSON.stringify(afterRevoke.body));
+    });
+    const relogin = await api('POST', '/api/auth/seller/login', {
+      body: { keyCode: alphaKey.body.key_code, name: 'Пётр' },
+    });
+    check('и войти заново по нему нельзя', () => {
+      assert.equal(relogin.status, 403, JSON.stringify(relogin.body));
+    });
+
+    // Владельца отзыв чужого ключа не касается.
+    const ownerStillWorks = await api('GET', `/api/sellers/stock?companyId=${alpha.body.id}`, { token: ownerToken });
+    check('владельца это не задевает', () => {
+      assert.equal(ownerStillWorks.status, 200, JSON.stringify(ownerStillWorks.body));
+    });
   } finally {
     server.close();
   }
