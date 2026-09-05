@@ -462,6 +462,8 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
         actionText: `Переместил «${result.sku}», ${result.qty} шт. — ${parts.join(', ')}.`,
         entityType: 'cell_block',
         entityId: result.toCellBlockId,
+        // Место, куда товар лёг: именно туда владелец пойдёт смотреть.
+        cellBlockId: result.toCellBlockId,
         actorType: 'worker',
         actorId: staffKeyId,
         status: 'auto',

@@ -86,6 +86,8 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         actionText,
         entityType: 'invoice_item',
         entityId: invoiceItemId,
+        invoiceId: item.invoice_id,
+        cellBlockId: cellBlockId || null,
         actorType: 'worker',
         actorId: staffKeyId,
         status: hasDiscrepancy ? 'pending' : 'auto',

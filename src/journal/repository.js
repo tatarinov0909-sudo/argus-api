@@ -12,20 +12,41 @@
 async function createEntry(client, {
   warehouseId, agent, actionText, entityType = null, entityId = null,
   actorType, actorId = null, status = 'auto',
+  // Документ и место события. Необязательны — но без них запись остаётся
+  // текстом, из которого никуда нельзя перейти.
+  invoiceId = null, cellBlockId = null,
 }) {
   const result = await client.query(
     `INSERT INTO journal_entries
-       (warehouse_id, agent, action_text, entity_type, entity_id, actor_type, actor_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (warehouse_id, agent, action_text, entity_type, entity_id, actor_type, actor_id,
+        status, invoice_id, cell_block_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING *`,
-    [warehouseId, agent, actionText, entityType, entityId, actorType, actorId, status],
+    [warehouseId, agent, actionText, entityType, entityId, actorType, actorId, status,
+      invoiceId, cellBlockId],
   );
   return result.rows[0];
 }
 
 async function listEntries(client, warehouseId, { limit = 200 } = {}) {
+  // Номер накладной и адрес ячейки собираем здесь, а не на клиенте: иначе
+  // кабинету пришлось бы держать в памяти всю карту склада только ради подписи.
   const result = await client.query(
-    `SELECT * FROM journal_entries WHERE warehouse_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    `SELECT je.*,
+            i.number AS invoice_number,
+            CASE WHEN cb.id IS NULL THEN NULL ELSE
+              wr.row_num
+              || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
+                             ELSE cb.rack_start || '–' || cb.rack_end END
+              || '.' || CASE WHEN cb.tier_start = cb.tier_end THEN cb.tier_start::text
+                             ELSE cb.tier_start || '–' || cb.tier_end END
+            END AS cell_label
+     FROM journal_entries je
+     LEFT JOIN invoices i ON i.id = je.invoice_id
+     LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
+     LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+     WHERE je.warehouse_id = $1
+     ORDER BY je.created_at DESC LIMIT $2`,
     [warehouseId, limit],
   );
   return result.rows;

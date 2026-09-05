@@ -104,6 +104,8 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
           + (note ? ` Дефект: ${note}` : ''),
         entityType: 'invoice_item',
         entityId: invoiceItemId,
+        invoiceId: item.invoice_id,
+        cellBlockId: cellBlockId || null,
         actorType: 'worker',
         actorId: staffKeyId,
         status: 'auto',

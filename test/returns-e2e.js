@@ -217,6 +217,15 @@ async function api(method, path, { token, body } = {}) {
     check('every bucket sort is journalled', () => {
       assert.equal(returnEntries.length, 3, `got ${returnEntries.length} entries`);
     });
+    // Запись должна вести к документу и к месту, иначе журнал остаётся текстом:
+    // прочитать про ячейку можно, а пойти в неё — нет.
+    check('из записи журнала видно накладную и ячейку', () => {
+      const withCell = returnEntries.filter((e) => e.cell_block_id);
+      assert.ok(withCell.length >= 1, 'ни одна запись не знает своей ячейки');
+      assert.ok(withCell[0].cell_label, 'адрес ячейки не собран: ' + JSON.stringify(withCell[0]));
+      assert.ok(returnEntries.every((e) => e.invoice_id), 'запись не знает своей накладной');
+      assert.ok(returnEntries[0].invoice_number, 'номер накладной не подставлен');
+    });
 
     // ---------- Брак не уезжает клиенту ----------
     // Брак и ждущий перепаковки товар лежат в обычных ячейках, и до появления
