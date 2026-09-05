@@ -116,6 +116,12 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       continue;
     }
 
+    // Штрихкод и резерв приходят из 1С и не пересчитываются у нас: первый
+    // напечатан на коробке, второй знает только 1С. Обоих может не быть —
+    // конфигурации разные, и обмен не должен от этого падать.
+    const barcode = typeof rec.barcode === 'string' ? rec.barcode.trim().slice(0, 64) : null;
+    const reserved = numeric(rec.reservedQty);
+
     const fields = {
       name,
       category: rec.category?.trim() || null,
@@ -124,6 +130,11 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       height_mm: numeric(rec.heightMm),
       weight_g: numeric(rec.weightG),
       active: rec.active === undefined ? true : Boolean(rec.active),
+      barcode: barcode || null,
+      reserved_qty: reserved,
+      // Отметка времени у резерва обязательна: без неё нельзя отличить
+      // «ноль в резерве» от «1С давно не присылала резервы».
+      reserved_at: reserved === null ? null : new Date(),
     };
 
     const byExternal = await client.query(
@@ -138,13 +149,21 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
 
     if (target) {
       await client.query(
+        // COALESCE у штрихкода и резерва: обмен, который их ещё не умеет
+        // присылать, не должен стирать уже полученные. Затирать данные
+        // молчанием — худший вид потери.
         `UPDATE products SET name = $2, category = $3, length_mm = $4, width_mm = $5,
                              height_mm = $6, weight_g = $7, active = $8,
-                             external_id = $9, updated_at = now()
+                             external_id = $9,
+                             barcode = COALESCE($10, barcode),
+                             reserved_qty = COALESCE($11, reserved_qty),
+                             reserved_at = COALESCE($12, reserved_at),
+                             updated_at = now()
          WHERE id = $1`,
         [
           target.id, fields.name, fields.category, fields.length_mm, fields.width_mm,
           fields.height_mm, fields.weight_g, fields.active, externalId,
+          fields.barcode, fields.reserved_qty, fields.reserved_at,
         ],
       );
       results.push({
@@ -164,12 +183,14 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       const inserted = await client.query(
         `INSERT INTO products
            (warehouse_id, company_id, sku, name, category,
-            length_mm, width_mm, height_mm, weight_g, active, external_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+            length_mm, width_mm, height_mm, weight_g, active, external_id,
+            barcode, reserved_qty, reserved_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
         [
           warehouseId, companyId, sku, fields.name, fields.category,
           fields.length_mm, fields.width_mm, fields.height_mm, fields.weight_g,
           fields.active, externalId,
+          fields.barcode, fields.reserved_qty, fields.reserved_at,
         ],
       );
       await client.query('RELEASE SAVEPOINT sp_insert_product');

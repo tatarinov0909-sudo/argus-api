@@ -12,7 +12,8 @@ const { kitInfo } = require('../kits/kits');
 
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
-    `SELECT p.sku, p.name, p.category, p.weight_g
+    `SELECT p.sku, p.name, p.category, p.weight_g, p.barcode,
+            p.reserved_qty, p.reserved_at
      FROM products p
      WHERE p.warehouse_id = $1 AND p.active AND (p.sku ILIKE $2 OR p.name ILIKE $2)
 
@@ -24,7 +25,8 @@ async function findProducts(client, warehouseId, query) {
               (SELECT ii.name FROM invoice_items ii
                WHERE ii.warehouse_id = cs.warehouse_id AND ii.sku = cs.sku
                ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
-            NULL AS category, NULL AS weight_g
+            NULL AS category, NULL AS weight_g, NULL AS barcode,
+            NULL AS reserved_qty, NULL AS reserved_at
      FROM cell_stock cs
      WHERE cs.warehouse_id = $1 AND cs.qty > 0
        AND NOT EXISTS (SELECT 1 FROM products p2
@@ -84,6 +86,14 @@ async function findProducts(client, warehouseId, query) {
       totalQty,
       availableQty,
       notForSaleQty: totalQty - availableQty,
+      barcode: p.barcode || null,
+      // Резерв 1С: сколько из этого уже обещано её заказам. НЕ вычитаем сами —
+      // заказ, который мы сейчас собираем, вполне может быть тем самым, кто
+      // этот резерв и поставил, и вычитание было бы двойным счётом. Показываем
+      // рядом, чтобы решение принимал человек, а не арифметика вслепую.
+      reservedQty: p.reserved_qty === null || p.reserved_qty === undefined
+        ? null : Number(p.reserved_qty),
+      reservedAt: p.reserved_at || null,
       kit: kit && {
         buildable: kit.buildable,
         limitedBy: kit.limitedBy,
