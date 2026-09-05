@@ -1,9 +1,11 @@
 const express = require('express');
 const service = require('./service');
 
+const { loginLimiter, keyLoginLimiter } = require('../middleware/rateLimit');
+
 const router = express.Router();
 
-router.post('/owner/register', async (req, res, next) => {
+router.post('/owner/register', keyLoginLimiter, async (req, res, next) => {
   try {
     const result = await service.registerOwner(req.body);
     res.status(201).json(result);
@@ -12,7 +14,7 @@ router.post('/owner/register', async (req, res, next) => {
   }
 });
 
-router.post('/owner/login', async (req, res, next) => {
+router.post('/owner/login', loginLimiter, async (req, res, next) => {
   try {
     const result = await service.loginOwner(req.body);
     res.json(result);
@@ -21,7 +23,7 @@ router.post('/owner/login', async (req, res, next) => {
   }
 });
 
-router.post('/staff/login', async (req, res, next) => {
+router.post('/staff/login', keyLoginLimiter, async (req, res, next) => {
   try {
     const result = await service.loginStaffKey(req.body);
     res.json(result);
@@ -30,7 +32,7 @@ router.post('/staff/login', async (req, res, next) => {
   }
 });
 
-router.post('/seller/login', async (req, res, next) => {
+router.post('/seller/login', keyLoginLimiter, async (req, res, next) => {
   try {
     const result = await service.loginSellerKey(req.body);
     res.json(result);

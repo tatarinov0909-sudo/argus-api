@@ -21,6 +21,14 @@ function transliteratePrefix(name) {
   return prefix;
 }
 
+// Почта — это имя входа, и «Ivan@Mail.ru» с «ivan@mail.ru» для человека одно
+// и то же. Раньше регистрация писала как ввели, а вход искал точным
+// совпадением: зарегистрировался с заглавной — войти уже не смог. Плюс на
+// UNIQUE(email) можно было завести два аккаунта, отличающихся регистром.
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
 function signToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '45m',
@@ -40,26 +48,53 @@ async function registerOwner({ name, email, password, warehouseName, city }) {
   // transaction, so this must run inside withTenantContext's BEGIN/COMMIT,
   // not as a bare query before it (that was the bug: the setting was gone
   // by the time the INSERT ran, and Postgres correctly rejected the row).
-  const warehouseId = crypto.randomUUID();
-  const warehouseCode = String(1000 + Math.floor(Math.random() * 9000));
+  const normalizedEmail = normalizeEmail(email);
 
-  return withTenantContext({ warehouseId }, async (client) => {
-    const ownerResult = await client.query(
-      `INSERT INTO owners (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email`,
-      [name, email, passwordHash],
-    );
-    const owner = ownerResult.rows[0];
+  // Код склада — четыре цифры, всего девять тысяч вариантов, и на колонке
+  // UNIQUE. Раньше он брался случайно и один раз: на сотне складов
+  // столкновения становятся обычным делом, и регистрация просто падала
+  // пятисоткой на ровном месте. Пробуем несколько раз, каждый раз заново.
+  const attempt = async () => {
+    const warehouseId = crypto.randomUUID();
+    const warehouseCode = String(1000 + Math.floor(Math.random() * 9000));
+    return withTenantContext({ warehouseId }, async (client) => {
+      // Через узкую функцию: сама таблица владельцев закрыта от приложения,
+      // в ней лежат хеши паролей (см. миграцию owners-locked).
+      const ownerResult = await client.query(
+        `SELECT * FROM create_owner($1, $2, $3)`,
+        [name, normalizedEmail, passwordHash],
+      );
+      const owner = ownerResult.rows[0];
 
-    const whResult = await client.query(
-      `INSERT INTO warehouses (id, owner_id, name, city, warehouse_code)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, name, city, warehouse_code`,
-      [warehouseId, owner.id, warehouseName, city || null, warehouseCode],
-    );
-    const warehouse = whResult.rows[0];
+      const whResult = await client.query(
+        `INSERT INTO warehouses (id, owner_id, name, city, warehouse_code)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, name, city, warehouse_code`,
+        [warehouseId, owner.id, warehouseName, city || null, warehouseCode],
+      );
+      const warehouse = whResult.rows[0];
 
-    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name });
-    return { token, owner, warehouse };
-  });
+      const token = signToken({
+        role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name,
+      });
+      return { token, owner, warehouse };
+    });
+  };
+
+  for (let i = 0; i < 5; i += 1) {
+    try {
+      return await attempt();
+    } catch (err) {
+      // Занятый код склада — не ошибка пользователя, а наша неудачная монетка:
+      // пробуем другую. Занятая почта — ошибка пользователя, и повторять её
+      // бессмысленно, надо сказать об этом словами.
+      if (err.code === '23505' && err.constraint === 'warehouses_warehouse_code_key') continue;
+      if (err.code === '23505' && String(err.constraint || '').includes('email')) {
+        throw new HttpError(409, 'На эту почту уже зарегистрирован кабинет');
+      }
+      throw err;
+    }
+  }
+  throw new HttpError(503, 'Не удалось подобрать свободный код склада, попробуйте ещё раз');
 }
 
 async function loginOwner({ email, password }) {
@@ -67,7 +102,7 @@ async function loginOwner({ email, password }) {
 
   return withoutTenantContext(async (client) => {
     const ownerResult = await client.query(
-      `SELECT id, name, email, password_hash FROM owners WHERE email = $1`,
+      `SELECT * FROM find_owner_for_login($1)`,
       [email],
     );
     const owner = ownerResult.rows[0];
