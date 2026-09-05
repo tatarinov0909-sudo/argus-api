@@ -246,6 +246,7 @@ router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandl
 // складе по-настоящему.
 router.post('/push/stock', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertStock));
 router.post('/push/cells', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertCells1c));
+router.post('/push/cell-catalog', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertCellCatalog));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 

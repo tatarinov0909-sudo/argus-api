@@ -109,6 +109,36 @@ function numeric(value) {
 // товару, поэтому прежние строки этого товара сначала удаляем. Иначе позиция,
 // которую переставили из А-01 в Б-07, осталась бы числиться в обеих —
 // а «лежит в двух местах» хуже, чем «не знаем, где лежит».
+// Справочник ячеек: не «где что лежит», а «какие ячейки вообще есть».
+//
+// Нужен отдельно от адресов, потому что пустая ячейка — тоже ячейка: карта
+// склада, нарисованная по одним занятым, показала бы дырявый склад и
+// работник искал бы полку, которой на схеме нет.
+async function upsertCellCatalog(client, warehouseId, records) {
+  const results = [];
+  for (const rec of records) {
+    const name = typeof rec.cell === 'string' ? rec.cell.trim() : '';
+    if (!name) {
+      results.push({ cell: null, status: 'error', error: 'cell обязателен' });
+      continue;
+    }
+    // «01-02-015» — ряд, ярус, ячейка. Имя не в формате не выбрасываем:
+    // сохраняем без координат, чтобы было видно, что склад размечен не весь.
+    const m = /^(\d+)-(\d+)-(\d+)$/.exec(name);
+    const [rowNum, tier, pos] = m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [null, null, null];
+    await client.query(
+      `INSERT INTO warehouse_cells_1c (warehouse_id, cell_name, row_num, tier, pos, synced_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (warehouse_id, cell_name)
+       DO UPDATE SET row_num = EXCLUDED.row_num, tier = EXCLUDED.tier,
+                     pos = EXCLUDED.pos, synced_at = now()`,
+      [warehouseId, name, rowNum, tier, pos],
+    );
+    results.push({ cell: name, status: m ? 'updated' : 'updated_unparsed' });
+  }
+  return results;
+}
+
 async function upsertCells1c(client, warehouseId, records, options = {}) {
   const results = [];
 
@@ -406,6 +436,7 @@ async function insertItems(client, warehouseId, companyId, invoiceId, items) {
 module.exports = {
   upsertStock,
   upsertCells1c,
+  upsertCellCatalog,
   signIntegrationToken,
   generateKeyCode,
   upsertCompanies,

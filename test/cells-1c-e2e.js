@@ -95,6 +95,35 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(row.cells1c[0].cell, 'В-03-04');
     });
 
+    // ---------- Справочник ячеек: карта склада ----------
+    const cat = await push('/api/sync/push/cell-catalog', [
+      { cell: '01-02-015' }, { cell: '01-02-016' }, { cell: '22-05-050' },
+      { cell: 'Зона приёмки' },
+    ]);
+    check('справочник ячеек принимается, включая неразмеченные', () => {
+      assert.equal(cat.status, 200, JSON.stringify(cat.body));
+      assert.equal(cat.body.results.filter((r) => r.status === 'updated').length, 3);
+      assert.equal(cat.body.results.filter((r) => r.status === 'updated_unparsed').length, 1);
+    });
+
+    const parsed = await run((c) => c.query(
+      `SELECT cell_name, row_num, tier, pos FROM warehouse_cells_1c
+       WHERE warehouse_id = $1 ORDER BY cell_name`, [warehouseId]));
+    check('имя разбирается на ряд, ярус и место', () => {
+      const one = parsed.rows.find((r) => r.cell_name === '01-02-015');
+      assert.equal(one.row_num, 1, 'ряд');
+      assert.equal(one.tier, 2, 'ярус');
+      assert.equal(one.pos, 15, 'ячейка');
+    });
+    check('и ведущие нули не теряются — на табличке написано именно так', () => {
+      assert.ok(parsed.rows.some((r) => r.cell_name === '01-02-015'));
+    });
+    check('ячейка без разметки остаётся, но без координат', () => {
+      const z = parsed.rows.find((r) => r.cell_name === 'Зона приёмки');
+      assert.ok(z, 'потеряли ячейку, имя которой не в формате');
+      assert.equal(z.row_num, null);
+    });
+
     const asOwner = await api('POST', '/api/sync/push/cells', {
       token: ownerToken, body: { records: [{ sku: 'PB-A', cell: 'Х-1' }] },
     });
