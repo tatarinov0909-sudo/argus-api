@@ -179,6 +179,32 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(worker.status, 403, JSON.stringify(worker.body));
     });
 
+    // ---------- Движение: что отгрузили и что вернулось ----------
+    const moves = await api('GET', '/api/sellers/movements', { token: alphaToken });
+    check('продавец видит свою отгрузку', () => {
+      assert.equal(moves.status, 200, JSON.stringify(moves.body));
+      assert.equal(moves.body.shipped.length, 1, JSON.stringify(moves.body.shipped));
+      assert.equal(moves.body.shipped[0].qty, 30);
+      assert.equal(moves.body.shipped[0].sku, 'PB-A');
+      assert.ok(moves.body.shipped[0].order, 'не сказано, по какому заказу');
+    });
+    check('и свой возврат — с тем, чем его признали', () => {
+      assert.equal(moves.body.returned.length, 1, JSON.stringify(moves.body.returned));
+      assert.equal(moves.body.returned[0].qty, 9);
+      assert.equal(moves.body.returned[0].bucket, 'defective',
+        'продавцу не сказано, что товар признан браком');
+    });
+
+    const betaKey = await api('POST', `/api/sellers/companies/${beta.body.id}/keys`, { token: ownerToken });
+    const betaToken = (await api('POST', '/api/auth/seller/login', {
+      body: { keyCode: betaKey.body.key_code, name: 'Иван' },
+    })).body.token;
+    const betaMoves = await api('GET', '/api/sellers/movements', { token: betaToken });
+    check('чужое движение продавцу не видно', () => {
+      assert.equal(betaMoves.body.shipped.length, 0, JSON.stringify(betaMoves.body.shipped));
+      assert.equal(betaMoves.body.returned.length, 0, JSON.stringify(betaMoves.body.returned));
+    });
+
     // ---------- Отзыв ключа действует сразу ----------
     // Раньше отзыв закрывал только вход, а выданный токен жил до конца срока —
     // до 45 минут. Отзывают ключ обычно тогда, когда этих минут и нет.

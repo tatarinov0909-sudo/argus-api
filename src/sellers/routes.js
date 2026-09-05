@@ -83,6 +83,75 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, re
   }
 });
 
+// Движение товара продавца: что у него отгрузили и что вернулось.
+//
+// Остаток отвечает на «сколько лежит», но не на «куда делось». Именно из-за
+// второго вопроса продавец и звонит на склад: он видит, что стало меньше, и
+// не знает почему. Возврат тем более: пока он не увидит, что признано браком
+// и почему, решать по нему он не сможет.
+//
+// Область видимости снова решает Postgres: политики на shipping_records и
+// return_records пропускают строки своей компании.
+router.get('/movements', requireAuth, requireRole('seller', 'owner'), async (req, res, next) => {
+  try {
+    const ctx = tenantContextFromAuth(req.auth);
+    const companyId = req.auth.role === 'owner' ? req.query.companyId : req.auth.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+
+    const out = await withTenantContext(ctx, async (client) => {
+      const shipped = await client.query(
+        `SELECT sr.id, sr.picked_qty AS qty, sr.finished_at AS at,
+                ii.name, ii.sku, i.number AS invoice_number, i.source
+         FROM shipping_records sr
+         JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+         JOIN invoices i ON i.id = ii.invoice_id
+         WHERE sr.company_id = $1 AND sr.picked_qty IS NOT NULL
+         ORDER BY sr.finished_at DESC NULLS LAST
+         LIMIT 300`,
+        [companyId],
+      );
+      const returned = await client.query(
+        `SELECT rr.id, rr.qty, rr.finished_at AS at, rr.quality_bucket, rr.defect_note,
+                ii.name, ii.sku, i.number AS invoice_number
+         FROM return_records rr
+         JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+         JOIN invoices i ON i.id = ii.invoice_id
+         WHERE rr.company_id = $1
+         ORDER BY rr.finished_at DESC
+         LIMIT 300`,
+        [companyId],
+      );
+      return { shipped: shipped.rows, returned: returned.rows };
+    });
+
+    res.json({
+      shipped: out.shipped.map((r) => ({
+        id: r.id,
+        at: r.at,
+        qty: Number(r.qty),
+        name: r.name,
+        sku: r.sku,
+        order: r.invoice_number,
+        // Откуда пришёл заказ — продавцу это важнее, чем складу: он сверяет
+        // с кабинетом площадки, а не с 1С склада.
+        source: r.source === 'wb' ? 'Wildberries' : '1С',
+      })),
+      returned: out.returned.map((r) => ({
+        id: r.id,
+        at: r.at,
+        qty: Number(r.qty),
+        name: r.name,
+        sku: r.sku,
+        order: r.invoice_number,
+        bucket: r.quality_bucket,
+        note: r.defect_note || null,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/companies', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
