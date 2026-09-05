@@ -13,7 +13,7 @@ const { kitInfo } = require('../kits/kits');
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
     `SELECT p.sku, p.name, p.category, p.weight_g, p.barcode,
-            p.reserved_qty, p.reserved_at
+            p.reserved_qty, p.reserved_at, p.stock_qty_1c, p.stock_at
      FROM products p
      WHERE p.warehouse_id = $1 AND p.active AND (p.sku ILIKE $2 OR p.name ILIKE $2)
 
@@ -26,7 +26,8 @@ async function findProducts(client, warehouseId, query) {
                WHERE ii.warehouse_id = cs.warehouse_id AND ii.sku = cs.sku
                ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
             NULL AS category, NULL AS weight_g, NULL AS barcode,
-            NULL AS reserved_qty, NULL AS reserved_at
+            NULL AS reserved_qty, NULL AS reserved_at,
+            NULL AS stock_qty_1c, NULL AS stock_at
      FROM cell_stock cs
      WHERE cs.warehouse_id = $1 AND cs.qty > 0
        AND NOT EXISTS (SELECT 1 FROM products p2
@@ -94,6 +95,12 @@ async function findProducts(client, warehouseId, query) {
       reservedQty: p.reserved_qty === null || p.reserved_qty === undefined
         ? null : Number(p.reserved_qty),
       reservedAt: p.reserved_at || null,
+      // Сколько числится в 1С — отдельно от того, что разложено по ячейкам.
+      // Расхождение между ними и есть самая полезная цифра: «в 1С 500,
+      // в ячейках 480» означает, что двадцать штук где-то не там.
+      stockIn1c: p.stock_qty_1c === null || p.stock_qty_1c === undefined
+        ? null : Number(p.stock_qty_1c),
+      stockAt: p.stock_at || null,
       kit: kit && {
         buildable: kit.buildable,
         limitedBy: kit.limitedBy,

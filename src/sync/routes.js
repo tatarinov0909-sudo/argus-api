@@ -242,6 +242,9 @@ function pushHandlerWithDefaultCompany(upsertFn) {
 
 router.post('/push/products', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertProducts));
 router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertInvoices));
+// Остатки: то, чего в обмене не было вовсе, из-за чего Аргус ничего не знал о
+// складе по-настоящему.
+router.post('/push/stock', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertStock));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 

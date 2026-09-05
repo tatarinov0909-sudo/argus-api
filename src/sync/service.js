@@ -93,6 +93,54 @@ function numeric(value) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
+// Остатки из 1С.
+//
+// Приходит «сколько всего этого артикула на складе» — то, что 1С знает точно.
+// Кладём рядом с карточкой, а не в ячейки: в какой ячейке товар лежит, знает
+// только Аргус, и узнаёт он это, когда работник туда что-то положил.
+// Разложить итог по ячейкам самим означало бы выдумать адреса — ровно то, из-за
+// чего пришлось стирать 879 строк.
+//
+// Обмен идёт пачками и повторяется по расписанию, поэтому это именно снимок:
+// каждый раз перезаписываем, а не прибавляем.
+async function upsertStock(client, warehouseId, records, options = {}) {
+  const results = [];
+  const now = new Date();
+
+  for (const rec of records) {
+    const sku = rec.sku?.trim();
+    if (!sku) {
+      results.push({ sku: null, status: 'error', error: 'sku обязателен' });
+      continue;
+    }
+    const qty = numeric(rec.qty);
+    if (qty === null) {
+      results.push({ sku, status: 'error', error: 'qty обязателен и должен быть числом' });
+      continue;
+    }
+
+    const companyId = (await resolveCompany(client, warehouseId, rec.companyExternalId))
+      || options.defaultCompanyId || null;
+
+    // Товар должен быть в справочнике: остаток без карточки некуда положить,
+    // и это верный признак, что номенклатуру ещё не выгружали.
+    const updated = await client.query(
+      `UPDATE products SET stock_qty_1c = $3, stock_at = $4, updated_at = now()
+       WHERE warehouse_id = $1 AND sku = $2
+         AND ($5::uuid IS NULL OR company_id = $5::uuid)
+       RETURNING id`,
+      [warehouseId, sku, qty, now, companyId],
+    );
+    if (updated.rows.length === 0) {
+      results.push({ sku, status: 'error', error: 'Товар не найден — сначала выгрузите номенклатуру' });
+      continue;
+    }
+    results.push({ sku, status: 'updated', rows: updated.rows.length });
+  }
+
+  return results;
+}
+
 async function upsertProducts(client, warehouseId, records, options = {}) {
   const results = [];
   for (const rec of records) {
@@ -301,6 +349,7 @@ async function insertItems(client, warehouseId, companyId, invoiceId, items) {
 }
 
 module.exports = {
+  upsertStock,
   signIntegrationToken,
   generateKeyCode,
   upsertCompanies,
