@@ -244,6 +244,23 @@ async function expectFails(run) {
       assert.equal(trail.rows.length, 1, 'записана операция, которой не было');
     });
 
+    // 1С должна узнать и о сборке: компонентов стало меньше, набора больше.
+    const kitOutbox = await run((c) => c.query(
+      `SELECT payload FROM sync_outbox
+       WHERE warehouse_id = $1 AND event_type = 'kit_assembled'`,
+      [warehouseId],
+    ));
+    check('сборка уходит в очередь для 1С', () => {
+      assert.equal(kitOutbox.rows.length, 1, 'события сборки в очереди нет');
+    });
+    check('и в нём обе стороны движения: набор в плюс, компоненты в минус', () => {
+      const lines = kitOutbox.rows[0].payload.lines;
+      const kit = lines.find((l) => l.sku === KIT);
+      const oat = lines.find((l) => l.sku === 'PB-OAT');
+      assert.equal(kit.deltaQty, 3, JSON.stringify(lines));
+      assert.equal(oat.deltaQty, -6, JSON.stringify(lines));
+    });
+
     const afterBuild = await api('GET', `/api/kits/${companyId}/${KIT}`, { token: ownerToken });
     check('после сборки собрать можно меньше — компоненты кончаются', () => {
       assert.equal(afterBuild.body.buildable, 1, JSON.stringify(afterBuild.body.components));

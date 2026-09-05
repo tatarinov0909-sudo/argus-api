@@ -264,6 +264,22 @@ const whIdOf = (token) => JSON.parse(
       assert.equal(Number(goneStock.rows[0].qty), 0, 'списанного товара по базе всё ещё 40');
     });
 
+    const invOutbox = await run((c) => c.query(
+      `SELECT payload FROM sync_outbox
+       WHERE warehouse_id = $1 AND event_type = 'inventory_applied'`,
+      [warehouseId],
+    ));
+    check('принятый пересчёт уходит в очередь для 1С', () => {
+      assert.equal(invOutbox.rows.length, 1, 'события пересчёта в очереди нет');
+      const lines = invOutbox.rows[0].payload.lines;
+      const lost = lines.find((l) => l.sku === 'PB-LOST');
+      assert.equal(lost.deltaQty, 7, JSON.stringify(lines));
+    });
+    check('а отклонённый — не уходит', () => {
+      // Отклонение остаток не меняет, значит и сообщать 1С не о чем.
+      assert.equal(invOutbox.rows.length, 1);
+    });
+
     const twice = await api('POST', `/api/inventory/tasks/${second.id}/resolve`, {
       token: ownerToken, body: { decision: 'apply' },
     });

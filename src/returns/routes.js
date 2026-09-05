@@ -4,6 +4,7 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
+const outbox = require('../sync/outbox');
 
 const router = express.Router();
 
@@ -39,10 +40,16 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
       const itemResult = await client.query(
+        // Идентификаторы 1С забираем сразу: событие для обмена собирается в
+        // той же транзакции, и второй заход в базу ради них не нужен.
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
-                i.direction
+                ii.external_id,
+                i.direction, i.number AS invoice_number,
+                i.external_id AS invoice_external_id,
+                c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
+         JOIN companies c ON c.id = ii.company_id
          WHERE ii.id = $1 AND ii.warehouse_id = $2`,
         [invoiceItemId, warehouseId],
       );
@@ -93,6 +100,23 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
           staffKeyId, pausedMs || 0, JSON.stringify(pauseReasons || []), note || null,
         ],
       );
+
+      // Возврат физически прибавил товар на складе — 1С должна об этом узнать
+      // так же, как о приёмке. В одной транзакции с движением остатка: запись
+      // без события означала бы тихое расхождение с 1С.
+      await outbox.appendReturn(client, {
+        warehouseId,
+        item,
+        invoice: {
+          id: item.invoice_id,
+          number: item.invoice_number,
+          external_id: item.invoice_external_id,
+        },
+        company: { id: item.company_id, external_id: item.company_external_id },
+        actualQty: qty,
+        quality: qualityBucket,
+        defectNote: note,
+      });
 
       const newTotal = alreadyLogged + Number(qty);
       await journal.createEntry(client, {

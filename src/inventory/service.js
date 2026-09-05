@@ -1,5 +1,6 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
+const outbox = require('../sync/outbox');
 
 // Пересчёт ячейки: назначение, счёт, решение владельца.
 //
@@ -398,6 +399,25 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId }) {
     );
   }
   await refreshCellFill(client, task.cell_block_id);
+
+  // Принятый пересчёт — единственное место, где остаток меняется «просто так»,
+  // без документа. Именно поэтому 1С обязана о нём узнать: иначе её цифра
+  // останется той, которую только что признали неверной.
+  if (changes.length > 0) {
+    const byCompany = new Map();
+    for (const line of changes) {
+      const key = line.companyId || '';
+      if (!byCompany.has(key)) byCompany.set(key, []);
+      byCompany.get(key).push(line);
+    }
+    for (const [companyId, lines] of byCompany) {
+      await outbox.appendInventory(client, {
+        warehouseId,
+        companyId: companyId || null,
+        changes: lines,
+      });
+    }
+  }
 
   // След: пересчёт двигает остаток так же, как сборка или перепаковка, и
   // должен быть виден в том же месте.

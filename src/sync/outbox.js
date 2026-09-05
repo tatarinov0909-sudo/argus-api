@@ -12,6 +12,14 @@
 
 const EVENT_RECEIVING = 'receiving_completed';
 const EVENT_SHIPPING = 'shipping_completed';
+// Возврат, сборка набора и пересчёт тоже двигают остаток — и до сих пор в
+// очередь не попадали. То есть обещание «1С узнает обо всём» было верно ровно
+// наполовину: приход и расход по документам уезжали, а товар, вернувшийся от
+// покупателя, разобранный в набор или найденный при пересчёте, — нет. Включив
+// когда-нибудь запись в 1С, мы бы получили расхождение с первого же возврата.
+const EVENT_RETURN = 'return_sorted';
+const EVENT_ASSEMBLY = 'kit_assembled';
+const EVENT_INVENTORY = 'inventory_applied';
 
 async function append(client, { warehouseId, eventType, payload }) {
   const result = await client.query(
@@ -69,6 +77,62 @@ async function appendShipping(client, args) {
   });
 }
 
+// Возврат: товар физически прибавился на складе. Состояние передаём, потому
+// что от него зависит, можно ли его снова продавать, — а решает это 1С, где
+// брак и годное живут по-разному.
+async function appendReturn(client, args) {
+  return append(client, {
+    warehouseId: args.warehouseId,
+    eventType: EVENT_RETURN,
+    payload: {
+      ...movementPayload({ ...args, direction: 'return' }),
+      quality: args.quality,
+      defectNote: args.defectNote ?? null,
+    },
+  });
+}
+
+// Сборка набора и пересчёт — движения без документа. Здесь нет ни накладной,
+// ни строки: есть только «стало столько-то такого-то товара», и именно это
+// 1С и нужно, чтобы её остаток сошёлся с полкой.
+function adjustmentPayload({ companyId, lines, occurredAt, reason }) {
+  return {
+    companyId: companyId || null,
+    reason,
+    // Плюс — прибавилось, минус — убыло. Одним списком, чтобы 1С провела это
+    // одним документом, а не пятью.
+    lines: lines.map((l) => ({ sku: l.sku, deltaQty: Number(l.deltaQty) })),
+    occurredAt: occurredAt || new Date().toISOString(),
+  };
+}
+
+async function appendAssembly(client, { warehouseId, companyId, kitSku, qty, components }) {
+  return append(client, {
+    warehouseId,
+    eventType: EVENT_ASSEMBLY,
+    payload: adjustmentPayload({
+      companyId,
+      reason: `Собран набор ${kitSku}`,
+      lines: [
+        { sku: kitSku, deltaQty: qty },
+        ...components.map((c) => ({ sku: c.sku, deltaQty: -c.taken })),
+      ],
+    }),
+  });
+}
+
+async function appendInventory(client, { warehouseId, companyId, changes, cellLabel }) {
+  return append(client, {
+    warehouseId,
+    eventType: EVENT_INVENTORY,
+    payload: adjustmentPayload({
+      companyId,
+      reason: `Пересчёт ячейки${cellLabel ? ' ' + cellLabel : ''}`,
+      lines: changes.map((c) => ({ sku: c.sku, deltaQty: c.diff })),
+    }),
+  });
+}
+
 // Cursor read. `since` is exclusive, so a client that has processed up to N
 // asks for N and gets N+1 onward — the same call repeated returns the same
 // rows until they are acknowledged, which is what makes retrying safe.
@@ -107,6 +171,7 @@ async function pendingCount(client, warehouseId) {
 }
 
 module.exports = {
+  appendReturn, appendAssembly, appendInventory,
   EVENT_RECEIVING,
   EVENT_SHIPPING,
   appendReceiving,

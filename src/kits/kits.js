@@ -1,5 +1,6 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
+const outbox = require('../sync/outbox');
 
 // Наборы («сплиты»): один артикул в заказе — несколько разных товаров на полке.
 //
@@ -160,6 +161,17 @@ async function assembleKit(client, warehouseId, {
   // След операции. У сборки нет накладной, к которой можно привязаться, —
   // значит без этой записи остаток меняется, а кто и когда, неизвестно. Ровно
   // на это упирается любой спор о недостаче.
+  // Сборка меняет остаток по нескольким артикулам сразу: компонентов стало
+  // меньше, набора — больше. Для 1С это такое же движение, как приёмка, и без
+  // события её остаток разойдётся с полкой на первом же собранном наборе.
+  await outbox.appendAssembly(client, {
+    warehouseId,
+    companyId,
+    kitSku,
+    qty: amount,
+    components: parts.map((p) => ({ sku: p.sku, taken: p.perKit * amount })),
+  });
+
   await client.query(
     `INSERT INTO stock_operations
        (warehouse_id, company_id, kind, sku, qty, to_cell_block_id, details, worker_key_id)

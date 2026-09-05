@@ -9,6 +9,7 @@
 
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
+const { withTenantContext } = require('../src/db/pool');
 
 const PORT = 3998;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -61,6 +62,9 @@ async function api(method, path, { token, body } = {}) {
     });
     assert.equal(reg.status, 201, `register failed: ${JSON.stringify(reg.body)}`);
     const ownerToken = reg.body.token;
+    const warehouseId = JSON.parse(
+      Buffer.from(ownerToken.split('.')[1], 'base64').toString('utf8'),
+    ).warehouseId;
 
     const company = await api('POST', '/api/sellers/companies', {
       token: ownerToken, body: { name: 'Alpha' },
@@ -219,6 +223,23 @@ async function api(method, path, { token, body } = {}) {
     });
     // Запись должна вести к документу и к месту, иначе журнал остаётся текстом:
     // прочитать про ячейку можно, а пойти в неё — нет.
+    // 1С должна узнать о возврате так же, как о приёмке: товар физически
+    // прибавился. До этого в очередь попадали только приёмки и отгрузки.
+    const outboxRows = await withTenantContext({ warehouseId }, (c) => c.query(
+      `SELECT event_type, payload FROM sync_outbox
+       WHERE warehouse_id = $1 AND event_type = 'return_sorted'`,
+      [warehouseId],
+    ));
+    check('возврат уходит в очередь для 1С', () => {
+      assert.equal(outboxRows.rows.length, 3,
+        'событий возврата в очереди: ' + outboxRows.rows.length);
+    });
+    check('и в событии есть состояние товара', () => {
+      const buckets = outboxRows.rows.map((r) => r.payload.quality).sort();
+      assert.deepEqual(buckets, ['defective', 'good', 'packaging_defect'],
+        JSON.stringify(buckets));
+    });
+
     // Обратный ход: из ячейки и из накладной — вся их история.
     const cellId = returnEntries.find((e) => e.cell_block_id)?.cell_block_id;
     const byCell = cellId

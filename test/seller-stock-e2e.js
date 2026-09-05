@@ -179,6 +179,23 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(worker.status, 403, JSON.stringify(worker.body));
     });
 
+    // Список актов приёмки должен быть списком приёмок. Без фильтра по
+    // направлению туда попадали заказы на отгрузку и возвраты — и продавец
+    // видел их как «акты приёмки» с пустой колонкой «принято».
+    const acts = await api('GET', '/api/invoices?direction=in', { token: alphaToken });
+    check('в актах приёмки только приёмки', () => {
+      assert.equal(acts.status, 200, JSON.stringify(acts.body));
+      assert.ok(acts.body.length >= 1);
+      assert.ok(acts.body.every((i) => i.direction === 'in'),
+        'в акты приёмки попало другое направление: '
+          + JSON.stringify(acts.body.map((i) => i.direction)));
+    });
+    const allDirections = await api('GET', '/api/invoices', { token: alphaToken });
+    check('и без фильтра их действительно больше — фильтр не декоративный', () => {
+      assert.ok(allDirections.body.length > acts.body.length,
+        'у продавца нет ни отгрузок, ни возвратов — проверка ничего не значит');
+    });
+
     // ---------- Движение: что отгрузили и что вернулось ----------
     const moves = await api('GET', '/api/sellers/movements', { token: alphaToken });
     check('продавец видит свою отгрузку', () => {
