@@ -23,12 +23,24 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
       const blocksResult = await client.query(
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
                 cb.state, cb.fill_pct, cb.label,
-                COALESCE(json_agg(json_build_object(
+                COALESCE(json_agg(DISTINCT jsonb_build_object(
                   'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
                   'quality', cs.quality
-                ) ORDER BY cs.updated_at) FILTER (WHERE cs.id IS NOT NULL), '[]') AS stock
+                )) FILTER (WHERE cs.id IS NOT NULL), '[]') AS stock,
+                -- Что в этой ячейке числится по 1С. Отдельно от stock и
+                -- намеренно: наш stock — то, что работник положил своими
+                -- руками, здесь же чужое утверждение об этой полке. Количества
+                -- в нём нет вовсе — регистр владельца отвечает «лежит тут»,
+                -- но не «сколько».
+                COALESCE(json_agg(DISTINCT jsonb_build_object(
+                  'sku', pc.sku, 'name', p.name
+                )) FILTER (WHERE pc.id IS NOT NULL), '[]') AS stock_1c
          FROM cell_blocks cb
          LEFT JOIN cell_stock cs ON cs.cell_block_id = cb.id
+         LEFT JOIN product_cells_1c pc
+           ON pc.warehouse_id = cb.warehouse_id AND pc.cell_name = cb.label
+         LEFT JOIN products p
+           ON p.warehouse_id = pc.warehouse_id AND p.sku = pc.sku
          WHERE cb.warehouse_id = $1
          GROUP BY cb.id`,
         [warehouseId],
