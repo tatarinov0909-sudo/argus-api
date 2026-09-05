@@ -21,7 +21,11 @@ router.get('/', requireAuth, async (req, res, next) => {
     }
     const rows = await withTenantContext(ctx, async (client) => {
       const result = await client.query(
+        // source нужен списку и выгрузке: заказ с площадки и накладная из 1С
+        // выглядят одинаково, пока не сказано, откуда они. Без этого поля
+        // выгрузка честно подписывала «1С» под каждым заказом Wildberries.
         `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
+                i.source, i.external_id,
                 c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)

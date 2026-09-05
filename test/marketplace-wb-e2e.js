@@ -277,6 +277,15 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       assert.equal(row.sku, 'ART-НЕТУ');
     });
 
+    // Список накладных должен говорить, откуда заказ: без этого владелец не
+    // отличит заказ площадки от документа 1С, а выгрузка подписывает всё «1С».
+    const listed2 = await api('GET', '/api/invoices', { token: ownerToken });
+    check('в списке накладных видно, что заказ пришёл с площадки', () => {
+      const wbRow = (listed2.body || []).find((i) => i.number === 'WB-5000000001');
+      assert.ok(wbRow, JSON.stringify((listed2.body || []).map((i) => i.number)));
+      assert.equal(wbRow.source, 'wb');
+    });
+
     // ---------- Повторный проход ----------
     const second = await api('POST', '/api/marketplaces/sync', {
       token: ownerToken, body: { companyId },
