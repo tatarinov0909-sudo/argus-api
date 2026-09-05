@@ -25,7 +25,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
                 cb.state, cb.fill_pct, cb.label,
                 COALESCE(json_agg(DISTINCT jsonb_build_object(
                   'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
-                  'quality', cs.quality
+                  'quality', cs.quality, 'source', cs.source
                 )) FILTER (WHERE cs.id IS NOT NULL), '[]') AS stock,
                 -- Что в этой ячейке числится по 1С. Отдельно от stock и
                 -- намеренно: наш stock — то, что работник положил своими
