@@ -17,6 +17,7 @@ const shippingRoutes = require('./shipping/routes');
 const kitRoutes = require('./kits/routes');
 const marketplaceRoutes = require('./marketplaces/routes');
 const leadRoutes = require('./leads/routes');
+const inventoryRoutes = require('./inventory/routes');
 const returnRoutes = require('./returns/routes');
 const journalRoutes = require('./journal/routes');
 const syncRoutes = require('./sync/routes');
@@ -53,6 +54,7 @@ function createApp() {
   app.use('/api/marketplaces', marketplaceRoutes);
   // Единственная ручка без авторизации: заявка с лендинга.
   app.use('/api/leads', leadRoutes);
+  app.use('/api/inventory', inventoryRoutes);
   app.use('/api/returns', returnRoutes);
   app.use('/api/journal', journalRoutes);
   app.use('/api/sync', syncRoutes);
