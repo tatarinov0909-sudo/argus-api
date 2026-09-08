@@ -24,6 +24,27 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Экран менеджера, первый взгляд: у кого накопились заказы. Не список
+// заказов, а список продавцов с числом — по нему решают, чем заняться.
+router.get('/pending', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rows = await withTenantContext({ warehouseId },
+      (client) => service.pendingByCompany(client, warehouseId));
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+// Заказы выбранного продавца.
+router.get('/pending/:companyId', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rows = await withTenantContext({ warehouseId },
+      (client) => service.pendingOrders(client, warehouseId, req.params.companyId));
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
 // Список поставок. Продавцу тоже: это его товар уезжает, и знать, когда
 // и куда, — его законный интерес. Что он увидит, решает изоляция в базе.
 router.get('/', requireAuth, requireRole('owner', 'worker', 'seller'), async (req, res, next) => {

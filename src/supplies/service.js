@@ -288,4 +288,81 @@ async function list(client, warehouseId, { status = null } = {}) {
   return r.rows.map((x) => ({ ...x, statusName: STATUS_NAMES[x.status] }));
 }
 
-module.exports = { create, contents, advance, list, STATUS_NAMES };
+// Заказы, которые ещё никуда не уехали, — сгруппированные по продавцам.
+//
+// Главный экран менеджера начинается не со списка заказов, а со списка
+// продавцов и числа накопившегося у каждого. Двести заказов подряд — это
+// выгрузка базы, по ней нельзя решить, чем заняться; «у Slim Team набралось
+// 153» — можно.
+//
+// Считается только то, что ещё не в поставке: попавшее в поставку уже решено
+// и в этом списке лишнее.
+async function pendingByCompany(client, warehouseId) {
+  const r = await client.query(
+    `SELECT c.id AS company_id, c.name AS company_name, i.source AS marketplace,
+            count(DISTINCT i.id)::int AS orders,
+            COALESCE(sum(ii.declared_qty), 0)::numeric AS units,
+            min(i.created_at) AS oldest,
+            count(DISTINCT i.id) FILTER (WHERE ii.sku IS NULL OR ii.mp_rid IS NULL)::int AS incomplete
+       FROM invoices i
+       JOIN companies c ON c.id = i.company_id
+       LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE i.warehouse_id = $1
+        AND i.direction = 'out'
+        AND i.supply_id IS NULL
+        AND i.status <> 'shipped'
+      GROUP BY c.id, c.name, i.source
+      ORDER BY count(DISTINCT i.id) DESC, c.name`,
+    [warehouseId],
+  );
+  return r.rows.map((x) => ({
+    companyId: x.company_id,
+    companyName: x.company_name,
+    marketplace: x.marketplace,
+    orders: x.orders,
+    units: Number(x.units),
+    oldest: x.oldest,
+    // Заказы, у которых нет нашего артикула или номера отправления: собрать
+    // их нельзя, и лучше сказать об этом до того, как менеджер нажмёт
+    // «всё на сборку», а не после.
+    incomplete: x.incomplete,
+  }));
+}
+
+// Заказы одного продавца — то, что менеджер видит, выбрав его в списке.
+async function pendingOrders(client, warehouseId, companyId) {
+  const r = await client.query(
+    `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
+            ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
+            ii.mp_nm_id, ii.mp_rid
+       FROM invoices i
+       LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE i.warehouse_id = $1
+        AND i.company_id = $2
+        AND i.direction = 'out'
+        AND i.supply_id IS NULL
+        AND i.status <> 'shipped'
+      ORDER BY i.created_at DESC, i.number`,
+    [warehouseId, companyId],
+  );
+  return r.rows.map((x) => ({
+    id: x.id,
+    number: x.number,
+    createdAt: x.created_at,
+    marketplace: x.marketplace,
+    status: x.status,
+    sku: x.sku,
+    name: x.name,
+    qty: x.declared_qty === null ? null : Number(x.declared_qty),
+    article: x.mp_article,
+    barcode: x.mp_barcode,
+    nmId: x.mp_nm_id,
+    rid: x.mp_rid,
+    // Собирать нечего, пока товар не сопоставлен с номенклатурой склада.
+    ready: Boolean(x.sku && x.mp_rid),
+  }));
+}
+
+module.exports = {
+  create, contents, advance, list, pendingByCompany, pendingOrders, STATUS_NAMES,
+};

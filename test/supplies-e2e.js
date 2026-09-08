@@ -73,6 +73,31 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
               mp_nm_id = '111222'
         WHERE warehouse_id = $1`, [warehouseId]));
 
+    // ---------- Экран менеджера: у кого накопилось ----------
+    const pending = await api('GET', '/api/supplies/pending', { token: ownerToken });
+    check('менеджер видит продавцов с числом накопившихся заказов', () => {
+      assert.equal(pending.status, 200, JSON.stringify(pending.body));
+      const a = pending.body.find((x) => x.companyName === 'Альфа');
+      const b = pending.body.find((x) => x.companyName === 'Бета');
+      assert.equal(a.orders, 3, JSON.stringify(a));
+      assert.equal(a.units, 7, 'штук: 1 + 1 + 5');
+      assert.equal(b.orders, 1);
+    });
+    check('первым идёт тот, у кого больше — по нему и решают, чем заняться', () => {
+      assert.equal(pending.body[0].companyName, 'Альфа');
+    });
+    check('«pending» не принимается за номер поставки', () => {
+      assert.ok(Array.isArray(pending.body), JSON.stringify(pending.body).slice(0, 80));
+    });
+
+    const alphaOrders = await api('GET', `/api/supplies/pending/${alpha.body.id}`, { token: ownerToken });
+    check('заказы выбранного продавца — с артикулом площадки и признаком готовности', () => {
+      assert.equal(alphaOrders.status, 200, JSON.stringify(alphaOrders.body));
+      assert.equal(alphaOrders.body.length, 3);
+      assert.ok(alphaOrders.body.every((o) => o.ready), 'заказ без артикула или отправления не собрать');
+      assert.ok(alphaOrders.body[0].article, 'нет артикула площадки');
+    });
+
     // ---------- Смешивать продавцов нельзя ----------
     const mixed = await api('POST', '/api/supplies', {
       token: ownerToken, body: { invoiceIds: [o1, foreign] },
@@ -210,6 +235,12 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     const sellerToken = (await api('POST', '/api/auth/seller/login', {
       body: { keyCode: key.body.key_code, name: 'Альфа' },
     })).body.token;
+    const afterSupply = await api('GET', '/api/supplies/pending', { token: ownerToken });
+    check('заказы, ушедшие в поставку, из списка накопившегося исчезают', () => {
+      const a = afterSupply.body.find((x) => x.companyName === 'Альфа');
+      assert.ok(!a, JSON.stringify(afterSupply.body));
+    });
+
     const badFilter = await api('GET', '/api/supplies?status=foo', { token: ownerToken });
     check('неизвестный статус в фильтре — понятный отказ, а не внутренняя ошибка', () => {
       assert.equal(badFilter.status, 400, JSON.stringify(badFilter.body));
