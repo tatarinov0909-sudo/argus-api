@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const credentials = require('./credentials');
@@ -8,10 +8,15 @@ const wb = require('./wb');
 
 const router = express.Router();
 
-// Всё здесь — только владельцу склада. Работник к площадкам отношения не имеет
-// вовсе: он видит задание на отбор, а откуда оно приехало — не его дело и не
-// его дверь.
-router.use(requireAuth, requireRole('owner'));
+// Работник к площадкам отношения не имеет вовсе: он видит задание на отбор,
+// а откуда оно приехало — не его дело и не его дверь.
+//
+// Менеджера пускаем, но не всюду. Разница не в должности, а в том, что
+// делает запрос: забрать заказы — это чтение с площадки и прямая работа
+// менеджера, а вот привязать или снять ключ API — распоряжение доступом
+// к чужому кабинету, и это решение владельца. Поэтому список и синхронизация
+// открыты обоим, а ключи — за отдельным правом.
+router.use(requireAuth, requireRole('owner', 'manager'));
 
 router.get('/', async (req, res, next) => {
   try {
@@ -26,7 +31,7 @@ router.get('/', async (req, res, next) => {
 // Подключить ключ. Перед сохранением обязательно ходим на площадку: ключ,
 // который не проверили, выглядит подключённым и молчит, а разбираться в этом
 // придётся через неделю, когда заказы «почему-то не приходят».
-router.post('/credentials', async (req, res, next) => {
+router.post('/credentials', requireGrant('marketplaces'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { companyId, marketplace, token } = req.body;
@@ -44,7 +49,7 @@ router.post('/credentials', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.delete('/:companyId/:marketplace', async (req, res, next) => {
+router.delete('/:companyId/:marketplace', requireGrant('marketplaces'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { companyId, marketplace } = req.params;

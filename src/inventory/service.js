@@ -440,7 +440,161 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId }) {
   return { applied: true, changes };
 }
 
+// Совет «как часто считать».
+//
+// Владелец видит три числа и не знает, откуда их брать. Совет считается по
+// его же складу, без ИИ: доля ячеек, где пересчёт нашёл расхождение, доля
+// сборок, где товар не нашли на полке, и сколько ячеек вообще под товаром.
+// Языковая модель тут не нужна — данных ровно три, а арифметику владелец
+// может проверить сам. Зато выдумать она ничего не может, и это важнее.
+//
+// Осторожность в одну сторону: пока пересчётов мало, никакой доли ещё нет,
+// и совет — это умолчание, о чём прямо написано в причине. Считать «одну
+// ошибку из двух» за пятьдесят процентов расхождений значит гнать склад
+// на ежемесячный пересчёт по двум случайным ячейкам.
+async function advice(client, warehouseId) {
+  const settings = await getSettings(client, warehouseId);
+  const r = await client.query(
+    `WITH stocked AS (
+       SELECT cb.id FROM cell_blocks cb
+       WHERE cb.warehouse_id = $1
+         AND EXISTS (SELECT 1 FROM cell_stock cs WHERE cs.cell_block_id = cb.id AND cs.qty > 0)
+     ),
+     tasks AS (
+       SELECT count(*) FILTER (WHERE counted_at IS NOT NULL)::int AS counted,
+              count(*) FILTER (WHERE status IN ('waiting_owner', 'applied', 'rejected'))::int AS mismatched,
+              max(counted_at) AS last_counted
+       FROM inventory_tasks WHERE warehouse_id = $1
+     ),
+     picks AS (
+       SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE sr.picked_qty < ii.declared_qty)::int AS short
+       FROM shipping_records sr
+       JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+       WHERE sr.warehouse_id = $1 AND sr.is_final
+         AND sr.finished_at > now() - interval '90 days'
+     ),
+     moves AS (
+       SELECT count(*)::int AS n FROM (
+         SELECT finished_at AS at FROM receiving_records WHERE warehouse_id = $1
+         UNION ALL SELECT finished_at FROM shipping_records WHERE warehouse_id = $1
+         UNION ALL SELECT finished_at FROM return_records WHERE warehouse_id = $1
+         UNION ALL SELECT created_at FROM stock_operations WHERE warehouse_id = $1
+       ) m WHERE m.at > now() - interval '30 days'
+     )
+     SELECT (SELECT count(*)::int FROM cell_blocks WHERE warehouse_id = $1) AS cells,
+            (SELECT count(*)::int FROM stocked) AS stocked,
+            (SELECT count(*)::int FROM inventory_tasks
+              WHERE warehouse_id = $1 AND status = 'waiting_owner') AS waiting,
+            (SELECT count(*)::int FROM stocked s
+              WHERE NOT EXISTS (SELECT 1 FROM inventory_tasks t
+                                WHERE t.cell_block_id = s.id AND t.counted_at IS NOT NULL)) AS never_counted,
+            t.counted, t.mismatched, t.last_counted,
+            p.total AS picks, p.short AS shortfalls, mv.n AS moves_30d
+     FROM tasks t, picks p, moves mv`,
+    [warehouseId],
+  );
+  const d = r.rows[0];
+  const stocked = Number(d.stocked);
+  const counted = Number(d.counted);
+  const reasons = [];
+
+  // Доля расхождений — главный признак. Ниже пяти пересчётов доли ещё нет:
+  // на таком числе она скачет от нуля до половины и советует чепуху.
+  const errorRate = counted >= 5 ? Number(d.mismatched) / counted : null;
+  // Сборка, не нашедшая товар на полке, — то же расхождение, только замеченное
+  // позже и дороже: заказ уже собирают.
+  const shortRate = Number(d.picks) >= 20 ? Number(d.shortfalls) / Number(d.picks) : null;
+
+  let days;
+  if (errorRate !== null && errorRate > 0.1) {
+    days = 60;
+    reasons.push(`Пересчёт находил расхождение в ${Math.round(errorRate * 100)}% посчитанных ячеек`
+      + ' — это часто, считать стоит чаще.');
+  } else if (errorRate !== null && errorRate >= 0.03) {
+    days = 90;
+    reasons.push(`Расхождения находятся в ${Math.round(errorRate * 100)}% ячеек — обычная картина склада.`);
+  } else if (errorRate !== null) {
+    days = 120;
+    reasons.push(`Из ${counted} посчитанных ячеек расхождение нашлось в ${d.mismatched}`
+      + ' — база и полка сходятся, редкого пересчёта достаточно.');
+  } else if (shortRate !== null && shortRate > 0.02) {
+    days = 60;
+    reasons.push('Пересчётов пока мало, но сборка не нашла товар на полке'
+      + ` ${d.shortfalls} ${plural(Number(d.shortfalls), 'раз', 'раза', 'раз')} из ${d.picks}`
+      + ' — расхождения есть, их просто ещё не искали.');
+  } else {
+    days = 90;
+    reasons.push('Пересчётов пока мало, считать долю расхождений не на чем.'
+      + ' 90 дней — осторожное умолчание, его стоит пересмотреть после первых заходов.');
+  }
+
+  // Сколько ячеек за заход, чтобы обойти склад целиком за этот срок.
+  const pause = Math.max(1, Number(settings.min_days_between_runs) || DEFAULTS.min_days_between_runs);
+  const runs = Math.max(1, Math.floor(days / pause));
+  // Больше сорока ячеек за заход — это уже не «между делом», а полсмены.
+  // Упираемся в это и честно говорим, что круг тогда длиннее.
+  const wanted = stocked > 0 ? Math.ceil(stocked / runs) : DEFAULTS.cells_per_run;
+  const cellsPerRun = Math.min(40, Math.max(1, wanted));
+  const cycleDays = stocked > 0 ? Math.ceil(stocked / cellsPerRun) * pause : 0;
+
+  if (stocked === 0) {
+    reasons.push('Под товаром нет ни одной ячейки — считать пока нечего.');
+  } else {
+    reasons.push(`Под товаром ${stocked} ${plural(stocked, 'ячейка', 'ячейки', 'ячеек')}`
+      + ` из ${d.cells}. По ${cellsPerRun} за заход с паузой ${pause}`
+      + ` ${plural(pause, 'день', 'дня', 'дней')} склад обходится целиком за ${cycleDays}`
+      + ` ${plural(cycleDays, 'день', 'дня', 'дней')}.`);
+  }
+  if (wanted > cellsPerRun) {
+    reasons.push(`Чтобы уложиться в ${days} ${plural(days, 'день', 'дня', 'дней')},`
+      + ` пришлось бы отдавать по ${wanted} ячеек за заход — это полсмены.`
+      + ' Аргус предлагает 40 и круг подольше: реже, зато выполнимо.');
+  }
+  if (Number(d.never_counted) > 0) {
+    reasons.push(`${d.never_counted} ${plural(Number(d.never_counted), 'ячейку', 'ячейки', 'ячеек')}`
+      + ' под товаром не считали ни разу — они пойдут первыми.');
+  }
+  if (Number(d.waiting) > 0) {
+    reasons.push(`${d.waiting} ${plural(Number(d.waiting), 'расхождение ждёт', 'расхождения ждут', 'расхождений ждут')}`
+      + ' вашего решения. Пока они висят, остаток по этим ячейкам неверный.');
+  }
+  if (Number(d.moves_30d) === 0) {
+    reasons.push('За последний месяц по ячейкам не было ни приёмки, ни отгрузки.'
+      + ' На стоячем складе расхождению взяться неоткуда — спешить незачем.');
+  }
+
+  return {
+    recountAfterDays: days,
+    cellsPerRun,
+    minDaysBetweenRuns: pause,
+    cycleDays,
+    reasons,
+    facts: {
+      cells: Number(d.cells),
+      stocked,
+      counted,
+      mismatched: Number(d.mismatched),
+      neverCounted: Number(d.never_counted),
+      waiting: Number(d.waiting),
+      picks: Number(d.picks),
+      shortfalls: Number(d.shortfalls),
+      moves30d: Number(d.moves_30d),
+      lastCountedAt: d.last_counted,
+    },
+  };
+}
+
+function plural(n, one, few, many) {
+  const mod100 = n % 100;
+  const mod10 = n % 10;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
 module.exports = {
   DEFAULTS, getSettings, saveSettings, pickCells, createRun,
-  cellContents, listTasks, openTask, submitCount, resolveTask, diffOf,
+  cellContents, listTasks, openTask, submitCount, resolveTask, diffOf, advice,
 };

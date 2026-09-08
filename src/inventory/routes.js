@@ -37,6 +37,16 @@ router.patch('/settings', requireAuth, requireRole('owner'), async (req, res, ne
   } catch (err) { next(err); }
 });
 
+// Что Аргус советует поставить в этих трёх полях — и почему.
+// Ничего не сохраняет: владелец решает сам, кнопкой «Применить».
+router.get('/advice', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (c) => service.advice(c, warehouseId));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 // Что правило предложило бы сейчас — без создания заданий. Владелец видит,
 // что именно уйдёт в работу, до того как отправит туда человека.
 router.get('/preview', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {

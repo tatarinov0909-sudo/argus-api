@@ -313,6 +313,43 @@ const whIdOf = (token) => JSON.parse(
     check('счёт, устаревший из-за работы в ячейке, не принимается', () => {
       assert.equal(stale.status, 409, JSON.stringify(stale.body));
     });
+
+    // ---------- Совет «как часто считать» ----------
+    //
+    // Проверяется не конкретное число дней, а то, что совет выполним:
+    // предложенная норма за заход обходит склад целиком за обещанный срок,
+    // и владельцу сказано, откуда это взялось.
+    const adv = await api('GET', '/api/inventory/advice', { token: ownerToken });
+    check('совет отдаётся с причинами, а не одним числом', () => {
+      assert.equal(adv.status, 200, JSON.stringify(adv.body));
+      assert.ok(adv.body.recountAfterDays >= 1, JSON.stringify(adv.body));
+      assert.ok(adv.body.cellsPerRun >= 1 && adv.body.cellsPerRun <= 40, JSON.stringify(adv.body));
+      assert.ok(adv.body.reasons.length >= 2, 'совет без объяснения — это гадание');
+    });
+    check('пока пересчётов мало, совет честно называет себя умолчанием', () => {
+      // На этом складе посчитанных ячеек меньше пяти: доли расхождений нет,
+      // и совет обязан это сказать, а не выдать 50% за статистику.
+      assert.ok(adv.body.facts.counted < 5, 'тест перестал проверять то, что задумано');
+      assert.ok(adv.body.reasons.some((s) => s.includes('умолчание')), adv.body.reasons.join(' | '));
+    });
+    check('норма за заход обходит склад за обещанный срок', () => {
+      const { stocked } = adv.body.facts;
+      if (stocked === 0) return;
+      const runs = Math.ceil(stocked / adv.body.cellsPerRun);
+      assert.equal(adv.body.cycleDays, runs * adv.body.minDaysBetweenRuns, JSON.stringify(adv.body));
+    });
+    check('совет ничего не сохраняет — решает владелец', () => {
+      // Настройки остались теми, что владелец выставил выше.
+      assert.equal(adv.body.recountAfterDays !== 2, true);
+    });
+    const savedAfterAdvice = await api('GET', '/api/inventory/settings', { token: ownerToken });
+    check('и настройки склада после совета не изменились', () => {
+      assert.equal(savedAfterAdvice.body.cellsPerRun, 2, JSON.stringify(savedAfterAdvice.body));
+    });
+    const workerAdvice = await api('GET', '/api/inventory/advice', { token: workerToken });
+    check('работнику совет не отдаётся — это не его решение', () => {
+      assert.equal(workerAdvice.status, 403, JSON.stringify(workerAdvice.body));
+    });
   } finally {
     server.close();
   }

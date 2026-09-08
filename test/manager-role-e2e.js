@@ -83,6 +83,14 @@ async function api(method, path, { token, body } = {}) {
     check('и карту склада видит', () => {
       assert.equal(map.status, 200, JSON.stringify(map.body));
     });
+    const mps = await api('GET', '/api/marketplaces', { token: mgrToken });
+    check('список площадок менеджеру виден — по нему он забирает заказы', () => {
+      assert.equal(mps.status, 200, JSON.stringify(mps.body));
+    });
+    const advice = await api('GET', '/api/inventory/advice', { token: mgrToken });
+    check('и совет по частоте пересчёта — он же его и назначает', () => {
+      assert.equal(advice.status, 200, JSON.stringify(advice.body));
+    });
     const journal = await api('GET', '/api/journal', { token: mgrToken });
     check('и журнал действий', () => {
       assert.equal(journal.status, 200, JSON.stringify(journal.body));
@@ -94,6 +102,10 @@ async function api(method, path, { token, body } = {}) {
       ['POST', '/api/staff', { name: 'Новый грузчик' }, 'выдавать ключи работникам'],
       ['POST', '/api/cells/rows', { configs: [{ rackCount: 2, tierCount: 2 }] }, 'менять склад'],
       ['POST', '/api/sync/keys', { label: 'ключ' }, 'подключать 1С'],
+      ['POST', '/api/marketplaces/credentials', { companyId: null, marketplace: 'wb', token: 'x' },
+        'привязывать ключ площадки'],
+      ['DELETE', '/api/marketplaces/00000000-0000-0000-0000-000000000000/wb', null,
+        'снимать ключ площадки'],
     ];
     for (const [method, path, body, what] of closed) {
       const r = await api(method, path, { token: mgrToken, body });
