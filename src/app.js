@@ -44,6 +44,7 @@ function createApp() {
   app.use('/api/warehouses', warehouseRoutes);
   app.use('/api/staff', staffRoutes);
   app.use('/api/sellers', sellerRoutes);
+  app.use('/api/supplies', require('./supplies/routes'));
   app.use('/api/cells', cellRoutes);
   app.use('/api/dropzones', dropzoneRoutes);
   app.use('/api/products', productRoutes);
