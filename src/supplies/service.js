@@ -17,6 +17,11 @@ const STATUS_NAMES = {
 // Номер поставки человеку, а не машине: дату видно глазами, счётчик внутри
 // дня короткий. Его называют вслух по телефону и пишут на коробке, поэтому
 // UUID здесь не годится.
+// Номер занят? Значит рядом создали такую же поставку в ту же секунду —
+// пересчитываем и пробуем снова. Считать и вставлять одним запросом нельзя:
+// счётчик внутри дня, а не глобальная последовательность, и «предыдущий
+// номер» приходится читать. Три попытки с запасом: одновременных нажатий
+// на складе бывает два, не тридцать.
 async function nextNumber(client, warehouseId) {
   const today = new Date();
   const stamp = `${String(today.getDate()).padStart(2, '0')}${String(today.getMonth() + 1).padStart(2, '0')}`;
@@ -26,6 +31,29 @@ async function nextNumber(client, warehouseId) {
     [warehouseId],
   );
   return `ПС-${stamp}-${String(r.rows[0].n + 1).padStart(2, '0')}`;
+}
+
+const UNIQUE_VIOLATION = '23505';
+
+async function insertWithNumber(client, warehouseId, { companyId, marketplace, destination }) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const number = await nextNumber(client, warehouseId);
+    try {
+      const r = await client.query(
+        `INSERT INTO supplies (warehouse_id, company_id, number, marketplace, destination)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, number, status, destination, created_at`,
+        [warehouseId, companyId, number, marketplace, destination],
+      );
+      return r.rows[0];
+    } catch (err) {
+      // Внутри транзакции неудачная вставка отравляет её целиком, поэтому
+      // откатываемся к точке сохранения, а не пробуем «просто ещё раз».
+      if (err.code !== UNIQUE_VIOLATION) throw err;
+      await client.query('ROLLBACK TO SAVEPOINT supply_number').catch(() => {});
+    }
+  }
+  throw new HttpError(409, 'Не удалось выдать номер поставки — попробуйте ещё раз');
 }
 
 // Собрать поставку из заказов.
@@ -60,14 +88,11 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
     throw new HttpError(400, 'В одной поставке заказы только одного продавца');
   }
 
-  const number = await nextNumber(client, warehouseId);
-  const inserted = await client.query(
-    `INSERT INTO supplies (warehouse_id, company_id, number, marketplace, destination)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, number, status, destination, created_at`,
-    [warehouseId, companies[0], number, marketplace, destination],
-  );
-  const supply = inserted.rows[0];
+  await client.query('SAVEPOINT supply_number');
+  const supply = await insertWithNumber(client, warehouseId, {
+    companyId: companies[0], marketplace, destination,
+  });
+  const number = supply.number;
 
   await client.query(
     `UPDATE invoices SET supply_id = $1 WHERE warehouse_id = $2 AND id = ANY($3::uuid[])`,
@@ -179,6 +204,34 @@ async function advance(client, warehouseId, supplyId, { to, destination = null, 
       : `Из «${STATUS_NAMES[from]}» нельзя перейти в «${STATUS_NAMES[to] || to}»`);
   }
 
+  // Собранной поставка становится только когда собран КАЖДЫЙ заказ в ней.
+  //
+  // Без этой проверки поставку можно было отгрузить, не сняв с полки ни одной
+  // коробки: заказы получали «отгружено», продавец видел, что товар уехал,
+  // а товар лежал в ячейке и продолжал числиться в остатке. Отдельная охрана
+  // на отгрузке одного заказа (shipping/routes.js) при этом была — и поставка
+  // её обходила, потому что писала статус напрямую.
+  if (to === 'ready') {
+    const notPicked = await client.query(
+      `SELECT i.number, i.status FROM invoices i
+        WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND i.status <> 'ready'
+        ORDER BY i.number LIMIT 3`,
+      [warehouseId, supplyId],
+    );
+    if (notPicked.rows.length > 0) {
+      const names = notPicked.rows.map((r) => `«${r.number}»`).join(', ');
+      throw new HttpError(409,
+        `Ещё не собрано: ${names}. Поставка считается собранной, когда собран каждый заказ в ней.`);
+    }
+    const empty = await client.query(
+      `SELECT 1 FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 LIMIT 1`,
+      [warehouseId, supplyId],
+    );
+    if (empty.rows.length === 0) {
+      throw new HttpError(409, 'В поставке нет ни одного заказа — собирать нечего');
+    }
+  }
+
   const stampColumn = to === 'ready' ? 'ready_at' : 'shipped_at';
   const updated = await client.query(
     `UPDATE supplies SET status = $3::supply_status, ${stampColumn} = now(),
@@ -213,6 +266,13 @@ async function advance(client, warehouseId, supplyId, { to, destination = null, 
 }
 
 async function list(client, warehouseId, { status = null } = {}) {
+  // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
+  // в запросе роняло его целиком, и человек получал «внутреннюю ошибку»
+  // там, где должен получить «такого статуса нет».
+  if (status !== null && !Object.prototype.hasOwnProperty.call(STATUS_NAMES, status)) {
+    throw new HttpError(400,
+      `Статус может быть только: ${Object.keys(STATUS_NAMES).join(', ')}`);
+  }
   const r = await client.query(
     `SELECT s.id, s.number, s.status, s.destination, s.marketplace, s.mp_supply_id,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,

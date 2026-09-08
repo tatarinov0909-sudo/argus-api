@@ -21,28 +21,38 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
         [warehouseId],
       );
       const blocksResult = await client.query(
+        // Два списка считаются ОТДЕЛЬНО, каждый своим подзапросом.
+        //
+        // Сначала я собрал их одним запросом с двумя LEFT JOIN и DISTINCT —
+        // и получил две беды разом: строки перемножались (двадцать артикулов
+        // на двадцать адресов давали четыреста строк на одну ячейку), а
+        // DISTINCT молча съел ORDER BY, потому что сортировка по другому
+        // выражению с ним несовместима, и остаток в карточке стал выводиться
+        // в произвольном порядке.
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
                 cb.state, cb.fill_pct, cb.label,
-                COALESCE(json_agg(DISTINCT jsonb_build_object(
-                  'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
-                  'quality', cs.quality, 'source', cs.source
-                )) FILTER (WHERE cs.id IS NOT NULL), '[]') AS stock,
+                COALESCE((
+                  SELECT json_agg(json_build_object(
+                    'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
+                    'quality', cs.quality, 'source', cs.source
+                  ) ORDER BY cs.updated_at)
+                    FROM cell_stock cs WHERE cs.cell_block_id = cb.id
+                ), '[]') AS stock,
                 -- Что в этой ячейке числится по 1С. Отдельно от stock и
                 -- намеренно: наш stock — то, что работник положил своими
                 -- руками, здесь же чужое утверждение об этой полке. Количества
                 -- в нём нет вовсе — регистр владельца отвечает «лежит тут»,
                 -- но не «сколько».
-                COALESCE(json_agg(DISTINCT jsonb_build_object(
-                  'sku', pc.sku, 'name', p.name
-                )) FILTER (WHERE pc.id IS NOT NULL), '[]') AS stock_1c
+                COALESCE((
+                  SELECT json_agg(json_build_object('sku', pc.sku, 'name', p.name)
+                                  ORDER BY p.name, pc.sku)
+                    FROM product_cells_1c pc
+                    LEFT JOIN products p
+                      ON p.warehouse_id = pc.warehouse_id AND p.sku = pc.sku
+                   WHERE pc.warehouse_id = cb.warehouse_id AND pc.cell_name = cb.label
+                ), '[]') AS stock_1c
          FROM cell_blocks cb
-         LEFT JOIN cell_stock cs ON cs.cell_block_id = cb.id
-         LEFT JOIN product_cells_1c pc
-           ON pc.warehouse_id = cb.warehouse_id AND pc.cell_name = cb.label
-         LEFT JOIN products p
-           ON p.warehouse_id = pc.warehouse_id AND p.sku = pc.sku
-         WHERE cb.warehouse_id = $1
-         GROUP BY cb.id`,
+         WHERE cb.warehouse_id = $1`,
         [warehouseId],
       );
       const blocksByRow = new Map();

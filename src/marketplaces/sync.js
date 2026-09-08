@@ -135,7 +135,13 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
            AND i.external_id = $2
            AND i.source = 'wb'
            AND (ii.mp_rid IS NULL OR ii.mp_article IS NULL
-                OR ii.mp_barcode IS NULL OR ii.mp_nm_id IS NULL)`,
+                OR ii.mp_barcode IS NULL OR ii.mp_nm_id IS NULL)
+           -- Только когда в накладной ровно одна позиция. Номер отправления
+           -- уникален на складе, и записать его в две позиции сразу значит
+           -- нарушить индекс и уронить весь проход обмена, а не одну строку.
+           -- Сегодня заказ WB всегда одна позиция; появятся сплиты — здесь
+           -- честно ничего не заполнится, а не сломается молча.
+           AND (SELECT count(*) FROM invoice_items x WHERE x.invoice_id = i.id) = 1`,
         [warehouseId, order.externalId, order.rid || null, order.article || null,
           (order.barcodes && order.barcodes[0]) || null, order.nmId || null],
       );

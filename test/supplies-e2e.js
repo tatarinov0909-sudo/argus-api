@@ -144,8 +144,41 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(skip.status, 409, JSON.stringify(skip.body));
     });
 
+    // Пока ни одна коробка не снята с полки, поставка собранной не считается.
+    // Без этой охраны её можно было отгрузить, не тронув склад: заказы
+    // получали «отгружено», а товар продолжал числиться в ячейке.
+    const early = await api('POST', `/api/supplies/${supplyId}/ready`, { token: ownerToken });
+    check('несобранную поставку нельзя объявить собранной', () => {
+      assert.equal(early.status, 409, JSON.stringify(early.body));
+      assert.ok(String(early.body.error).includes('Ещё не собрано'), early.body.error);
+    });
+
+    // Собираем по-настоящему: работник снимает товар с полок.
+    const staff = await api('POST', '/api/staff', { token: ownerToken, body: { name: 'Сборщик' } });
+    const workerToken = (await api('POST', '/api/auth/staff/login',
+      { body: { keyCode: staff.body.key_code } })).body.token;
+    await api('POST', '/api/cells/rows', {
+      token: ownerToken, body: { configs: [{ rackCount: 3, tierCount: 2 }] },
+    });
+    const cell = (await api('GET', '/api/cells/rows', { token: ownerToken }))
+      .body.flatMap((r) => r.blocks)[0];
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
+       VALUES ($1, $2, $3, 'PB-A', 50, 'good'), ($1, $2, $3, 'PB-B', 50, 'good')`,
+      [cell.id, warehouseId, alpha.body.id]));
+
+    for (const orderId of [o1, o2, o3]) {
+      const full = await api('GET', `/api/invoices/${orderId}`, { token: ownerToken });
+      const item = full.body.items[0];
+      const picked = await api('POST', '/api/shipping', {
+        token: workerToken,
+        body: { invoiceItemId: item.id, pickedQty: Number(item.declared_qty), cellBlockId: cell.id },
+      });
+      assert.equal(picked.status, 201, JSON.stringify(picked.body));
+    }
+
     const ready = await api('POST', `/api/supplies/${supplyId}/ready`, { token: ownerToken });
-    check('собрана — со временем', () => {
+    check('после сборки всех заказов — собрана, со временем', () => {
       assert.equal(ready.status, 200, JSON.stringify(ready.body));
       assert.ok(ready.body.ready_at);
     });
@@ -177,6 +210,11 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     const sellerToken = (await api('POST', '/api/auth/seller/login', {
       body: { keyCode: key.body.key_code, name: 'Альфа' },
     })).body.token;
+    const badFilter = await api('GET', '/api/supplies?status=foo', { token: ownerToken });
+    check('неизвестный статус в фильтре — понятный отказ, а не внутренняя ошибка', () => {
+      assert.equal(badFilter.status, 400, JSON.stringify(badFilter.body));
+    });
+
     const seen = await api('GET', '/api/supplies', { token: sellerToken });
     check('продавец видит свою поставку — это его товар уехал', () => {
       assert.equal(seen.status, 200, JSON.stringify(seen.body));
