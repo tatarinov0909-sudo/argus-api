@@ -142,7 +142,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
 // Manual invoice entry — stands in for the 1C sync that doesn't exist yet.
 // Defaults to 'in' so every existing caller keeps creating receiving documents
 // without change; pass direction:'out' to create a shipment order.
-router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { companyId, number, items, direction = 'in' } = req.body;

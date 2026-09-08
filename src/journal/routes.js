@@ -8,7 +8,7 @@ const router = express.Router();
 
 // Journal is owner-only (workers act, they don't watch the log; sellers
 // never see it at all — see the RLS policy note in the initial migration).
-router.get('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     // ?cellBlockId= / ?invoiceId= — история одного места или одного документа.
@@ -32,7 +32,7 @@ router.get('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   }
 });
 
-router.post('/:id/resolve', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId, ownerId } = req.auth;
     const { id } = req.params;

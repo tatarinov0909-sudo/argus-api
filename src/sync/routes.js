@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const service = require('./service');
@@ -22,7 +22,7 @@ function requireBatch(body) {
 
 /* ===================== Owner: managing the integration key ===================== */
 
-router.get('/keys', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/keys', requireAuth, requireGrant('integration'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
@@ -39,7 +39,7 @@ router.get('/keys', requireAuth, requireRole('owner'), async (req, res, next) =>
   }
 });
 
-router.post('/keys', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/keys', requireAuth, requireGrant('integration'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { label } = req.body || {};
@@ -74,7 +74,7 @@ router.post('/keys', requireAuth, requireRole('owner'), async (req, res, next) =
   }
 });
 
-router.patch('/keys/:id/toggle', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.patch('/keys/:id/toggle', requireAuth, requireGrant('integration'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { id } = req.params;

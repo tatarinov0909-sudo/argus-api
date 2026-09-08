@@ -39,7 +39,7 @@ router.patch('/settings', requireAuth, requireRole('owner'), async (req, res, ne
 
 // Что правило предложило бы сейчас — без создания заданий. Владелец видит,
 // что именно уйдёт в работу, до того как отправит туда человека.
-router.get('/preview', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/preview', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const out = await withTenantContext({ warehouseId }, async (c) => {
@@ -55,7 +55,7 @@ router.get('/preview', requireAuth, requireRole('owner'), async (req, res, next)
 
 // Назначить пересчёт. Единственная точка, где задания появляются: работник
 // сам инвентаризацию не начинает.
-router.post('/runs', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/runs', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId, ownerId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => (
@@ -66,7 +66,7 @@ router.post('/runs', requireAuth, requireRole('owner'), async (req, res, next) =
 });
 
 // Что считать. Работнику видны только назначенные задания.
-router.get('/tasks', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+router.get('/tasks', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const statuses = req.query.status
@@ -112,7 +112,7 @@ router.post('/tasks/:id/count', requireAuth, requireRole('owner', 'worker'), asy
 });
 
 // Решение по расхождению. Только владелец и только здесь остаток меняется.
-router.post('/tasks/:id/resolve', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/tasks/:id/resolve', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId, ownerId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => (

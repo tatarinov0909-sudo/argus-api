@@ -44,10 +44,15 @@ async function requireAuth(req, res, next) {
   }
 
   // Владелец входит по паролю, обмен с 1С — по своему ключу со своей проверкой.
-  // Здесь речь о двух ролях, которые живут по выданному ключу: работник и
-  // продавец. Их ключ владелец может отозвать в любую секунду.
+  // Здесь речь о ролях, которые живут по выданному ключу: работник, менеджер
+  // и продавец. Их ключ владелец может отозвать в любую секунду.
+  //
+  // Менеджер сюда попал не сразу: роль добавили позже, а список остался
+  // старым — и отзыв его ключа не действовал бы до конца жизни токена. Ровно
+  // этот же промах у продавца уже стоил нам сорока пяти минут, за которые
+  // отозванный ключ продолжал работать.
   const keyId = payload.role === 'seller' ? payload.sellerKeyId
-    : payload.role === 'worker' ? payload.staffKeyId : null;
+    : (payload.role === 'worker' || payload.role === 'manager') ? payload.staffKeyId : null;
   if (keyId) {
     try {
       if (!await keyStillActive(payload.role, keyId)) {
@@ -74,4 +79,38 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { requireAuth, requireRole };
+// Права, которые владелец может открыть конкретному менеджеру. Список
+// закрытый: чего здесь нет, того не откроешь никому — и первым в этом
+// списке НЕ значится выдача ключей менеджерам, иначе менеджер выпишет себе
+// полный доступ, и всё урезание станет вежливой просьбой.
+const GRANTS = {
+  clients: 'заводить клиентов и выдавать им ключи',
+  staff: 'выдавать ключи работникам',
+  warehouse: 'менять структуру склада',
+  integration: 'подключать 1С',
+  marketplaces: 'подключать маркетплейсы',
+  billing: 'тариф и деньги',
+};
+
+// Пускает владельца всегда, менеджера — если владелец открыл ему это право.
+//
+// Отдельная функция, а не флаг у requireRole: тогда каждый маршрут решал бы
+// сам, «а менеджеру-то можно?», и один пропущенный маршрут означал бы дыру,
+// которую никто не заметит. Здесь спрашивают право по имени, и список прав
+// один на всё приложение.
+function requireGrant(grant) {
+  if (!Object.prototype.hasOwnProperty.call(GRANTS, grant)) {
+    throw new Error(`Неизвестное право: ${grant}`);
+  }
+  return (req, res, next) => {
+    if (!req.auth) return res.status(401).json({ error: 'Нужен вход' });
+    if (req.auth.role === 'owner') return next();
+    if (req.auth.role === 'manager' && (req.auth.grants || []).includes(grant)) return next();
+    return res.status(403).json({
+      error: `Это может только руководитель склада — ${GRANTS[grant]}. `
+        + 'Попросите открыть вам это право.',
+    });
+  };
+}
+
+module.exports = { requireAuth, requireRole, requireGrant, GRANTS };

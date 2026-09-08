@@ -138,13 +138,21 @@ async function loginStaffKey({ keyCode }) {
     if (!key) throw new HttpError(404, 'Такой ключ не найден. Проверьте у руководителя, всё ли верно скопировано.');
     if (!key.active) throw new HttpError(403, 'Этот ключ отозван. Обратитесь к руководителю склада.');
 
+    // Роль берётся из ключа, а не из того, куда человек постучался. Иначе
+    // достаточно было бы зайти «как менеджер» с ключом работника.
+    const role = key.kind === 'manager' ? 'manager' : 'worker';
     const token = signToken({
-      role: 'worker',
+      role,
       warehouseId: key.warehouse_id,
       staffKeyId: key.id,
       name: key.name,
+      // Открытые владельцем права. У работника всегда пусто.
+      grants: role === 'manager' ? (key.permissions || []) : [],
     });
-    return { token, name: key.name, warehouseId: key.warehouse_id };
+    return {
+      token, name: key.name, warehouseId: key.warehouse_id, role,
+      grants: role === 'manager' ? (key.permissions || []) : [],
+    };
   });
 }
 

@@ -13,7 +13,7 @@ const actorOf = (auth) => ({
 
 // Собрать поставку. Право владельца (и менеджера, когда роль появится):
 // это решение «что уезжает сегодня», а не исполнение.
-router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { invoiceIds, marketplace, destination } = req.body || {};
@@ -26,7 +26,7 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
 
 // Экран менеджера, первый взгляд: у кого накопились заказы. Не список
 // заказов, а список продавцов с числом — по нему решают, чем заняться.
-router.get('/pending', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/pending', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId },
@@ -36,7 +36,7 @@ router.get('/pending', requireAuth, requireRole('owner'), async (req, res, next)
 });
 
 // Заказы выбранного продавца.
-router.get('/pending/:companyId', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/pending/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId },

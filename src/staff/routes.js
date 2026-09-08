@@ -1,16 +1,16 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant, GRANTS } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 
 const router = express.Router();
 
-router.get('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/', requireAuth, requireGrant('staff'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const result = await client.query(
-        `SELECT id, key_code, name, active, issued_at, revoked_at
+        `SELECT id, key_code, name, active, issued_at, revoked_at, kind, permissions
          FROM staff_keys WHERE warehouse_id = $1 ORDER BY issued_at ASC`,
         [warehouseId],
       );
@@ -22,11 +22,35 @@ router.get('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   }
 });
 
-router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/', requireAuth, requireGrant('staff'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { name } = req.body;
+    const { name, kind = 'worker', permissions = [] } = req.body;
     if (!name || !name.trim()) throw new HttpError(400, 'Введите имя сотрудника');
+    if (kind !== 'worker' && kind !== 'manager') {
+      throw new HttpError(400, 'Сотрудник бывает либо работником, либо менеджером');
+    }
+
+    // Ключ МЕНЕДЖЕРА выдаёт только владелец, и открытое право «выдавать
+    // ключи работникам» этого не позволяет. Иначе менеджер с этим правом
+    // завёл бы себе второго менеджера с любыми правами, и всё урезание
+    // превратилось бы в вежливую просьбу.
+    if (kind === 'manager' && req.auth.role !== 'owner') {
+      throw new HttpError(403, 'Ключ менеджера может выдать только руководитель склада');
+    }
+    const grants = Array.isArray(permissions)
+      ? permissions.filter((g) => Object.prototype.hasOwnProperty.call(GRANTS, g))
+      : [];
+    const unknown = Array.isArray(permissions)
+      ? permissions.filter((g) => !Object.prototype.hasOwnProperty.call(GRANTS, g))
+      : [];
+    if (unknown.length > 0) {
+      throw new HttpError(400, `Неизвестное право: ${unknown.join(', ')}. `
+        + `Бывают: ${Object.keys(GRANTS).join(', ')}`);
+    }
+    if (kind === 'worker' && grants.length > 0) {
+      throw new HttpError(400, 'Права открываются менеджеру, а не работнику');
+    }
 
     const key = await withTenantContext({ warehouseId }, async (client) => {
       const whResult = await client.query(`SELECT warehouse_code FROM warehouses WHERE id = $1`, [warehouseId]);
@@ -40,9 +64,10 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
       const keyCode = `${code}-${String(seq).padStart(2, '0')}`;
 
       const insertResult = await client.query(
-        `INSERT INTO staff_keys (warehouse_id, key_code, name)
-         VALUES ($1, $2, $3) RETURNING id, key_code, name, active, issued_at`,
-        [warehouseId, keyCode, name.trim()],
+        `INSERT INTO staff_keys (warehouse_id, key_code, name, kind, permissions)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, key_code, name, active, issued_at, kind, permissions`,
+        [warehouseId, keyCode, name.trim(), kind, grants],
       );
       return insertResult.rows[0];
     });
@@ -52,7 +77,7 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
   }
 });
 
-router.patch('/:id/toggle', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.patch('/:id/toggle', requireAuth, requireGrant('staff'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { id } = req.params;

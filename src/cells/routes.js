@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
@@ -11,7 +11,7 @@ const router = express.Router();
 
 // Full layout: rows -> blocks -> stock, everything the frontend needs to
 // render the floorplan and rack grids in one round trip.
-router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+router.get('/rows', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
@@ -73,7 +73,7 @@ router.get('/rows', requireAuth, requireRole('owner', 'worker'), async (req, res
 // and the simulated document-upload flow both call. New rows start as all
 // empty atomic (1x1) blocks: there is no real stock yet on a freshly built
 // warehouse, so nothing here is randomly pre-filled the way the old mockup was.
-router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { configs } = req.body; // [{ rackCount, tierCount, aisleAfter, label }, ...]
@@ -173,7 +173,7 @@ router.post('/rows', requireAuth, requireRole('owner'), async (req, res, next) =
 // Расстановка проходов. Массив идёт по порядку рядов: aisles[i] — есть ли
 // проход после ряда i+1. Последний элемент игнорируется: за последним рядом
 // проход нарисовать негде.
-router.patch('/rows/aisles', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.patch('/rows/aisles', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { aisles } = req.body;
@@ -209,7 +209,7 @@ router.patch('/rows/aisles', requireAuth, requireRole('owner'), async (req, res,
 });
 
 // Своё имя для ряда. Пустое имя стирает название и возвращает номер.
-router.patch('/rows/:rowNum/name', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.patch('/rows/:rowNum/name', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rowNum = Number(req.params.rowNum);
@@ -250,7 +250,7 @@ router.patch('/rows/:rowNum/name', requireAuth, requireRole('owner'), async (req
 // refused unless the request says so explicitly. The UI turns that refusal
 // into a warning naming what would be lost, instead of a generic "are you
 // sure?" that teaches people to click through.
-router.delete('/rows', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.delete('/rows', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const confirmed = req.query.confirm === 'true';
@@ -302,7 +302,7 @@ router.delete('/rows', requireAuth, requireRole('owner'), async (req, res, next)
 // inserting a fresh one. That is not a style preference: cell_stock is wired
 // to cell_blocks with ON DELETE CASCADE, so delete-then-insert silently
 // destroys the record of goods that are still physically on the shelf.
-router.post('/blocks/merge-rect', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/blocks/merge-rect', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { rowNum, rackStart, rackEnd, tierStart, tierEnd } = req.body || {};
@@ -394,7 +394,7 @@ router.post('/blocks/merge-rect', requireAuth, requireRole('owner'), async (req,
   }
 });
 
-router.post('/blocks/:id/split', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/blocks/:id/split', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { id } = req.params;

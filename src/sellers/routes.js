@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
@@ -7,7 +7,7 @@ const { tenantContextFromAuth } = require('../auth/tenantContext');
 
 const router = express.Router();
 
-router.get('/companies', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
@@ -42,7 +42,7 @@ router.get('/companies', requireAuth, requireRole('owner'), async (req, res, nex
 // компанию, и политика на cell_stock пропускает ровно его строки. Никакой
 // фильтрации «руками» здесь нет намеренно — на такой фильтрации проект уже
 // однажды получил утечку между компаниями.
-router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, res, next) => {
+router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
     // Владелец смотрит глазами конкретного продавца — иначе он увидел бы
@@ -113,7 +113,7 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner'), async (req, re
 //
 // Область видимости снова решает Postgres: политики на shipping_records и
 // return_records пропускают строки своей компании.
-router.get('/movements', requireAuth, requireRole('seller', 'owner'), async (req, res, next) => {
+router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const companyId = req.auth.role === 'owner' ? req.query.companyId : req.auth.companyId;
@@ -173,7 +173,7 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner'), async (req
   }
 });
 
-router.post('/companies', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/companies', requireAuth, requireGrant('clients'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { name } = req.body;
@@ -192,7 +192,7 @@ router.post('/companies', requireAuth, requireRole('owner'), async (req, res, ne
   }
 });
 
-router.post('/companies/:companyId/keys', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/companies/:companyId/keys', requireAuth, requireGrant('clients'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { companyId } = req.params;
@@ -230,7 +230,7 @@ router.post('/companies/:companyId/keys', requireAuth, requireRole('owner'), asy
   }
 });
 
-router.patch('/keys/:id/toggle', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.patch('/keys/:id/toggle', requireAuth, requireGrant('clients'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { id } = req.params;
