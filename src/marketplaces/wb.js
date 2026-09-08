@@ -89,6 +89,12 @@ function normalizeOrder(o) {
     article: o.article == null ? null : String(o.article),
     nmId: o.nmId == null ? null : String(o.nmId),
     barcodes: (o.skus || []).map(String),
+    // Номер отправления. Это он печатается в упаковочном листе в колонке
+    // «№ отправления» и по нему сверяют посылку с наклейкой. Приходит вместе
+    // с заказом — проверено живым запросом, никакой поставки для этого
+    // создавать не нужно.
+    rid: o.rid == null ? null : String(o.rid),
+    orderUid: o.orderUid == null ? null : String(o.orderUid),
     // Цена приходит в копейках. Наружу отдаём как есть и подписываем полем —
     // молча делить на сто значит однажды поделить дважды.
     salePriceKopecks: o.salePrice ?? null,

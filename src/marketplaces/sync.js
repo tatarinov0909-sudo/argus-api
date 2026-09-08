@@ -76,7 +76,16 @@ async function pullWildberries(client, warehouseId, { companyId }) {
   const token = await credentials.tokenFor(client, warehouseId, companyId, 'wb');
   const orders = await wb.newOrders(token);
   await credentials.markUsed(client, warehouseId, companyId, 'wb');
+  return importOrders(client, warehouseId, { companyId, orders });
+}
 
+// Сохранение заказов отдельно от их получения.
+//
+// Так это проверяется без сети — иначе единственный способ убедиться, что
+// поля доезжают до накладной, это дождаться живого заказа. И тот же шов
+// понадобится, чтобы дозагрузить историю: очередь `orders/new` отдаёт только
+// текущее, а за прошлым надо идти в выборку по датам.
+async function importOrders(client, warehouseId, { companyId, orders }) {
   const resolve = await loadMapping(client, warehouseId, companyId, 'wb');
   const resolved = orders.map((o) => ({ order: o, sku: resolve(o) }));
   const names = await loadNames(
@@ -108,12 +117,44 @@ async function pullWildberries(client, warehouseId, { companyId }) {
        RETURNING id`,
       [warehouseId, companyId, `WB-${order.externalId}`, order.externalId],
     );
-    if (!inserted.rows[0]) { existed += 1; continue; }
+    if (!inserted.rows[0]) {
+      existed += 1;
+      // Заказ уже заведён — но, возможно, ещё до того, как мы стали сохранять
+      // поля площадки. Дозаполняем, пока он в очереди: уйдёт из неё — взять
+      // будет негде. COALESCE, а не перезапись: то, что уже сохранено, площадка
+      // подтвердит тем же значением, а спорить с собой незачем.
+      await client.query(
+        `UPDATE invoice_items ii
+            SET mp_rid     = COALESCE(ii.mp_rid, $3),
+                mp_article = COALESCE(ii.mp_article, $4),
+                mp_barcode = COALESCE(ii.mp_barcode, $5),
+                mp_nm_id   = COALESCE(ii.mp_nm_id, $6)
+          FROM invoices i
+         WHERE i.id = ii.invoice_id
+           AND ii.warehouse_id = $1
+           AND i.external_id = $2
+           AND i.source = 'wb'
+           AND (ii.mp_rid IS NULL OR ii.mp_article IS NULL
+                OR ii.mp_barcode IS NULL OR ii.mp_nm_id IS NULL)`,
+        [warehouseId, order.externalId, order.rid || null, order.article || null,
+          (order.barcodes && order.barcodes[0]) || null, order.nmId || null],
+      );
+      continue;
+    }
 
+    // Поля площадки сохраняем ВСЕ, из которых потом печатаются листы:
+    // номер отправления, артикул продавца, штрихкод, номер карточки. Раньше
+    // они читались у Wildberries и выбрасывались здесь же, а печатать было
+    // нечем — и заново их взять негде: очередь `orders/new` отдаёт только
+    // текущее, ушедшее из неё пропадает.
     await client.query(
-      `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [inserted.rows[0].id, warehouseId, companyId, lineName, lineSku, QTY_PER_ORDER],
+      `INSERT INTO invoice_items
+         (invoice_id, warehouse_id, company_id, name, sku, declared_qty,
+          mp_rid, mp_article, mp_barcode, mp_nm_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [inserted.rows[0].id, warehouseId, companyId, lineName, lineSku, QTY_PER_ORDER,
+        order.rid || null, order.article || null,
+        (order.barcodes && order.barcodes[0]) || null, order.nmId || null],
     );
     created += 1;
   }
@@ -146,4 +187,4 @@ async function pullAll(client, warehouseId) {
   return results;
 }
 
-module.exports = { pullWildberries, pullAll, loadMapping };
+module.exports = { pullWildberries, importOrders, pullAll, loadMapping };

@@ -347,6 +347,62 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
     check('без ключа обмен честно отказывается, а не делает вид', () => {
       assert.equal(afterRemove.status, 404, JSON.stringify(afterRemove.body));
     });
+    // ---------- Поля площадки доезжают до накладной ----------
+    // Ради них всё и затевалось: из этих полей состоят печатные листы, а
+    // обмен их читал и выбрасывал. Проверяем без сети — заказы подаём руками.
+    const ORDERS = [{
+      externalId: '900001',
+      article: '1201010228',
+      nmId: '1252172509',
+      barcodes: ['2053278139291'],
+      rid: 'ebb.id1e2405565cd1b61b4e47cbad090b4b4.0.0',
+      orderUid: 'id1e2405565cd1b61b4e47cbad090b4b4',
+    }];
+    const imported = await withTenantContext({ warehouseId },
+      (c) => sync.importOrders(c, warehouseId, { companyId: companyId, orders: ORDERS }));
+    check('заказ площадки заводится накладной', () => {
+      assert.equal(imported.created, 1, JSON.stringify(imported));
+    });
+
+    const savedItem = await withTenantContext({ warehouseId }, (c) => c.query(
+      `SELECT mp_rid, mp_article, mp_barcode, mp_nm_id FROM invoice_items
+       WHERE warehouse_id = $1 AND mp_rid = $2`,
+      [warehouseId, ORDERS[0].rid]));
+    check('номер отправления сохранён — из него печатается упаковочный лист', () => {
+      assert.equal(savedItem.rows.length, 1, 'позиция не найдена по номеру отправления');
+      assert.equal(savedItem.rows[0].mp_rid, ORDERS[0].rid);
+    });
+    check('артикул продавца, штрихкод и номер карточки тоже', () => {
+      const r = savedItem.rows[0];
+      assert.equal(r.mp_article, '1201010228');
+      assert.equal(r.mp_barcode, '2053278139291');
+      assert.equal(r.mp_nm_id, '1252172509');
+    });
+
+    const again = await withTenantContext({ warehouseId },
+      (c) => sync.importOrders(c, warehouseId, { companyId: companyId, orders: ORDERS }));
+    check('повторный обмен не заводит второй раз — иначе две наклейки на одну коробку', () => {
+      assert.equal(again.created, 0, JSON.stringify(again));
+      assert.equal(again.existed, 1);
+    });
+
+    // Заказы, заведённые ДО того как мы стали сохранять поля, должны
+    // дозаполниться на следующем же обмене — пока они ещё в очереди.
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `UPDATE invoice_items SET mp_rid = NULL, mp_article = NULL,
+              mp_barcode = NULL, mp_nm_id = NULL
+        WHERE warehouse_id = $1 AND sku IS NOT NULL`, [warehouseId]));
+    await withTenantContext({ warehouseId },
+      (c) => sync.importOrders(c, warehouseId, { companyId, orders: ORDERS }));
+    const healed = await withTenantContext({ warehouseId }, (c) => c.query(
+      `SELECT mp_rid, mp_article FROM invoice_items
+        WHERE warehouse_id = $1 AND mp_rid IS NOT NULL`, [warehouseId]));
+    check('старый заказ дозаполняется полями, пока он в очереди площадки', () => {
+      assert.equal(healed.rows.length, 1, 'поля не дозаполнились');
+      assert.equal(healed.rows[0].mp_rid, ORDERS[0].rid);
+      assert.equal(healed.rows[0].mp_article, '1201010228');
+    });
+
   } finally {
     wb.sellerInfo = realSellerInfo;
     wb.newOrders = realNewOrders;
