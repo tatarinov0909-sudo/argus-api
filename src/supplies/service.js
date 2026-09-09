@@ -1,4 +1,5 @@
 const { HttpError } = require('../middleware/errorHandler');
+const { formatBlockLabel } = require('../cells/label');
 const journal = require('../journal/repository');
 
 // Поставка: пачка заказов, уезжающая одной машиной.
@@ -174,6 +175,10 @@ async function contents(client, warehouseId, supplyId) {
       bySku.set(key, {
         sku: l.sku, name: l.name, article: l.mp_article, barcode: l.mp_barcode,
         nmId: l.mp_nm_id, qty: 0,
+        // `cells` — где лежит, `available` — сколько там годного. Второе нужно
+        // отдельно: если в ячейках меньше, чем в поставке, узнать об этом надо
+        // до похода к стеллажу, а не у стеллажа.
+        cells: [], available: 0,
       });
     }
     bySku.get(key).qty += Number(l.declared_qty);
@@ -190,7 +195,54 @@ async function contents(client, warehouseId, supplyId) {
     qty: Number(l.declared_qty),
   }));
 
-  const picking = [...bySku.values()].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+  // Где это лежит. Без ячеек лист комплектации — это список покупок без
+  // магазина: кладовщик знает, что взять, и не знает, куда идти.
+  //
+  // Только годное: брак лежит на тех же полках, и отправить его клиенту
+  // вместо товара — худшее, что может сделать склад.
+  const skus = [...bySku.keys()];
+  const places = skus.length === 0 ? { rows: [] } : await client.query(
+    `SELECT cs.sku, SUM(cs.qty) AS qty, wr.row_num, cb.label,
+            cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       FROM cell_stock cs
+       JOIN cell_blocks cb ON cb.id = cs.cell_block_id
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE cs.warehouse_id = $1 AND cs.sku = ANY($2::text[])
+        AND cs.qty > 0 AND cs.quality = 'good'
+      GROUP BY cs.sku, cb.id, wr.row_num, cb.label,
+               cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+      ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
+    [warehouseId, skus],
+  );
+  for (const row of places.rows) {
+    const item = bySku.get(row.sku);
+    if (!item) continue;
+    item.cells.push({
+      label: formatBlockLabel(row.row_num, row),
+      qty: Number(row.qty),
+      rowNum: row.row_num,
+      rack: row.rack_start,
+      tier: row.tier_start,
+    });
+    item.available += Number(row.qty);
+  }
+
+  // Порядок обхода, а не алфавит.
+  //
+  // Лист комплектации существует ради одного: пройти склад один раз. По
+  // алфавиту кладовщик мечется от первого ряда к седьмому и обратно; по
+  // адресу — идёт вдоль стеллажей и собирает всё по дороге. Товар, которого
+  // в ячейках нет, уходит в конец: за ним всё равно придётся идти отдельно
+  // и разбираться.
+  const picking = [...bySku.values()].sort((a, b) => {
+    const A = a.cells[0];
+    const B = b.cells[0];
+    if (!A && !B) return a.name.localeCompare(b.name, 'ru');
+    if (!A) return 1;
+    if (!B) return -1;
+    return A.rowNum - B.rowNum || A.rack - B.rack || A.tier - B.tier
+      || a.name.localeCompare(b.name, 'ru');
+  });
 
   return {
     supply: {

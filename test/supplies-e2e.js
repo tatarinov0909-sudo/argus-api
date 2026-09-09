@@ -197,19 +197,44 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     await api('POST', '/api/cells/rows', {
       token: ownerToken, body: { configs: [{ rackCount: 3, tierCount: 2 }] },
     });
-    const cell = (await api('GET', '/api/cells/rows', { token: ownerToken }))
-      .body.flatMap((r) => r.blocks)[0];
+    const blocks = (await api('GET', '/api/cells/rows', { token: ownerToken }))
+      .body.flatMap((r) => r.blocks);
+    const near = blocks[0];
+    const far = blocks[blocks.length - 1];
+    // «Renal» стоит в дальней ячейке, «Сухой корм» — в ближней. По алфавиту
+    // первым идёт Renal, по складу — Сухой. Разложить их в одну ячейку значит
+    // не проверить ничего: любой порядок сойдётся.
     await withTenantContext({ warehouseId }, (c) => c.query(
       `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-       VALUES ($1, $2, $3, 'PB-A', 50, 'good'), ($1, $2, $3, 'PB-B', 50, 'good')`,
-      [cell.id, warehouseId, alpha.body.id]));
+       VALUES ($1, $3, $4, 'PB-A', 50, 'good'), ($2, $3, $4, 'PB-B', 50, 'good'),
+              ($1, $3, $4, 'PB-B', 7, 'defective')`,
+      [far.id, near.id, warehouseId, alpha.body.id]));
+
+    const sheet = await api('GET', `/api/supplies/${supplyId}`, { token: ownerToken });
+    check('лист комплектации ведёт по складу, а не по алфавиту', () => {
+      const order = sheet.body.picking.map((r) => r.sku);
+      assert.deepEqual(order, ['PB-B', 'PB-A'],
+        'по алфавиту вышло бы PB-A, PB-B — и кладовщик прошёл бы ряд дважды: ' + JSON.stringify(order));
+    });
+    check('в листе написано, из какой ячейки брать и сколько там есть', () => {
+      const a = sheet.body.picking.find((r) => r.sku === 'PB-A');
+      assert.equal(a.cells.length, 1, JSON.stringify(a.cells));
+      assert.ok(a.cells[0].label, 'у ячейки нет адреса');
+      assert.equal(a.available, 50);
+    });
+    check('брак в лист не попадает — его нельзя отгрузить клиенту', () => {
+      const b = sheet.body.picking.find((r) => r.sku === 'PB-B');
+      assert.equal(b.available, 50, 'семь бракованных попали в доступное к отбору');
+      assert.equal(b.cells.length, 1, JSON.stringify(b.cells));
+    });
 
     for (const orderId of [o1, o2, o3]) {
       const full = await api('GET', `/api/invoices/${orderId}`, { token: ownerToken });
       const item = full.body.items[0];
+      const from = item.sku === 'PB-A' ? far : near;
       const picked = await api('POST', '/api/shipping', {
         token: workerToken,
-        body: { invoiceItemId: item.id, pickedQty: Number(item.declared_qty), cellBlockId: cell.id },
+        body: { invoiceItemId: item.id, pickedQty: Number(item.declared_qty), cellBlockId: from.id },
       });
       assert.equal(picked.status, 201, JSON.stringify(picked.body));
     }

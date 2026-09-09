@@ -9,6 +9,7 @@
 // На живой базе таких артикулов было двое из 633 — редко, но именно про такой
 // товар и спрашивают, когда он потерялся.
 const { kitInfo } = require('../kits/kits');
+const { formatBlockLabel } = require('../cells/label');
 
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
@@ -136,15 +137,7 @@ async function findProducts(client, warehouseId, query) {
   return results;
 }
 
-function formatBlockLabel(rowNum, block) {
-  // Если у ячейки есть собственное имя — оно и есть ответ. На стеллаже висит
-  // «01-10-015», и назвать её «1.15.2» значит заставить работника переводить
-  // наши координаты в то, что он видит глазами.
-  if (block.label) return block.label;
-  const rackPart = block.rack_start === block.rack_end ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
-  const tierPart = block.tier_start === block.tier_end ? block.tier_start : `${block.tier_start}–${block.tier_end}`;
-  return `${rowNum}.${rackPart}.${tierPart}`;
-}
+// formatBlockLabel переехала в ../cells/label — её же печатает лист комплектации.
 
 // Подсказка ячейки при приёмке — чистое правило, без ИИ: сначала предложить
 // ячейку, где этот SKU уже лежит (не размазывать один товар по складу),
