@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { randomPart } = require('../middleware/keys');
 const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
@@ -208,8 +209,11 @@ router.post('/companies/:companyId/keys', requireAuth, requireGrant('clients'), 
       const prefix = transliteratePrefix(company.name);
 
       for (let attempt = 0; attempt < 5; attempt++) {
-        const digits = String(1000 + Math.floor(Math.random() * 9000));
-        const keyCode = `${prefix}-${digits}-K`;
+        // Было четыре цифры от Math.random: девять тысяч вариантов при
+        // угадываемой приставке из названия компании — и генератор, который
+        // для секретов не предназначен. Шесть знаков из crypto дают
+        // миллиард, форма ключа при этом та же.
+        const keyCode = `${prefix}-${randomPart(6)}-K`;
         try {
           const insertResult = await client.query(
             `INSERT INTO seller_keys (company_id, warehouse_id, key_code)

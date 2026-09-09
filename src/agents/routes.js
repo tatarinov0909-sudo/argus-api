@@ -1,5 +1,6 @@
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
+const { agentLimiter } = require('../middleware/rateLimit');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const kladovshchik = require('./kladovshchik');
@@ -66,7 +67,7 @@ router.get('/kladovshchik/suggest-cell', requireAuth, requireRole('owner', 'work
 // приёмки и отбора (loader.html), и если ему что-то понадобится спросить —
 // это будет кнопка, а не переписка. Раньше здесь стояла и роль worker, хотя
 // экрана для неё не существовало: дверь без ручки, но незапертая.
-router.post('/orchestrator/ask', requireAuth, requireRole('owner'), async (req, res, next) => {
+router.post('/orchestrator/ask', requireAuth, requireRole('owner'), agentLimiter, async (req, res, next) => {
   try {
     const question = req.body?.question?.trim();
     if (!question) throw new HttpError(400, 'Укажите question — вопрос к Оркестратору');

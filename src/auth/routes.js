@@ -1,11 +1,11 @@
 const express = require('express');
 const service = require('./service');
 
-const { loginLimiter, keyLoginLimiter } = require('../middleware/rateLimit');
+const { loginLimiter, keyLoginLimiter, registerLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
-router.post('/owner/register', keyLoginLimiter, async (req, res, next) => {
+router.post('/owner/register', registerLimiter, async (req, res, next) => {
   try {
     const result = await service.registerOwner(req.body);
     res.status(201).json(result);

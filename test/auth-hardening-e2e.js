@@ -41,13 +41,14 @@ function check(name, fn) {
   }
 }
 
-async function api(method, path, { body, ip } = {}) {
+async function api(method, path, { body, ip, token } = {}) {
   const res = await fetch(BASE + path, {
     method,
     headers: {
       'Content-Type': 'application/json',
       // Разные адреса, чтобы счётчик попыток одного теста не мешал другому.
       ...(ip ? { 'X-Forwarded-For': ip } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -165,6 +166,100 @@ async function api(method, path, { body, ip } = {}) {
     });
     check('но вход при этом продолжает работать', () => {
       assert.equal(stillLogsIn.status, 200, JSON.stringify(stillLogsIn.body));
+    });
+
+    // ---------- Ключи нельзя угадать ----------
+    //
+    // Ключи сотрудников выдавались подряд: 7721-01, 7721-02, 7721-03. Код
+    // склада написан в кабинете крупными цифрами и известен каждому, кто там
+    // работал, — значит войти чужим ключом можно было с двадцатой попытки.
+    // Проверяется не «ключ длинный», а именно это: номер по порядку
+    // предсказуем, и после него обязана стоять случайная часть.
+    const owner2 = await api('POST', '/api/auth/owner/register', {
+      ip: '203.0.113.77',
+      body: { name: 'Keys', email: `keys${stamp}@test.local`, password: 'secret123',
+              warehouseName: 'Keys WH', city: 'Moscow' },
+    });
+    const t2 = owner2.body.token;
+    const k1 = await api('POST', '/api/staff', { token: t2, body: { name: 'Первый' } });
+    const k2 = await api('POST', '/api/staff', { token: t2, body: { name: 'Второй' } });
+    check('ключи сотрудников выдаются', () => {
+      assert.equal(k1.status, 201, JSON.stringify(k1.body));
+      assert.equal(k2.status, 201, JSON.stringify(k2.body));
+    });
+    check('ключ сотрудника не предсказуем по номеру', () => {
+      const code = k2.body.key_code;
+      const seq = code.split('-').slice(0, 2).join('-');
+      // Порядковая часть предсказуема — и сама по себе больше не пускает.
+      assert.ok(code.length > seq.length + 2, `ключ «${code}» — это только номер`);
+    });
+    const guess = await api('POST', '/api/auth/staff/login', {
+      ip: '203.0.113.78',
+      body: { keyCode: k2.body.key_code.split('-').slice(0, 2).join('-') },
+    });
+    check('вход по одной порядковой части не проходит', () => {
+      assert.equal(guess.status, 404, JSON.stringify(guess.body));
+    });
+    check('случайные части двух ключей разные', () => {
+      const r1 = k1.body.key_code.split('-').pop();
+      const r2 = k2.body.key_code.split('-').pop();
+      assert.notEqual(r1, r2, 'случайности нет');
+      assert.ok(r1.length >= 4 && r2.length >= 4, `${r1} / ${r2} — коротко`);
+      // Алфавит без похожих знаков: ключ диктуют по телефону.
+      assert.ok(!/[01OI]/.test(r1 + r2), `${r1}${r2} содержит спорные знаки`);
+    });
+
+    const comp = await api('POST', '/api/sellers/companies', { token: t2, body: { name: 'Ромашка' } });
+    const sk1 = await api('POST', `/api/sellers/companies/${comp.body.id}/keys`, { token: t2 });
+    const sk2 = await api('POST', `/api/sellers/companies/${comp.body.id}/keys`, { token: t2 });
+    check('ключ продавца длиннее четырёх цифр и не от Math.random', () => {
+      assert.equal(sk1.status, 201, JSON.stringify(sk1.body));
+      const mid1 = sk1.body.key_code.split('-')[1];
+      const mid2 = sk2.body.key_code.split('-')[1];
+      assert.ok(mid1.length >= 6, `«${sk1.body.key_code}» — четыре цифры это девять тысяч вариантов`);
+      assert.notEqual(mid1, mid2);
+      assert.ok(!/^[0-9]+$/.test(mid1 + mid2), 'только цифры — значит перебор дешевле');
+    });
+
+    // ---------- Регистрация не бесконечна ----------
+    let regBlocked = 0;
+    for (let i = 0; i < 6; i += 1) {
+      const r = await api('POST', '/api/auth/owner/register', {
+        ip: '203.0.113.90',
+        body: { name: 'Spam', email: `spam${stamp}-${i}@test.local`, password: 'secret123',
+                warehouseName: 'Spam WH', city: 'Moscow' },
+      });
+      if (r.status === 429) regBlocked += 1;
+    }
+    check('склады нельзя заводить пачками с одного адреса', () => {
+      assert.ok(regBlocked > 0, 'ни одна регистрация не отбита');
+    });
+
+    // ---------- Счётчик не наказывает за нормальную работу ----------
+    //
+    // Ключи работников считаются по адресу, а весь склад сидит за одним.
+    // Пока счётчик считал все попытки, двадцать человек, входящих в смену,
+    // упирались в него на шестнадцатом: «слишком много попыток» получал тот,
+    // кто ввёл ключ верно с первого раза. Считать надо неудачи.
+    let okLogins = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const r = await api('POST', '/api/auth/staff/login', {
+        ip: '203.0.113.55', body: { keyCode: k1.body.key_code },
+      });
+      if (r.status === 200) okLogins += 1;
+    }
+    check('двадцать верных входов подряд с одного адреса проходят', () => {
+      assert.equal(okLogins, 20, `прошло только ${okLogins}`);
+    });
+    let blocked = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const r = await api('POST', '/api/auth/staff/login', {
+        ip: '203.0.113.56', body: { keyCode: `7721-99-XXX${i}` },
+      });
+      if (r.status === 429) blocked += 1;
+    }
+    check('а перебор неверных — нет', () => {
+      assert.ok(blocked > 0, 'перебор ключей ничем не ограничен');
     });
   } finally {
     server.close();

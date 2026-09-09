@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
+const { keyLoginLimiter } = require('../middleware/rateLimit');
 const { HttpError } = require('../middleware/errorHandler');
 const service = require('./service');
 const outbox = require('./outbox');
@@ -128,7 +129,7 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
 
 /* ===================== 1C module: auth ===================== */
 
-router.post('/auth', async (req, res, next) => {
+router.post('/auth', keyLoginLimiter, async (req, res, next) => {
   try {
     const { keyCode } = req.body || {};
     if (!keyCode) throw new HttpError(400, 'Введите ключ интеграции');

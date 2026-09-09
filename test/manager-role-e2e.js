@@ -152,6 +152,36 @@ async function api(method, path, { token, body } = {}) {
       assert.ok(String(madeManager.body.error).includes('только руководитель'), madeManager.body.error);
     });
 
+
+    // ---------- Ключи менеджеров закрыты и от менеджера с правом ----------
+    //
+    // Запрет «второго менеджера не выдать» ничего не стоил, пока список
+    // ключей был общим: менеджер читал ключ другого менеджера прямо в списке
+    // и входил им — со всеми чужими правами. Выдавать новый ключ ему было
+    // незачем, готовый лежал на экране.
+    const listByIgor = await api('GET', '/api/staff', { token: igorToken });
+    check('менеджер видит в списке только работников', () => {
+      assert.equal(listByIgor.status, 200, JSON.stringify(listByIgor.body));
+      const managers = listByIgor.body.filter((k) => k.kind === 'manager');
+      assert.equal(managers.length, 0,
+        'в списке видны ключи менеджеров: ' + JSON.stringify(managers.map((m) => m.name)));
+      assert.ok(listByIgor.body.some((k) => k.name === 'Грузчик Игоря'), 'работники пропали');
+    });
+    const listByOwner = await api('GET', '/api/staff', { token: ownerToken });
+    check('а владелец видит всех', () => {
+      assert.ok(listByOwner.body.some((k) => k.kind === 'manager'), 'владелец потерял менеджеров');
+    });
+    const revokeManager = await api('PATCH', `/api/staff/${withStaff.body.id}/toggle`,
+      { token: igorToken });
+    check('и не может отозвать или восстановить ключ менеджера', () => {
+      assert.equal(revokeManager.status, 403, JSON.stringify(revokeManager.body));
+    });
+    const revokeWorker = await api('PATCH', `/api/staff/${madeWorker.body.id}/toggle`,
+      { token: igorToken });
+    check('но ключом работника распоряжается свободно', () => {
+      assert.equal(revokeWorker.status, 200, JSON.stringify(revokeWorker.body));
+      assert.equal(revokeWorker.body.active, false);
+    });
     // ---------- Отзыв ключа действует ----------
     //
     // «В ту же секунду» — не буквально: у проверки живости ключа есть

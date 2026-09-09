@@ -36,7 +36,25 @@ function createApp() {
   // Default body-parser limit is 100kb — a 500-record 1C sync batch
   // (companies/products/invoices) routinely exceeds that.
   app.use(express.json({ limit: '5mb' }));
-  app.use(pinoHttp({ level: process.env.LOG_LEVEL || 'info' }));
+  // Заголовки пишем в лог без секретов.
+  //
+  // pino-http по умолчанию логирует все заголовки запроса — включая
+  // Authorization. То есть каждый запрос оставлял на диске рабочий токен:
+  // сорок пять минут доступа к складу лежало открытым текстом в файле, который
+  // читает любой, кто смотрит логи, и который уезжает в любую выгрузку. Логи
+  // нужны, токены в них — нет.
+  app.use(pinoHttp({
+    level: process.env.LOG_LEVEL || 'info',
+    redact: {
+      paths: [
+        'req.headers.authorization',
+        'req.headers.cookie',
+        'req.headers["x-api-key"]',
+        'res.headers["set-cookie"]',
+      ],
+      censor: '[скрыто]',
+    },
+  }));
 
   app.get('/health', (req, res) => res.json({ ok: true }));
 

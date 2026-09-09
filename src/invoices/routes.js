@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { requireQty } = require('../middleware/qty');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 
 const router = express.Router();
@@ -156,6 +157,9 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
       if (!it.name || !it.sku || it.declaredQty == null) {
         throw new HttpError(400, 'У каждой позиции должны быть название, SKU и заявленное количество');
       }
+      // Проверялось только «не null», поэтому минус сто и ноль проходили
+      // насквозь и портили каждую сумму, в которую попадали.
+      requireQty(it.declaredQty, `Количество по позиции «${it.name}»`, { min: 1 });
     }
 
     const invoice = await withTenantContext({ warehouseId }, async (client) => {

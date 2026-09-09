@@ -2,6 +2,7 @@ const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { requireQty } = require('../middleware/qty');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const kladovshchik = require('../agents/kladovshchik');
@@ -22,6 +23,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     if (!invoiceItemId || acceptedQty == null) {
       throw new HttpError(400, 'Не хватает данных о принятой позиции');
     }
+    // Отрицательная приёмка — это не «ничего не приняли», а списание чужого
+    // товара с полки: остаток в ячейке уменьшится, и никто не узнает.
+    requireQty(acceptedQty, 'Принятое количество', { min: 0 });
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
       // Invoice and company are joined in for the sync payload, so the outbox
