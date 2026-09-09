@@ -3,6 +3,7 @@ const { requireAuth, requireRole, requireGrant } = require('../middleware/auth')
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const credentials = require('./credentials');
+const mapping = require('./mapping');
 const sync = require('./sync');
 const wb = require('./wb');
 
@@ -25,6 +26,60 @@ router.get('/', async (req, res, next) => {
       credentials.list(c, warehouseId)
     ));
     res.json(rows);
+  } catch (err) { next(err); }
+});
+
+/* ============ Сопоставление артикулов ============
+   Объявлено выше `/:companyId/:marketplace`: у `DELETE /mapping/<id>`
+   ровно столько же сегментов, и Express выбрал бы первый подошедший
+   маршрут — то есть снял бы ключ площадки вместо строки сопоставления.
+
+   Право — владельцу и менеджеру без отдельной галочки: это ежедневная
+   работа по разбору очереди, и доступа она ни к чему не открывает.
+   Менеджер, который не может сопоставить артикул, не может работать. */
+
+router.get('/mapping/unresolved', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rows = await withTenantContext({ warehouseId },
+      (c) => mapping.unresolved(c, warehouseId));
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.get('/mapping/products', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rows = await withTenantContext({ warehouseId },
+      (c) => mapping.searchProducts(c, warehouseId, req.query.companyId, req.query.q));
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.get('/mapping', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rows = await withTenantContext({ warehouseId },
+      (c) => mapping.list(c, warehouseId, req.query.companyId));
+    res.json(rows);
+  } catch (err) { next(err); }
+});
+
+router.post('/mapping', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId },
+      (c) => mapping.save(c, warehouseId, req.body || {}));
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+
+router.delete('/mapping/:id', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId },
+      (c) => mapping.remove(c, warehouseId, req.params.id));
+    res.json(out);
   } catch (err) { next(err); }
 });
 
