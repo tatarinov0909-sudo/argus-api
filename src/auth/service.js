@@ -177,7 +177,19 @@ async function loginSellerKey({ keyCode, name }) {
       sellerKeyId: key.id,
       name,
     });
-    return { token, name, companyName: key.company_name };
+    // Имя склада — чтобы кабинет продавца не подписывался выдуманным.
+    // В шапке было вписано руками «Склад №1, Люберцы», и клиент читал это
+    // как настоящее название. Отдельным запросом в контексте склада: без
+    // него изоляция вернёт ноль строк, и это правильно.
+    const wh = await withTenantContext({ warehouseId: key.warehouse_id },
+      (c) => c.query('SELECT name, city FROM warehouses WHERE id = $1', [key.warehouse_id]));
+    const w = wh.rows[0] || {};
+    return {
+      token,
+      name,
+      companyName: key.company_name,
+      warehouseName: [w.name, w.city].filter(Boolean).join(', ') || null,
+    };
   });
 }
 
