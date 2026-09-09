@@ -258,6 +258,83 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(betaMoves.body.returned.length, 0, JSON.stringify(betaMoves.body.returned));
     });
 
+    // ---------- Три колонки: на складе, в заказах, доступно ----------
+    //
+    // Ради этих трёх чисел продавец и звонит на склад. Проверяется не то,
+    // что они «есть», а арифметика между ними: доступное — это разность,
+    // и если она посчитана не по всем обещанным заказам, склад пообещает
+    // клиенту товар, который уже уезжает.
+    const trio = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    const rowA = trio.body.find((r) => r.sku === 'PB-A');
+    check('три числа приходят по каждому товару', () => {
+      assert.ok(rowA, JSON.stringify(trio.body));
+      assert.equal(typeof rowA.onHand, 'number');
+      assert.equal(typeof rowA.ordered, 'number');
+      assert.equal(typeof rowA.available, 'number');
+    });
+    check('доступно к продаже — это на складе минус обещанное', () => {
+      assert.equal(rowA.available, Math.max(0, rowA.onHand - rowA.ordered),
+        JSON.stringify(rowA));
+    });
+
+    // Новый заказ на 30 штук — ещё не собран.
+    const fresh = await api('POST', '/api/invoices', {
+      token: ownerToken,
+      body: { companyId: alpha.body.id, number: `WB-NEW-${stamp}`, direction: 'out',
+              items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 30 }] },
+    });
+    const afterOrder = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    const withOrder = afterOrder.body.find((r) => r.sku === 'PB-A');
+    check('новый заказ уменьшил доступное, не тронув «на складе»', () => {
+      assert.equal(withOrder.onHand, rowA.onHand, 'на складе не должно было измениться');
+      assert.equal(withOrder.ordered, rowA.ordered + 30, JSON.stringify(withOrder));
+      assert.equal(withOrder.available, withOrder.onHand - withOrder.ordered);
+    });
+    check('и сказано, сколькими заказами это обещано', () => {
+      assert.ok(withOrder.orderedOrders >= 1, JSON.stringify(withOrder));
+    });
+
+    // Собрали заказ: товар снят с полки, но машина ещё не ушла.
+    const freshItem = fresh.body.items[0];
+    await api('POST', '/api/shipping', {
+      token: workerToken,
+      body: { invoiceItemId: freshItem.id, pickedQty: 30, cellBlockId: blocks[0].id },
+    });
+    const afterPick = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    const picked = afterPick.body.find((r) => r.sku === 'PB-A');
+    check('собранный, но не уехавший заказ ОСТАЁТСЯ в обещанном', () => {
+      // Из ячейки он уже списан, а из учёта 1С — ещё нет: реализация
+      // проводится при отгрузке. Выкинь его из обещанного — и продавцу
+      // пообещают то, что стоит в коробке у ворот.
+      assert.equal(picked.ordered, withOrder.ordered, JSON.stringify(picked));
+      // Их два: этот и заказ, собранный выше в этом же тесте. Проверяем
+      // сам признак, а не число — иначе тест начнёт падать от любого
+      // заказа, добавленного в сценарий выше.
+      assert.ok(picked.orderedPicked >= 1, 'не отмечено, что заказ уже собран: '
+        + JSON.stringify(picked));
+    });
+
+    // Товар, которого нет ни в 1С, ни в ячейках — только в заказе.
+    await api('POST', '/api/invoices', {
+      token: ownerToken,
+      body: { companyId: alpha.body.id, number: `WB-GHOST-${stamp}`, direction: 'out',
+              items: [{ name: 'Товар только в заказе', sku: 'PB-ONLY-ORDER', declaredQty: 7 }] },
+    });
+    const withGhost = await api('GET', '/api/sellers/stock', { token: alphaToken });
+    const ghost = withGhost.body.find((r) => r.sku === 'PB-ONLY-ORDER');
+    check('заказ на товар, которого на складе нет, продавец всё равно видит', () => {
+      assert.ok(ghost, 'строка пропала: раньше остаток строился только по 1С и ячейкам');
+      assert.equal(ghost.onHand, 0);
+      assert.equal(ghost.ordered, 7);
+    });
+    check('доступное не уходит в минус — вместо этого видна нехватка', () => {
+      assert.equal(ghost.available, 0, JSON.stringify(ghost));
+      assert.equal(ghost.short, 7, 'нехватка не посчитана');
+    });
+    const foreign = withGhost.body.find((r) => r.sku === 'PB-B');
+    check('чужие заказы в это не попадают', () => {
+      assert.equal(foreign, undefined, 'виден товар другой компании');
+    });
     // ---------- Отзыв ключа действует сразу ----------
     // Раньше отзыв закрывал только вход, а выданный токен жил до конца срока —
     // до 45 минут. Отзывают ключ обычно тогда, когда этих минут и нет.
@@ -280,6 +357,7 @@ async function api(method, path, { token, body } = {}) {
     check('владельца это не задевает', () => {
       assert.equal(ownerStillWorks.status, 200, JSON.stringify(ownerStillWorks.body));
     });
+
   } finally {
     server.close();
   }

@@ -70,23 +70,53 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
            SELECT sku, name, stock_qty_1c, stock_at
            FROM products
            WHERE company_id = $1 AND COALESCE(stock_qty_1c, 0) <> 0
+         ), ordered AS (
+           -- Сколько этого товара уже обещано заказами и ещё не уехало.
+           --
+           -- Считаем ВСЕ неотгруженные заказы, а не только несобранные.
+           -- Собранный, но не уехавший заказ лежит в коробке у ворот: из
+           -- ячейки он уже списан, а из учёта 1С — ещё нет, потому что
+           -- реализация проводится при отгрузке. Не вычти его — и продавцу
+           -- обещано то, что физически уже уезжает.
+           SELECT ii.sku, SUM(ii.declared_qty) AS qty,
+                  count(DISTINCT i.id) AS orders,
+                  count(DISTINCT i.id) FILTER (WHERE i.status = 'ready') AS picked_orders
+           FROM invoices i
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+           WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
+           GROUP BY ii.sku
+         ), skus AS (
+           SELECT sku FROM prod
+           UNION SELECT sku FROM cells
+           UNION SELECT sku FROM ordered
          )
-         SELECT COALESCE(p.sku, c.sku) AS sku,
+         SELECT s.sku,
                 COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
-                                  WHERE ii.company_id = $1 AND ii.sku = c.sku
+                                  WHERE ii.company_id = $1 AND ii.sku = s.sku
                                   ORDER BY ii.id DESC LIMIT 1),
-                         COALESCE(p.sku, c.sku)) AS name,
+                         s.sku) AS name,
                 c.good_qty, c.bad_qty, c.cells,
-                p.stock_qty_1c, p.stock_at
-         FROM prod p
-         FULL JOIN cells c ON c.sku = p.sku
+                p.stock_qty_1c, p.stock_at,
+                o.qty AS ordered_qty, o.orders, o.picked_orders
+         FROM skus s
+         LEFT JOIN prod p ON p.sku = s.sku
+         LEFT JOIN cells c ON c.sku = s.sku
+         LEFT JOIN ordered o ON o.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
       return result.rows;
     });
 
-    res.json(rows.map((r) => ({
+    res.json(rows.map((r) => {
+      // «На складе» — цифра того источника, который для этого товара есть:
+      // учёт 1С, если обмен его отдал, иначе то, что Аргус разложил сам.
+      // Смешивать нельзя: одна и та же величина, посчитанная двумя разными
+      // способами, в сумме даст третью, неверную.
+      const onHand = r.stock_qty_1c === null || r.stock_qty_1c === undefined
+        ? Number(r.good_qty || 0) : Number(r.stock_qty_1c);
+      const ordered = Number(r.ordered_qty || 0);
+      return {
       sku: r.sku,
       name: r.name,
       // Годное и негодное раздельно: «на складе 40» без оговорки, что 8 из них
@@ -99,7 +129,19 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
       qtyIn1c: r.stock_qty_1c === null || r.stock_qty_1c === undefined
         ? null : Number(r.stock_qty_1c),
       stockAt: r.stock_at || null,
-    })));
+      // Три числа, которые продавец и звонит спрашивать.
+      onHand,
+      ordered,
+      orderedOrders: Number(r.orders || 0),
+      // Из них уже сняты с полки и ждут машину — продавцу это объясняет,
+      // почему «на складе» больше, чем он видит в ячейках.
+      orderedPicked: Number(r.picked_orders || 0),
+      // Отрицательным быть не может: заказов больше, чем товара, — это
+      // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
+      available: Math.max(0, onHand - ordered),
+      short: Math.max(0, ordered - onHand),
+      };
+    }));
   } catch (err) {
     next(err);
   }
