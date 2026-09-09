@@ -56,6 +56,20 @@ async function insertWithNumber(client, warehouseId, { companyId, marketplace, d
   throw new HttpError(409, 'Не удалось выдать номер поставки — попробуйте ещё раз');
 }
 
+// Сопоставлен ли товар заказа с номенклатурой склада. Ключ — тот же, что
+// в уникальном индексе `products`: склад, продавец и артикул.
+const MAPPED_SQL = `EXISTS (SELECT 1 FROM products p
+                             WHERE p.warehouse_id = ii.warehouse_id
+                               AND p.company_id = ii.company_id
+                               AND p.sku = ii.sku)`;
+
+// Заказ, который склад физически не соберёт: товара нет в номенклатуре, или
+// у заказа с площадки нет номера отправления. Номер спрашиваем только
+// у площадочных заказов — у накладной из 1С его не бывает и быть не должно,
+// и требовать его значило бы запретить поставку по обычной накладной.
+const UNPICKABLE_SQL = `NOT ${MAPPED_SQL}
+   OR (i.source <> '1c' AND ii.mp_rid IS NULL)`;
+
 // Собрать поставку из заказов.
 //
 // Заказы обязаны быть одной компании: поставка уезжает по документам одного
@@ -66,7 +80,11 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   }
 
   const orders = await client.query(
-    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.supply_id, c.name AS company_name
+    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.supply_id, c.name AS company_name,
+            (NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
+             OR EXISTS (SELECT 1 FROM invoice_items ii
+                         WHERE ii.invoice_id = i.id
+                           AND (${UNPICKABLE_SQL}))) AS has_unpickable
        FROM invoices i JOIN companies c ON c.id = i.company_id
       WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[])`,
     [warehouseId, invoiceIds],
@@ -86,6 +104,18 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   const companies = [...new Set(orders.rows.map((o) => o.company_id))];
   if (companies.length > 1) {
     throw new HttpError(400, 'В одной поставке заказы только одного продавца');
+  }
+  // Несобираемый заказ в поставку не берём — и решает это сервер, а не экран.
+  // Экран уже фильтровал такие заказы и всё равно пропустил 36: он спрашивал
+  // «есть ли строка с артикулом», а надо было «есть ли этот товар у нас».
+  // Пока проверка живёт только в отрисовке, её обходит и устаревшая страница,
+  // и прямой вызов, и любая следующая ошибка в том же условии.
+  const unpickable = orders.rows.filter((o) => o.has_unpickable);
+  if (unpickable.length > 0) {
+    throw new HttpError(409,
+      `${unpickable.length} ${unpickable.length === 1 ? 'заказ' : 'заказов'} нельзя собрать: `
+      + 'товар не сопоставлен с номенклатурой склада или нет номера отправления. '
+      + `Например «${unpickable[0].number}». Такие заказы остаются в очереди.`);
   }
 
   await client.query('SAVEPOINT supply_number');
@@ -303,7 +333,7 @@ async function pendingByCompany(client, warehouseId) {
             count(DISTINCT i.id)::int AS orders,
             COALESCE(sum(ii.declared_qty), 0)::numeric AS units,
             min(i.created_at) AS oldest,
-            count(DISTINCT i.id) FILTER (WHERE ii.sku IS NULL OR ii.mp_rid IS NULL)::int AS incomplete
+            count(DISTINCT i.id) FILTER (WHERE ${UNPICKABLE_SQL})::int AS incomplete
        FROM invoices i
        JOIN companies c ON c.id = i.company_id
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -334,7 +364,8 @@ async function pendingOrders(client, warehouseId, companyId) {
   const r = await client.query(
     `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
-            ii.mp_nm_id, ii.mp_rid
+            ii.mp_nm_id, ii.mp_rid,
+            NOT (${UNPICKABLE_SQL}) AS pickable
        FROM invoices i
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
       WHERE i.warehouse_id = $1
@@ -359,10 +390,68 @@ async function pendingOrders(client, warehouseId, companyId) {
     nmId: x.mp_nm_id,
     rid: x.mp_rid,
     // Собирать нечего, пока товар не сопоставлен с номенклатурой склада.
-    ready: Boolean(x.sku && x.mp_rid),
+    //
+    // Проверяется наличие товара в номенклатуре, а не наличие строки `sku`.
+    // Строка есть всегда: у несопоставленного заказа туда кладётся артикул
+    // площадки, чтобы заказ не потерялся. Из-за этого «готов» означало всего
+    // лишь «есть номер отправления», и 36 несобираемых заказов уехали
+    // в поставку вместе с остальными — кладовщик пошёл бы искать на полке
+    // артикул, которого на складе нет.
+    ready: Boolean(x.pickable),
   }));
 }
 
+// Разобрать поставку.
+//
+// Собрали не то — надо иметь возможность вернуть заказы в очередь. Разрешено
+// только пока поставка «собирается»: после отбора товар уже снят с полок,
+// а уехавшую поставку не разбирают в базе, её разгружают руками.
+async function disband(client, warehouseId, supplyId, { actor }) {
+  const s = await client.query(
+    'SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2',
+    [warehouseId, supplyId],
+  );
+  const supply = s.rows[0];
+  if (!supply) throw new HttpError(404, 'Поставка не найдена');
+  if (supply.status !== 'collecting') {
+    throw new HttpError(409,
+      `Поставка «${supply.number}» уже ${STATUS_NAMES[supply.status] || supply.status}`
+      + ' — разобрать её в Аргусе нельзя.');
+  }
+  // Отобранное вернуть в очередь молча нельзя: товар уже снят с полки, и
+  // «вернулось в очередь» означало бы, что его отберут второй раз.
+  const picked = await client.query(
+    `SELECT count(*)::int AS n FROM shipping_records sr
+      JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+      JOIN invoices i ON i.id = ii.invoice_id
+     WHERE i.supply_id = $1 AND sr.warehouse_id = $2`,
+    [supplyId, warehouseId],
+  );
+  if (Number(picked.rows[0].n) > 0) {
+    throw new HttpError(409,
+      `По поставке «${supply.number}» уже отбирали товар — разобрать нельзя.`);
+  }
+
+  const freed = await client.query(
+    'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND supply_id = $2',
+    [warehouseId, supplyId],
+  );
+  await client.query('DELETE FROM supplies WHERE warehouse_id = $1 AND id = $2',
+    [warehouseId, supplyId]);
+
+  await journal.createEntry(client, {
+    warehouseId,
+    agent: 'Кладовщик',
+    actionText: `Поставка «${supply.number}» разобрана — ${freed.rowCount} `
+      + `${freed.rowCount === 1 ? 'заказ' : 'заказов'} вернулись в очередь.`,
+    entityType: 'supply',
+    entityId: supplyId,
+    actorType: actor?.type || 'owner',
+    actorId: actor?.id || null,
+  });
+  return { number: supply.number, returned: freed.rowCount };
+}
+
 module.exports = {
-  create, contents, advance, list, pendingByCompany, pendingOrders, STATUS_NAMES,
+  create, contents, advance, list, pendingByCompany, pendingOrders, disband, STATUS_NAMES,
 };

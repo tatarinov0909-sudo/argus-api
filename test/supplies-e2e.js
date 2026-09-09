@@ -51,6 +51,18 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     const alpha = await api('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Альфа' } });
     const beta = await api('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Бета' } });
 
+    // Номенклатура склада. Раньше тест её не заводил, и заказы ссылались на
+    // артикулы, которых на складе не существует. Проверка «можно ли это
+    // собрать» на таких данных проходила при любом ответе — именно поэтому
+    // в живую поставку и уехали 36 несобираемых заказов.
+    for (const companyId of [alpha.body.id, beta.body.id]) {
+      for (const [sku, name] of [['PB-A', 'Renal для кошек 2кг'], ['PB-B', 'Сухой корм Ageing 12+']]) {
+        await api('POST', '/api/products', {
+          token: ownerToken, body: { companyId, sku, name },
+        });
+      }
+    }
+
     const mkOrder = async (companyId, number, sku, name, qty) => {
       const inv = await api('POST', '/api/invoices', {
         token: ownerToken,
@@ -261,6 +273,62 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     check('и не видит чужую', () => {
       assert.equal(foreignSeen.body.length, 0, JSON.stringify(foreignSeen.body));
     });
+    // ---------- Несобираемый заказ в поставку не попадает ----------
+    //
+    // Главная проверка этого файла. Артикул есть, номер отправления есть,
+    // а товара такого на складе нет — собрать нечего. Раньше «готов»
+    // означало «строка с артикулом не пустая», а она не пуста никогда:
+    // у несопоставленного заказа туда кладётся артикул площадки.
+    const ghostOrder = await mkOrder(alpha.body.id, `WB-GHOST-${stamp}`, 'НЕТ-ТАКОГО', 'Товар с площадки', 1);
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `UPDATE invoices SET source = 'wb' WHERE id = $1`, [ghostOrder]));
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `UPDATE invoice_items SET mp_rid = 'rid-ghost', mp_article = 'ART-GHOST'
+        WHERE invoice_id = $1`, [ghostOrder]));
+
+    const withGhost = await api('GET', `/api/supplies/pending/${alpha.body.id}`, { token: ownerToken });
+    check('заказ на товар, которого нет в номенклатуре, не считается готовым', () => {
+      const g = withGhost.body.find((o) => o.id === ghostOrder);
+      assert.ok(g, 'заказ исчез из очереди');
+      assert.equal(g.ready, false, JSON.stringify(g));
+    });
+
+    const refused = await api('POST', '/api/supplies', {
+      token: ownerToken, body: { invoiceIds: [ghostOrder] },
+    });
+    check('и сервер сам отказывается брать его в поставку, а не надеется на экран', () => {
+      assert.equal(refused.status, 409, JSON.stringify(refused.body));
+      assert.ok(String(refused.body.error).includes('нельзя собрать'), refused.body.error);
+    });
+
+    // ---------- Разобрать поставку ----------
+    const spare = await mkOrder(alpha.body.id, `WB-A4-${stamp}`, 'PB-B', 'Сухой корм Ageing 12+', 2);
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `UPDATE invoice_items SET mp_rid = 'rid-spare' WHERE invoice_id = $1`, [spare]));
+    const toDisband = await api('POST', '/api/supplies', {
+      token: ownerToken, body: { invoiceIds: [spare] },
+    });
+    check('поставка для разбора собралась', () => {
+      assert.equal(toDisband.status, 201, JSON.stringify(toDisband.body));
+    });
+    const undone = await api('DELETE', `/api/supplies/${toDisband.body.id}`, { token: ownerToken });
+    check('пока поставка собирается, её можно разобрать', () => {
+      assert.equal(undone.status, 200, JSON.stringify(undone.body));
+      assert.equal(undone.body.returned, 1, JSON.stringify(undone.body));
+    });
+    const backInQueue = await api('GET', `/api/supplies/pending/${alpha.body.id}`, { token: ownerToken });
+    check('разобранные заказы вернулись в очередь', () => {
+      assert.ok(backInQueue.body.some((o) => o.id === spare), 'заказ не вернулся');
+    });
+    const gone = await api('GET', `/api/supplies/${toDisband.body.id}`, { token: ownerToken });
+    check('а самой поставки больше нет', () => {
+      assert.equal(gone.status, 404, JSON.stringify(gone.body));
+    });
+    const shippedDisband = await api('DELETE', `/api/supplies/${supplyId}`, { token: ownerToken });
+    check('уехавшую поставку разобрать нельзя — машина ушла', () => {
+      assert.equal(shippedDisband.status, 409, JSON.stringify(shippedDisband.body));
+    });
+
   } finally { server.close(); }
 
   console.log(`\n${passed} прошло, ${failures.length} упало`);

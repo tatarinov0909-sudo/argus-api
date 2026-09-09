@@ -47,7 +47,7 @@ router.get('/pending/:companyId', requireAuth, requireRole('owner', 'manager'), 
 
 // Список поставок. Продавцу тоже: это его товар уезжает, и знать, когда
 // и куда, — его законный интерес. Что он увидит, решает изоляция в базе.
-router.get('/', requireAuth, requireRole('owner', 'worker', 'seller'), async (req, res, next) => {
+router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const rows = await withTenantContext(ctx, (client) => service.list(
@@ -60,7 +60,7 @@ router.get('/', requireAuth, requireRole('owner', 'worker', 'seller'), async (re
 // Состав: и сводно «что взять со склада», и построчно «что положить
 // в коробки». Работнику нужен первый, упаковщику второй — отдаём оба сразу,
 // чтобы экран не ходил за данными дважды.
-router.get('/:id', requireAuth, requireRole('owner', 'worker', 'seller'), async (req, res, next) => {
+router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'seller'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const data = await withTenantContext(ctx, (client) => service.contents(
@@ -88,6 +88,18 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req
     const out = await withTenantContext({ warehouseId }, (client) => service.advance(
       client, warehouseId, req.params.id,
       { to: 'shipped', destination: (req.body || {}).destination || null, actor: actorOf(req.auth) },
+    ));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Разобрать поставку, пока она собирается. Право владельца и менеджера:
+// это отмена их собственного решения, а не работа у полки.
+router.delete('/:id', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => service.disband(
+      client, warehouseId, req.params.id, { actor: actorOf(req.auth) },
     ));
     res.json(out);
   } catch (err) { next(err); }
