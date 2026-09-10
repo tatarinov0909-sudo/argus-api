@@ -53,7 +53,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     let row = await stock();
     assert.equal(row.qtyIn1c,0); assert.equal(row.barcode,'0000123456789'); assert.equal(row.onHand,100);
     const only1c = (await api('GET','/api/sellers/stock',sa)).find(r=>r.sku==='ONLY-1C');
-    assert.equal(only1c.onHand,0); assert.equal(only1c.qtyIn1c,900);
+    assert.equal(only1c.onHand,null); assert.equal(only1c.available,null); assert.equal(only1c.stockKnown,false); assert.equal(only1c.qtyIn1c,900);
     console.log('PASS zero 1C balance and barcode preserved; 1C never overrides Argus stock');
 
     const order = await invoice(a,'out',30);
@@ -92,6 +92,26 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await invoice(a,'out',90);
     row=await stock(); assert.equal(row.available,0); assert.equal(row.short,20);
     console.log('PASS shortages are explicit and availability does not go below zero');
+    assert.equal((await api('GET','/api/sellers/profile?companyId='+a.id,sb)).id,b.id);
+    const docs=await api('GET','/api/sellers/documents?companyId='+a.id,sb);
+    assert.equal(docs.rows.length,1); assert.equal(docs.rows[0].direction,'in');
+    assert.equal(Number(docs.rows[0].declared_qty),55);
+    const blocked=await api('GET','/api/sellers/export/1c?download=1',sa,undefined,422);
+    assert.ok(blocked.issues.some(i=>i.sku==='ONLY-1C'&&i.code==='unknown_stock'));
+    await withTenantContext({warehouseId},c=>c.query(
+      `INSERT INTO products(warehouse_id,company_id,sku,name,barcode) VALUES($1,$2,'SAME-SKU','Synthetic B','0000000000555')`,[warehouseId,b.id]));
+    const snapshot=await api('GET','/api/sellers/export/1c?download=1&companyId='+a.id,sb);
+    assert.equal(snapshot.seller.id,b.id); assert.equal(snapshot.items.length,1);
+    assert.equal(snapshot.items[0].barcode,'0000000000555'); assert.equal(snapshot.items[0].available,55);
+    const outB=await invoice(b,'out',55);
+    await api('POST','/api/shipping',worker,{invoiceItemId:outB.items[0].id,pickedQty:55,cellBlockId:cells[1].id,isFinal:true},201);
+    let emptyCell=(await api('GET','/api/sellers/stock',sb))[0];
+    assert.equal(emptyCell.onHand,55); assert.equal(emptyCell.stockKnown,true); assert.equal(emptyCell.available,0);
+    await api('POST',`/api/shipping/${outB.id}/ship`,token,{});
+    emptyCell=(await api('GET','/api/sellers/stock',sb))[0];
+    assert.equal(emptyCell.onHand,0); assert.equal(emptyCell.stockKnown,true); assert.equal(emptyCell.available,0);
+    assert.equal((await api('GET','/api/sellers/export/1c?download=1',sb)).items[0].onHand,0);
+    console.log('PASS profile, documents and export isolation; unknown blocked; leading zeros preserved; depleted stock stays known zero');
   } finally {
     await new Promise(r=>server.close(r)); await pool.end();
   }

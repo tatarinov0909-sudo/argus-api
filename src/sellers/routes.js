@@ -6,7 +6,42 @@ const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 
+const { loadStock } = require('./stock');
+const { prepareInventoryExport } = require('./export');
 const router = express.Router();
+
+router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    const profile = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
+      const company = (await c.query('SELECT id, name, warehouse_id FROM companies WHERE id=$1', [companyId])).rows[0];
+      if (!company) throw new HttpError(404, 'Компания не найдена');
+      // Warehouse identity is non-secret. Seller context cannot read warehouse rows.
+      return { id: company.id, name: company.name, warehouseId: company.warehouse_id };
+    });
+    res.set('Cache-Control','no-store').json(profile);
+  } catch (err) { next(err); }
+});
+
+router.get('/export/1c', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400,'Укажите продавца');
+    const prepared = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
+      // All quantities come from one loadStock SQL statement (one MVCC snapshot).
+      const company = (await c.query('SELECT id,name,warehouse_id FROM companies WHERE id=$1',[companyId])).rows[0];
+      if (!company) throw new HttpError(404,'Компания не найдена');
+      return prepareInventoryExport(await loadStock(c,companyId), {
+        seller: { id:company.id,name:company.name }, warehouse: { id:company.warehouse_id },
+      });
+    });
+    res.set('Cache-Control','no-store');
+    if (req.query.download !== '1') return res.json(prepared.readiness);
+    if (!prepared.readiness.ready) return res.status(422).json({ error:'Выгрузка требует проверки данных', ...prepared.readiness });
+    res.set('Content-Disposition','attachment; filename="argus-inventory-v1.json"');
+    res.json(prepared.snapshot);
+  } catch (err) { next(err); }
+});
 
 router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
@@ -43,6 +78,21 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
 // компанию, и политика на cell_stock пропускает ровно его строки. Никакой
 // фильтрации «руками» здесь нет намеренно — на такой фильтрации проект уже
 // однажды получил утечку между компаниями.
+router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400,'Укажите продавца');
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
+      `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at,
+              count(ii.id)::int AS item_count, COALESCE(SUM(ii.declared_qty),0) AS declared_qty
+       FROM invoices i LEFT JOIN invoice_items ii ON ii.invoice_id=i.id AND ii.company_id=$1
+       WHERE i.company_id=$1 AND i.direction IN ('in','return')
+       GROUP BY i.id ORDER BY i.created_at DESC,i.id LIMIT 1001`,[companyId],
+    )).rows);
+    res.set('Cache-Control','no-store').json({ rows:rows.slice(0,1000),hasMore:rows.length>1000 });
+  } catch (err) { next(err); }
+});
+
 router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
@@ -63,119 +113,11 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
 
 router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
-    const ctx = tenantContextFromAuth(req.auth);
-    // Владелец смотрит глазами конкретного продавца — иначе он увидел бы
-    // склад целиком, а вопрос здесь другой: «что видит мой клиент».
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
-
-    const rows = await withTenantContext(ctx, async (client) => {
-      // Два независимых факта об одном товаре, и ни один не подменяет другой:
-      // сколько числится в 1С и сколько Аргус физически разложил по ячейкам.
-      // Поэтому FULL JOIN: товар может числиться в 1С и ещё не быть принят
-      // у нас, а может лежать в ячейке, но не приехать из обмена. Обычный
-      // JOIN от cell_stock прятал первый случай — а сегодня это ВСЕ товары.
-      const result = await client.query(
-        `WITH cells AS (
-           SELECT sku,
-                  SUM(qty) FILTER (WHERE quality = 'good') AS good_qty,
-                  SUM(qty) FILTER (WHERE quality <> 'good') AS bad_qty,
-                  SUM(qty) FILTER (WHERE quality = 'defective') AS defective_qty,
-                  SUM(qty) FILTER (WHERE quality = 'packaging_defect') AS packaging_qty,
-                  count(DISTINCT cell_block_id) AS cells
-           FROM cell_stock
-           WHERE company_id = $1 AND qty > 0
-           GROUP BY sku
-         ), prod AS (
-           SELECT sku, name, barcode, stock_qty_1c, stock_at
-           FROM products
-           WHERE company_id = $1
-         ), ordered AS (
-           -- Сколько этого товара уже обещано заказами и ещё не уехало.
-           --
-           -- Считаем ВСЕ неотгруженные заказы, а не только несобранные.
-           -- Собранный, но не уехавший заказ лежит в коробке у ворот: из
-           -- ячейки он уже списан, а из учёта 1С — ещё нет, потому что
-           -- реализация проводится при отгрузке. Не вычти его — и продавцу
-           -- обещано то, что физически уже уезжает.
-           SELECT ii.sku, SUM(ii.declared_qty) AS qty,
-                  count(DISTINCT i.id) AS orders,
-                  count(DISTINCT i.id) FILTER (WHERE i.status = 'ready') AS picked_orders
-           FROM invoices i
-           JOIN invoice_items ii ON ii.invoice_id = i.id
-           WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
-           GROUP BY ii.sku
-         ), staged AS (
-           -- Picks have left their cells, but remain on site until shipment.
-           -- Include partial picks as well as fully assembled orders.
-           SELECT ii.sku, SUM(sr.picked_qty) AS qty
-           FROM shipping_records sr
-           JOIN invoice_items ii ON ii.id = sr.invoice_item_id
-           JOIN invoices i ON i.id = ii.invoice_id
-           WHERE sr.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
-           GROUP BY ii.sku
-         ), skus AS (
-           SELECT sku FROM prod WHERE stock_qty_1c IS NOT NULL
-           UNION SELECT sku FROM cells
-           UNION SELECT sku FROM ordered
-         )
-         SELECT s.sku,
-                COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
-                                  WHERE ii.company_id = $1 AND ii.sku = s.sku
-                                  ORDER BY ii.id DESC LIMIT 1),
-                         s.sku) AS name,
-                c.good_qty, c.bad_qty, c.defective_qty, c.packaging_qty, c.cells,
-                p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
-                o.qty AS ordered_qty, o.orders, o.picked_orders
-         FROM skus s
-         LEFT JOIN prod p ON p.sku = s.sku
-         LEFT JOIN cells c ON c.sku = s.sku
-         LEFT JOIN ordered o ON o.sku = s.sku
-         LEFT JOIN staged st ON st.sku = s.sku
-         ORDER BY name`,
-        [companyId],
-      );
-      return result.rows;
-    });
-
-    res.json(rows.map((r) => {
-      // Warehouse stock includes picked goods still waiting for departure.
-      // 1C is a separate reconciliation source, never a fallback balance.
-      const staged = Number(r.staged_qty || 0);
-      const onHand = Number(r.good_qty || 0) + staged;
-      const ordered = Number(r.ordered_qty || 0);
-      return {
-      sku: r.sku,
-      name: r.name,
-      barcode: r.barcode || null,
-      staged,
-      defective: Number(r.defective_qty || 0),
-      packagingDefect: Number(r.packaging_qty || 0),
-      // Годное и негодное раздельно: «на складе 40» без оговорки, что 8 из них
-      // брак, — это обещание отгрузить то, что отгружено не будет.
-      qty: Number(r.good_qty || 0),
-      notForSale: Number(r.bad_qty || 0),
-      cells: Number(r.cells || 0),
-      // Цифра из 1С склада и время, когда она пришла. Без времени нельзя
-      // отличить «на складе ноль» от «обмен молчит вторую неделю».
-      qtyIn1c: r.stock_qty_1c === null || r.stock_qty_1c === undefined
-        ? null : Number(r.stock_qty_1c),
-      stockAt: r.stock_at || null,
-      // Три числа, которые продавец и звонит спрашивать.
-      onHand,
-      ordered,
-      orderedOrders: Number(r.orders || 0),
-      // Count of fully assembled orders, not the number of picked units.
-      orderedPicked: Number(r.picked_orders || 0),
-      // Отрицательным быть не может: заказов больше, чем товара, — это
-      // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
-      available: Math.max(0, onHand - ordered),
-      short: Math.max(0, ordered - onHand),
-      };
-    }));
-  } catch (err) {
-    next(err);
-  }
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), client => loadStock(client, companyId));
+    res.set('Cache-Control', 'no-store').json(rows);
+  } catch (err) { next(err); }
 });
 
 // Движение товара продавца: что у него отгрузили и что вернулось.

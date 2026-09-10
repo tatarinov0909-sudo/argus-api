@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Argus inventory snapshot v1 (not native 1C document)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "schemaVersion", "seller", "warehouse", "quantityMode", "missingItems", "primaryMeasure", "items", "snapshotId", "generatedAt"],
+  "properties": {
+    "format": {"const": "argus.inventory"},
+    "schemaVersion": {"const": 1},
+    "seller": {
+      "type": "object", "additionalProperties": false, "required": ["id", "name"],
+      "properties": {"id": {"type": "string", "format": "uuid"}, "name": {"type": "string", "minLength": 1}}
+    },
+    "warehouse": {
+      "type": "object", "additionalProperties": false, "required": ["id"],
+      "properties": {"id": {"type": "string", "format": "uuid"}}
+    },
+    "quantityMode": {"const": "absolute"},
+    "missingItems": {"const": "unchanged"},
+    "primaryMeasure": {"const": "available"},
+    "snapshotId": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "generatedAt": {"type": "string", "format": "date-time"},
+    "items": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["sku", "barcode", "name", "unit", "onHand", "inAssembly", "available", "stockObservedAt"],
+        "properties": {
+          "sku": {"type": "string", "minLength": 1},
+          "barcode": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
+          "name": {"type": "string", "minLength": 1},
+          "unit": {"const": "pcs"},
+          "onHand": {"$ref": "#/$defs/quantity"},
+          "inAssembly": {"$ref": "#/$defs/quantity"},
+          "available": {"$ref": "#/$defs/quantity"},
+          "stockObservedAt": {"type": ["string", "null"], "format": "date-time"}
+        }
+      }
+    }
+  },
+  "$defs": {"quantity": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}}
+}

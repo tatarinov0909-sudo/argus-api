@@ -327,12 +327,12 @@ async function api(method, path, { token, body } = {}) {
     const ghost = withGhost.body.find((r) => r.sku === 'PB-ONLY-ORDER');
     check('заказ на товар, которого на складе нет, продавец всё равно видит', () => {
       assert.ok(ghost, 'строка пропала: раньше остаток строился только по 1С и ячейкам');
-      assert.equal(ghost.onHand, 0);
+      assert.equal(ghost.onHand, null);
       assert.equal(ghost.ordered, 7);
     });
-    check('доступное не уходит в минус — вместо этого видна нехватка', () => {
-      assert.equal(ghost.available, 0, JSON.stringify(ghost));
-      assert.equal(ghost.short, 7, 'нехватка не посчитана');
+    check('неизвестный остаток не превращается в ноль или ложную нехватку', () => {
+      assert.equal(ghost.available, null, JSON.stringify(ghost));
+      assert.equal(ghost.short, null);
     });
     const foreign = withGhost.body.find((r) => r.sku === 'PB-B');
     check('чужие заказы в это не попадают', () => {
