@@ -83,14 +83,17 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const result = await client.query(
-        `SELECT c.id, c.name, c.created_at,
+        `SELECT c.id, c.name, c.created_at, c.external_id AS one_c_external_id,
+                ic.name AS one_c_counterparty_name,
                 COALESCE(json_agg(json_build_object(
                   'id', sk.id, 'keyCode', sk.key_code, 'active', sk.active, 'issuedAt', sk.issued_at
                 ) ORDER BY sk.issued_at) FILTER (WHERE sk.id IS NOT NULL), '[]') AS keys
          FROM companies c
          LEFT JOIN seller_keys sk ON sk.company_id = c.id
+         LEFT JOIN integration_counterparties ic
+           ON ic.warehouse_id = c.warehouse_id AND ic.external_id = c.external_id
          WHERE c.warehouse_id = $1
-         GROUP BY c.id ORDER BY c.created_at ASC`,
+         GROUP BY c.id, ic.name ORDER BY c.created_at ASC`,
         [warehouseId],
       );
       return result.rows;
@@ -99,6 +102,72 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
   } catch (err) {
     next(err);
   }
+});
+
+// Поиск работает на сервере: в старой 1С справочник может содержать десятки
+// тысяч строк, и загружать их все в каждый браузер нет причины.
+router.get('/1c-counterparties', requireAuth, requireGrant('clients'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 120) : '';
+    const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 50);
+    const rows = await withTenantContext({ warehouseId }, async (client) => (await client.query(
+      `SELECT ic.external_id, ic.name, ic.last_seen_at,
+              c.id AS mapped_company_id, c.name AS mapped_company_name
+         FROM integration_counterparties ic
+         LEFT JOIN companies c
+           ON c.warehouse_id = ic.warehouse_id AND c.external_id = ic.external_id
+        WHERE ic.warehouse_id = $1
+          AND ($2 = '' OR ic.name ILIKE '%' || $2 || '%')
+        ORDER BY (c.id IS NULL) DESC, ic.name, ic.external_id
+        LIMIT $3`,
+      [warehouseId, q, limit],
+    )).rows);
+    res.set('Cache-Control', 'no-store').json({ rows });
+  } catch (err) { next(err); }
+});
+
+router.put('/companies/:companyId/1c-counterparty', requireAuth, requireGrant('clients'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { companyId } = req.params;
+    const externalId = typeof req.body?.externalId === 'string' ? req.body.externalId.trim() : '';
+    const company = await withTenantContext({ warehouseId }, async (client) => {
+      const found = (await client.query(
+        'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2',
+        [companyId, warehouseId],
+      )).rows[0];
+      if (!found) throw new HttpError(404, 'Компания не найдена');
+
+      if (!externalId) {
+        return (await client.query(
+          `UPDATE companies SET external_id = NULL WHERE id = $1
+           RETURNING id, name, external_id`, [companyId],
+        )).rows[0];
+      }
+
+      const counterparty = (await client.query(
+        `SELECT name FROM integration_counterparties
+         WHERE warehouse_id = $1 AND external_id = $2`,
+        [warehouseId, externalId],
+      )).rows[0];
+      if (!counterparty) throw new HttpError(404, 'Контрагент не найден в последней выгрузке 1С');
+
+      const occupied = (await client.query(
+        `SELECT id, name FROM companies
+         WHERE warehouse_id = $1 AND external_id = $2 AND id <> $3`,
+        [warehouseId, externalId, companyId],
+      )).rows[0];
+      if (occupied) throw new HttpError(409, `Этот контрагент уже связан с компанией «${occupied.name}»`);
+
+      return (await client.query(
+        `UPDATE companies SET external_id = $2 WHERE id = $1
+         RETURNING id, name, external_id`,
+        [companyId, externalId],
+      )).rows[0];
+    });
+    res.json(company);
+  } catch (err) { next(err); }
 });
 
 // Настоящий остаток продавца — то, что лежит в ячейках прямо сейчас.

@@ -112,7 +112,14 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
         `SELECT
            (SELECT COUNT(*)::int FROM products   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_products,
            (SELECT COUNT(*)::int FROM companies  WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_companies,
-           (SELECT COUNT(*)::int FROM invoices   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_invoices`,
+           (SELECT COUNT(*)::int FROM invoices   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_invoices,
+           (SELECT COUNT(*)::int FROM products
+             WHERE warehouse_id = $1 AND external_id IS NOT NULL AND company_id IS NULL) AS unassigned_products,
+           (SELECT COUNT(*)::int FROM integration_counterparties ic
+             WHERE ic.warehouse_id = $1 AND NOT EXISTS (
+               SELECT 1 FROM companies c
+                WHERE c.warehouse_id = ic.warehouse_id AND c.external_id = ic.external_id
+             )) AS unmapped_counterparties`,
         [warehouseId],
       );
       return {
@@ -195,6 +202,7 @@ function pushHandler(upsertFn) {
 }
 
 router.post('/push/companies', requireAuth, requireRole('integration'), pushHandler(service.upsertCompanies));
+router.post('/push/counterparties', requireAuth, requireRole('integration'), pushHandler(service.upsertCounterparties));
 
 // Общий хелпер: базы без связи документа/номенклатуры с контрагентом
 // (в частности старая УТ 10.3) шлют весь пуш под одну явно указанную

@@ -134,6 +134,87 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(pushCoAgain.body.results[0].id, manualCompanyId);
     });
 
+    // ---------- Scalable seller mapping: 1C directory -> existing Argus company ----------
+    const mappedSeller = await api('POST', '/api/sellers/companies', {
+      token: ownerToken, body: { name: 'Mapped Seller' },
+    });
+    const staged = await api('POST', '/api/sync/push/counterparties', {
+      token: syncToken,
+      body: { records: [{ externalId: 'cp-guid-mapped', name: 'Контрагент из 1С' }] },
+    });
+    check('1C counterparty is staged without creating a seller', () => {
+      assert.equal(staged.status, 200, JSON.stringify(staged.body));
+      assert.equal(staged.body.results[0].status, 'updated');
+    });
+
+    const searchCounterparty = await api('GET', '/api/sellers/1c-counterparties?q=Контрагент', {
+      token: ownerToken,
+    });
+    check('owner can search the staged 1C directory', () => {
+      assert.equal(searchCounterparty.status, 200, JSON.stringify(searchCounterparty.body));
+      assert.equal(searchCounterparty.body.rows[0].external_id, 'cp-guid-mapped');
+      assert.equal(searchCounterparty.body.rows[0].mapped_company_id, null);
+    });
+
+    const mapped = await api('PUT', `/api/sellers/companies/${mappedSeller.body.id}/1c-counterparty`, {
+      token: ownerToken, body: { externalId: 'cp-guid-mapped' },
+    });
+    check('owner links one Argus company to one 1C counterparty', () => {
+      assert.equal(mapped.status, 200, JSON.stringify(mapped.body));
+      assert.equal(mapped.body.external_id, 'cp-guid-mapped');
+    });
+
+    const duplicateMapping = await api('PUT', `/api/sellers/companies/${manualCompanyId}/1c-counterparty`, {
+      token: ownerToken, body: { externalId: 'cp-guid-mapped' },
+    });
+    check('one 1C counterparty cannot be linked to two sellers', () => {
+      assert.equal(duplicateMapping.status, 409, JSON.stringify(duplicateMapping.body));
+    });
+
+    const unassignedProduct = await api('POST', '/api/sync/push/products', {
+      token: syncToken,
+      body: { records: [{ externalId: 'p-guid-unassigned', sku: 'SKU-U', name: 'Unassigned first' }] },
+    });
+    check('1C product can arrive safely before seller mapping is applied to a document', () => {
+      assert.equal(unassignedProduct.body.results[0].status, 'created', JSON.stringify(unassignedProduct.body));
+    });
+
+    const zeroStock = await api('POST', '/api/sync/push/stock', {
+      token: syncToken,
+      body: { records: [{ productExternalId: 'p-guid-unassigned', sku: 'SKU-U', qty: 0 }] },
+    });
+    check('zero stock is accepted by stable 1C product id', () => {
+      assert.equal(zeroStock.body.results[0].status, 'updated', JSON.stringify(zeroStock.body));
+    });
+
+    const mappedInvoice = await api('POST', '/api/sync/push/invoices', {
+      token: syncToken,
+      body: { records: [{
+        externalId: 'i-guid-mapped', number: 'IN-MAPPED', direction: 'in',
+        companyExternalId: 'cp-guid-mapped',
+        items: [{ productExternalId: 'p-guid-unassigned', sku: 'SKU-U', name: 'Unassigned first', declaredQty: 1 }],
+      }] },
+    });
+    check('mapped 1C document assigns its product to the seller', () => {
+      assert.equal(mappedInvoice.body.results[0].status, 'created', JSON.stringify(mappedInvoice.body));
+    });
+
+    const mappedKey = await api('POST', `/api/sellers/companies/${mappedSeller.body.id}/keys`, {
+      token: ownerToken,
+    });
+    const mappedLogin = await api('POST', '/api/auth/seller/login', {
+      body: { keyCode: mappedKey.body.key_code, name: 'Mapped user' },
+    });
+    const mappedStock = await api('GET', '/api/sellers/stock', { token: mappedLogin.body.token });
+    check('seller sees the assigned product and the explicit zero from 1C', () => {
+      const row = mappedStock.body.find((item) => item.sku === 'SKU-U');
+      assert.ok(row, JSON.stringify(mappedStock.body));
+      assert.equal(row.qtyIn1c, 0);
+      // A number from 1C is the reconciliation source. Physical Argus stock
+      // remains unknown until the warehouse receives or counts the product.
+      assert.equal(row.stockKnown, false);
+    });
+
     // ---------- Products ----------
     const pushProd = await api('POST', '/api/sync/push/products', {
       token: syncToken,
@@ -364,8 +445,10 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(status.status, 200, JSON.stringify(status.body));
       assert.ok(status.body.pendingEvents >= 1, JSON.stringify(status.body));
       assert.ok(status.body.lastSeenAt, 'last seen never recorded');
-      assert.equal(status.body.synced_products, 1);
-      assert.equal(status.body.synced_companies, 2);
+      assert.equal(status.body.synced_products, 2);
+      assert.equal(status.body.synced_companies, 3);
+      assert.equal(status.body.unassigned_products, 0);
+      assert.equal(status.body.unmapped_counterparties, 0);
     });
 
     // ---------- Revocation ----------
