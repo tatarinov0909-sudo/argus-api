@@ -2,6 +2,8 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { HttpError } = require('../middleware/errorHandler');
 
+const trimmed = (value) => typeof value === 'string' ? value.trim() : '';
+
 // Matching rules shared by every push endpoint, in priority order:
 //
 //   1. by external_id — the 1C identifier. Authoritative once present.
@@ -33,8 +35,8 @@ function generateKeyCode(warehouseCode) {
 async function upsertCompanies(client, warehouseId, records) {
   const results = [];
   for (const rec of records) {
-    const externalId = rec.externalId?.trim();
-    const name = rec.name?.trim();
+    const externalId = trimmed(rec.externalId);
+    const name = trimmed(rec.name);
     if (!externalId || !name) {
       results.push({ externalId: externalId || null, status: 'error', error: 'externalId и name обязательны' });
       continue;
@@ -80,8 +82,8 @@ async function upsertCompanies(client, warehouseId, records) {
 async function upsertCounterparties(client, warehouseId, records) {
   const results = [];
   for (const rec of records) {
-    const externalId = rec.externalId?.trim();
-    const name = rec.name?.trim();
+    const externalId = trimmed(rec.externalId);
+    const name = trimmed(rec.name);
     if (!externalId || !name) {
       results.push({ externalId: externalId || null, status: 'error', error: 'externalId и name обязательны' });
       continue;
@@ -112,18 +114,21 @@ async function resolveCompany(client, warehouseId, companyExternalId) {
 }
 
 async function resolveProductForRecord(client, warehouseId, rec, companyId = null) {
-  const externalId = rec.productExternalId?.trim();
-  const sku = rec.sku?.trim();
+  const externalId = trimmed(rec.productExternalId);
+  const sku = trimmed(rec.sku);
 
   if (externalId) {
     const found = await client.query(
       `SELECT id, company_id, sku, external_id FROM products
-       WHERE warehouse_id = $1 AND external_id = $2`,
+       WHERE warehouse_id = $1 AND external_id = $2 FOR UPDATE`,
       [warehouseId, externalId],
     );
+    if (found.rows[0] && sku && found.rows[0].sku !== sku) {
+      return { code: 'product_identity_conflict', error: 'Идентификатор 1С и артикул указывают на разные товары; запись не изменена' };
+    }
     return found.rows[0]
       ? { product: found.rows[0] }
-      : { error: 'Товар не найден по идентификатору 1С — сначала выгрузите номенклатуру' };
+      : { code: 'product_not_found', error: 'Товар не найден по идентификатору 1С — сначала выгрузите номенклатуру' };
   }
 
   if (!sku) return { error: 'sku или productExternalId обязателен' };
@@ -144,10 +149,16 @@ async function resolveProductForRecord(client, warehouseId, rec, companyId = nul
   return { product: found.rows[0] };
 }
 
-function numeric(value) {
-  if (value === undefined || value === null || value === '') return null;
+function finiteNumber(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'string' && !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) return null;
   const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : null;
+  return Number.isFinite(n) ? n : null;
+}
+
+function numeric(value) {
+  const n = finiteNumber(value);
+  return n !== null && n >= 0 ? n : null;
 }
 
 // Остатки из 1С.
@@ -200,7 +211,7 @@ async function upsertCells1c(client, warehouseId, records, options = {}) {
   const results = [];
   const resolved = [];
   for (const rec of records) {
-    const sku = rec.sku?.trim();
+    const sku = trimmed(rec.sku);
     const cellName = typeof rec.cell === 'string' ? rec.cell.trim() : '';
     if ((!sku && !rec.productExternalId) || !cellName) {
       results.push({ sku: sku || null, status: 'error', error: 'sku и cell обязательны' });
@@ -258,14 +269,16 @@ async function upsertStock(client, warehouseId, records, options = {}) {
   const now = new Date();
 
   for (const rec of records) {
-    const sku = rec.sku?.trim();
+    const sku = trimmed(rec.sku);
     if (!sku && !rec.productExternalId) {
       results.push({ sku: null, status: 'error', error: 'sku или productExternalId обязателен' });
       continue;
     }
-    const qty = numeric(rec.qty);
+    // Учётный остаток может быть отрицательным. Это факт из 1С для сверки,
+    // а не физическое количество в ячейках и не доступное к продаже.
+    const qty = finiteNumber(rec.qty);
     if (qty === null) {
-      results.push({ sku, status: 'error', error: 'qty обязателен и должен быть числом' });
+      results.push({ sku, productExternalId: rec.productExternalId || null, status: 'error', code: 'invalid_quantity', error: 'Не передано числовое значение qty; прежний остаток сохранён' });
       continue;
     }
 
@@ -277,7 +290,7 @@ async function upsertStock(client, warehouseId, records, options = {}) {
     const companyId = explicitCompanyId || options.defaultCompanyId || null;
     const lookup = await resolveProductForRecord(client, warehouseId, rec, companyId);
     if (!lookup.product) {
-      results.push({ sku, status: 'error', error: lookup.error });
+      results.push({ sku, productExternalId: rec.productExternalId || null, status: 'error', code: lookup.code || 'product_not_resolved', error: lookup.error });
       continue;
     }
     if (companyId && lookup.product.company_id && lookup.product.company_id !== companyId) {
@@ -289,7 +302,8 @@ async function upsertStock(client, warehouseId, records, options = {}) {
        WHERE id = $1`,
       [lookup.product.id, qty, now],
     );
-    results.push({ sku: lookup.product.sku, status: 'updated', rows: 1 });
+    results.push({ sku: lookup.product.sku, status: 'updated', rows: 1,
+      ...(qty < 0 ? { warning: 'negative_accounting_stock' } : {}) });
   }
 
   return results;
@@ -298,9 +312,9 @@ async function upsertStock(client, warehouseId, records, options = {}) {
 async function upsertProducts(client, warehouseId, records, options = {}) {
   const results = [];
   for (const rec of records) {
-    const externalId = rec.externalId?.trim();
-    const sku = rec.sku?.trim();
-    const name = rec.name?.trim();
+    const externalId = trimmed(rec.externalId);
+    const sku = trimmed(rec.sku);
+    const name = trimmed(rec.name);
     if (!externalId || !sku || !name) {
       results.push({ externalId: externalId || null, status: 'error', error: 'externalId, sku и name обязательны' });
       continue;
@@ -327,7 +341,7 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
 
     const fields = {
       name,
-      category: rec.category?.trim() || null,
+      category: trimmed(rec.category) || null,
       length_mm: numeric(rec.lengthMm),
       width_mm: numeric(rec.widthMm),
       height_mm: numeric(rec.heightMm),
@@ -341,16 +355,30 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
     };
 
     const byExternal = await client.query(
-      `SELECT id, company_id FROM products WHERE warehouse_id = $1 AND external_id = $2`,
+      `SELECT id, company_id FROM products WHERE warehouse_id = $1 AND external_id = $2 FOR UPDATE`,
       [warehouseId, externalId],
     );
-    const target = byExternal.rows[0] || (companyId ? (await client.query(
-      `SELECT id FROM products
-       WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3 AND external_id IS NULL`,
+    let target = byExternal.rows[0] || (companyId ? (await client.query(
+      `SELECT id, company_id FROM products
+       WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3 AND external_id IS NULL FOR UPDATE`,
       [warehouseId, companyId, sku],
     )).rows[0] : null);
 
     if (target) {
+      // Повторная загрузка каталога не вправе переопределять уже назначенного
+      // продавца, в том числе через старый пакетный defaultCompanyName.
+      if (companyId && target.company_id && companyId !== target.company_id) {
+        results.push({ externalId, status: 'ownership_conflict', error: 'Товар уже назначен другой компании; связь сохранена' });
+        continue;
+      }
+      if (companyId && !target.company_id) {
+        const ownership = await claimProductOwnership(client, warehouseId, companyId, { productExternalId: externalId, sku });
+        if (ownership.status === 'conflict') {
+          results.push({ externalId, status: 'ownership_conflict', error: ownership.error });
+          continue;
+        }
+        target = { ...target, id: ownership.productId };
+      }
       await client.query(
         // COALESCE у штрихкода и резерва: обмен, который их ещё не умеет
         // присылать, не должен стирать уже полученные. Затирать данные
@@ -416,14 +444,9 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
 
 async function claimProductOwnership(client, warehouseId, companyId, item) {
   const lookup = await resolveProductForRecord(client, warehouseId, item, companyId);
-  if (!lookup.product) return { status: 'missing', sku: item.sku || null, error: lookup.error };
+  if (!lookup.product) return { status: lookup.code === 'product_identity_conflict' ? 'conflict' : 'missing', sku: item.sku || null, error: lookup.error };
 
-  const source = (await client.query('SELECT * FROM products WHERE id = $1', [lookup.product.id])).rows[0];
-  if (!source.company_id) {
-    await client.query('UPDATE products SET company_id = $2, updated_at = now() WHERE id = $1', [source.id, companyId]);
-    await client.query('UPDATE product_cells_1c SET company_id = $2 WHERE product_id = $1', [source.id, companyId]);
-    return { status: 'assigned', sku: source.sku, productId: source.id };
-  }
+  const source = (await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [lookup.product.id])).rows[0];
   if (source.company_id === companyId) return { status: 'matched', sku: source.sku, productId: source.id };
 
   // Разрешено исправлять только прежнее автоматическое назначение в компанию,
@@ -435,16 +458,27 @@ async function claimProductOwnership(client, warehouseId, companyId, item) {
   if (oldCompany?.external_id) {
     return { status: 'conflict', sku: source.sku, error: 'Товар уже связан с другим контрагентом 1С' };
   }
+  if (source.company_id) {
+    const used = await client.query(`SELECT
+      EXISTS (SELECT 1 FROM cell_stock WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3)
+      OR EXISTS (SELECT 1 FROM invoice_items i WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.sku = $3
+        AND (EXISTS (SELECT 1 FROM receiving_records r WHERE r.invoice_item_id = i.id)
+          OR EXISTS (SELECT 1 FROM shipping_records s WHERE s.invoice_item_id = i.id))) AS physical`,
+    [warehouseId, source.company_id, source.sku]);
+    if (used.rows[0].physical) {
+      return { status: 'conflict', sku: source.sku, error: 'По товару есть складские операции другой компании; автоматический перенос запрещён' };
+    }
+  }
 
   const target = (await client.query(
-    `SELECT * FROM products WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3`,
+    `SELECT * FROM products WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3 FOR UPDATE`,
     [warehouseId, companyId, source.sku],
   )).rows[0];
 
   if (!target) {
     await client.query('UPDATE products SET company_id = $2, updated_at = now() WHERE id = $1', [source.id, companyId]);
     await client.query('UPDATE product_cells_1c SET company_id = $2 WHERE product_id = $1', [source.id, companyId]);
-    return { status: 'reassigned', sku: source.sku, productId: source.id };
+    return { status: source.company_id ? 'reassigned' : 'assigned', sku: source.sku, productId: source.id };
   }
   if (target.external_id && target.external_id !== source.external_id) {
     return { status: 'conflict', sku: source.sku, error: 'У продавца уже есть другой товар с этим артикулом' };
@@ -487,8 +521,8 @@ async function claimProductOwnership(client, warehouseId, companyId, item) {
 async function upsertInvoices(client, warehouseId, records, options = {}) {
   const results = [];
   for (const rec of records) {
-    const externalId = rec.externalId?.trim();
-    const number = rec.number?.trim();
+    const externalId = trimmed(rec.externalId);
+    const number = trimmed(rec.number);
     const direction = rec.direction === 'out' ? 'out' : 'in';
     if (!externalId || !number || !Array.isArray(rec.items) || rec.items.length === 0) {
       results.push({
@@ -498,18 +532,39 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
       continue;
     }
 
-    // Та же оговорка, что и у товаров: базы без связи документа с
-    // контрагентом (в частности старая УТ 10.3) шлют весь пуш под одну
-    // явно указанную владельцем компанию, не по externalId на запись.
+    // Явно указанный, но не связанный контрагент никогда не подменяется
+    // пакетной компанией: иначе документ чужого продавца попадёт в её кабинет.
     const explicitCompanyId = await resolveCompany(client, warehouseId, rec.companyExternalId);
-    const companyId = explicitCompanyId || options.defaultCompanyId || null;
+    const companyId = rec.companyExternalId ? explicitCompanyId : options.defaultCompanyId || null;
     if (!companyId) {
       results.push({
-        externalId, status: 'error',
-        error: `Компания ${rec.companyExternalId || '(не указана)'} не найдена — синхронизируйте контрагентов`,
+        externalId, companyExternalId: rec.companyExternalId || null, status: 'skipped_unmapped_company',
+        error: 'Контрагент документа ещё не связан с продавцом в настройках склада',
       });
       continue;
     }
+
+    const badItem = rec.items.some((it) => !it || !trimmed(it.sku)
+      || finiteNumber(it.declaredQty) === null || finiteNumber(it.declaredQty) <= 0
+      || ['name', 'externalId', 'productExternalId'].some((key) => it[key] != null && typeof it[key] !== 'string'));
+    if (badItem) {
+      results.push({ externalId, status: 'error', code: 'invalid_invoice_item', error: 'В каждой позиции нужны артикул и положительное числовое количество; документ сохранён без изменений' });
+      continue;
+    }
+    const sourceType = typeof rec.sourceDocumentType === 'string' && /^[a-z_]{1,64}$/.test(rec.sourceDocumentType)
+      ? rec.sourceDocumentType : null;
+    const sourceDate = typeof rec.sourceDocumentDate === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(rec.sourceDocumentDate)
+      && Number.isFinite(Date.parse(rec.sourceDocumentDate + 'Z'))
+      && new Date(rec.sourceDocumentDate + 'Z').toISOString().slice(0, 19) === rec.sourceDocumentDate ? rec.sourceDocumentDate : null;
+    if (rec.sourceDocumentDate != null && sourceDate === null) {
+      results.push({ externalId, status: 'error', code: 'invalid_source_date', error: 'Некорректная дата документа 1С; прежний документ сохранён' });
+      continue;
+    }
+
+    // Один некорректный документ не отменяет остальные документы пачки.
+    // Конфликт принадлежности откатывает и строки, и назначение товаров.
+    await client.query('SAVEPOINT sp_sync_invoice');
+    try {
 
     // source = '1c' во всех трёх запросах ниже — граница между источниками.
     // Внешний номер уникален теперь по тройке (склад, источник, номер), и без
@@ -517,14 +572,15 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
     // переписал бы его как свой. Один заказ — один источник, это решение
     // принято отдельно и здесь оно исполняется.
     const existing = await client.query(
-      `SELECT id, status FROM invoices
-       WHERE warehouse_id = $1 AND source = '1c' AND external_id = $2`,
+      `SELECT id, status, company_id FROM invoices
+       WHERE warehouse_id = $1 AND source = '1c' AND external_id = $2 FOR UPDATE`,
       [warehouseId, externalId],
     );
     const found = existing.rows[0] || (await client.query(
-      `SELECT id, status FROM invoices
-       WHERE warehouse_id = $1 AND source = '1c' AND number = $2 AND external_id IS NULL`,
-      [warehouseId, number],
+      `SELECT id, status, company_id FROM invoices
+       WHERE warehouse_id = $1 AND source = '1c' AND number = $2 AND external_id IS NULL
+         AND company_id = $3 AND direction = $4 FOR UPDATE`,
+      [warehouseId, number, companyId, direction],
     )).rows[0];
 
     if (found) {
@@ -533,50 +589,75 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
       // destroy receiving_records' FK targets and silently discard the counts
       // already entered. 1C re-sends documents on every poll, so this is the
       // normal case, not an edge case.
-      if (found.status !== 'open') {
+      const worked = await client.query(`SELECT EXISTS (
+        SELECT 1 FROM invoice_items i WHERE i.invoice_id = $1
+        AND (EXISTS (SELECT 1 FROM receiving_records r WHERE r.invoice_item_id = i.id)
+          OR EXISTS (SELECT 1 FROM shipping_records s WHERE s.invoice_item_id = i.id))) AS has_work`, [found.id]);
+      if (found.status !== 'open' || worked.rows[0].has_work) {
+        await client.query('RELEASE SAVEPOINT sp_sync_invoice');
         results.push({ externalId, id: found.id, status: 'skipped_in_progress' });
         continue;
       }
+      if (found.company_id !== companyId) {
+        const old = await client.query('SELECT external_id FROM companies WHERE id = $1', [found.company_id]);
+        if (old.rows[0]?.external_id) {
+          await client.query('RELEASE SAVEPOINT sp_sync_invoice');
+          results.push({ externalId, id: found.id, status: 'ownership_conflict', error: 'Документ уже принадлежит другому связанному продавцу' });
+          continue;
+        }
+      }
       await client.query(
-        `UPDATE invoices SET number = $2, direction = $3, company_id = $4, external_id = $5
+        `UPDATE invoices SET number = $2, direction = $3, company_id = $4, external_id = $5,
+           source_document_type = COALESCE($6, source_document_type),
+           source_document_date = COALESCE($7, source_document_date)
          WHERE id = $1`,
-        [found.id, number, direction, companyId, externalId],
+        [found.id, number, direction, companyId, externalId, sourceType, sourceDate],
       );
       await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [found.id]);
       await insertItems(client, warehouseId, companyId, found.id, rec.items);
       const ownership = [];
       for (const item of rec.items) ownership.push(await claimProductOwnership(client, warehouseId, companyId, item));
       const conflicts = ownership.filter((row) => row.status === 'conflict');
+      if (conflicts.length) await client.query('ROLLBACK TO SAVEPOINT sp_sync_invoice');
+      await client.query('RELEASE SAVEPOINT sp_sync_invoice');
       results.push({
         externalId, id: found.id,
         status: conflicts.length ? 'ownership_conflict' : (existing.rows[0] ? 'updated' : 'adopted'),
-        ...(conflicts.length ? { error: `${conflicts.length} позиций уже принадлежат другому продавцу` } : {}),
+        ...(conflicts.length ? { error: `${conflicts.length} позиций с конфликтом принадлежности; документ не изменён` } : {}),
       });
       continue;
     }
 
     const inserted = await client.query(
-      `INSERT INTO invoices (warehouse_id, company_id, number, direction, external_id, source)
-       VALUES ($1, $2, $3, $4, $5, '1c') RETURNING id`,
-      [warehouseId, companyId, number, direction, externalId],
+      `INSERT INTO invoices (warehouse_id, company_id, number, direction, external_id, source, source_document_type, source_document_date)
+       VALUES ($1, $2, $3, $4, $5, '1c', $6, $7) RETURNING id`,
+      [warehouseId, companyId, number, direction, externalId, sourceType, sourceDate],
     );
     await insertItems(client, warehouseId, companyId, inserted.rows[0].id, rec.items);
     const ownership = [];
     for (const item of rec.items) ownership.push(await claimProductOwnership(client, warehouseId, companyId, item));
     const conflicts = ownership.filter((row) => row.status === 'conflict');
+    if (conflicts.length) await client.query('ROLLBACK TO SAVEPOINT sp_sync_invoice');
+    await client.query('RELEASE SAVEPOINT sp_sync_invoice');
     results.push({
-      externalId, id: inserted.rows[0].id,
+      externalId, ...(conflicts.length ? {} : { id: inserted.rows[0].id }),
       status: conflicts.length ? 'ownership_conflict' : 'created',
-      ...(conflicts.length ? { error: `${conflicts.length} позиций уже принадлежат другому продавцу` } : {}),
+      ...(conflicts.length ? { error: `${conflicts.length} позиций с конфликтом принадлежности; документ не создан` } : {}),
     });
+    } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_sync_invoice');
+      await client.query('RELEASE SAVEPOINT sp_sync_invoice');
+      if (!['23505', '23514', '22P02', '22003'].includes(err.code) && !(err instanceof HttpError)) throw err;
+      results.push({ externalId, status: 'error', code: 'invalid_document', error: 'Документ не сохранён: проверьте уникальность номера, артикулы и количества' });
+    }
   }
   return results;
 }
 
 async function insertItems(client, warehouseId, companyId, invoiceId, items) {
   for (const it of items) {
-    const sku = it.sku?.trim();
-    const name = it.name?.trim() || sku;
+    const sku = trimmed(it.sku);
+    const name = trimmed(it.name) || sku;
     if (!sku || it.declaredQty == null) {
       throw new HttpError(400, `Позиция без артикула или количества в накладной`);
     }
@@ -586,7 +667,7 @@ async function insertItems(client, warehouseId, companyId, invoiceId, items) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         invoiceId, warehouseId, companyId, name, sku, it.declaredQty,
-        it.externalId?.trim() || null, it.productExternalId?.trim() || null,
+        trimmed(it.externalId) || null, trimmed(it.productExternalId) || null,
       ],
     );
   }

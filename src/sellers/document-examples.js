@@ -16,7 +16,7 @@ router.post('/', requireRole('owner'), async (req,res,next) => {
     const result=await withTenantContext(tenantContextFromAuth(req.auth),async c=>{
       const company=(await c.query('SELECT id FROM companies WHERE id=$1 AND warehouse_id=$2',[companyId,req.auth.warehouseId])).rows[0];
       if(!company)throw new HttpError(404,'Компания не найдена');
-      const invoice=(await c.query(`SELECT i.number,i.direction,i.status,i.created_at,c.name AS source_company_name
+      const invoice=(await c.query(`SELECT i.number,i.direction,i.status,i.created_at,i.source_document_type,i.source_document_date,c.name AS source_company_name
         FROM invoices i JOIN companies c ON c.id=i.company_id
         WHERE i.id=$1 AND i.warehouse_id=$2 AND i.source='1c' AND i.direction='in'`,[invoiceId,req.auth.warehouseId])).rows[0];
       if(!invoice)throw new HttpError(404,'Входящий документ 1С не найден');
@@ -35,8 +35,11 @@ router.get('/',requireRole('seller','owner','manager'),async(req,res,next)=>{
   try {
     const companyId=companyFor(req);if(!companyId)throw new HttpError(400,'Укажите продавца');
     const rows=await withTenantContext(tenantContextFromAuth(req.auth),async c=>(await c.query(
-      'SELECT id,snapshot FROM seller_document_examples WHERE company_id=$1 ORDER BY created_at DESC LIMIT 100',[companyId])).rows);
-    res.set('Cache-Control','no-store').json({rows:rows.map(({id,snapshot:s})=>({id,number:s.number,direction:s.direction,status:s.status,created_at:s.created_at,source:'1c',preview:true,source_company_name:s.source_company_name,item_count:s.items.length,declared_qty:s.items.reduce((sum,r)=>sum+Number(r.declared_qty),0)}))});
+      `SELECT e.id,e.source_invoice_id,e.snapshot FROM seller_document_examples e
+       WHERE e.company_id=$1 AND NOT EXISTS (
+         SELECT 1 FROM invoices i WHERE i.id=e.source_invoice_id AND i.company_id=$1
+       ) ORDER BY e.created_at DESC LIMIT 100`,[companyId])).rows);
+    res.set('Cache-Control','no-store').json({rows:rows.map(({id,source_invoice_id,snapshot:s})=>({id,source_invoice_id,number:s.number,direction:s.direction,status:s.status,created_at:s.created_at,source_document_type:s.source_document_type||null,source_document_date:s.source_document_date||null,source:'1c',preview:true,source_company_name:s.source_company_name,item_count:s.items.length,declared_qty:s.items.reduce((sum,r)=>sum+Number(r.declared_qty),0)}))});
   }catch(e){next(e);}
 });
 router.get('/:id',requireRole('seller','owner','manager'),async(req,res,next)=>{

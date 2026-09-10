@@ -5,6 +5,7 @@ const { keyLoginLimiter } = require('../middleware/rateLimit');
 const { HttpError } = require('../middleware/errorHandler');
 const service = require('./service');
 const outbox = require('./outbox');
+const { recordBatch } = require('./health');
 
 const router = express.Router();
 
@@ -17,6 +18,9 @@ function requireBatch(body) {
   }
   if (records.length > MAX_BATCH) {
     throw new HttpError(413, `За один раз можно передать не больше ${MAX_BATCH} записей`);
+  }
+  if (records.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+    throw new HttpError(400, 'Каждая запись records должна быть объектом');
   }
   return records;
 }
@@ -112,7 +116,7 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
         `SELECT
            (SELECT COUNT(*)::int FROM products   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_products,
            (SELECT COUNT(*)::int FROM companies  WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_companies,
-           (SELECT COUNT(*)::int FROM invoices   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_invoices,
+           (SELECT COUNT(*)::int FROM invoices   WHERE warehouse_id = $1 AND source = '1c' AND external_id IS NOT NULL) AS synced_invoices,
            (SELECT COUNT(*)::int FROM products p
              LEFT JOIN companies c ON c.id = p.company_id
             WHERE p.warehouse_id = $1 AND p.external_id IS NOT NULL
@@ -124,9 +128,15 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
              )) AS unmapped_counterparties`,
         [warehouseId],
       );
+      const batches = await client.query(`SELECT s.stage, s.received_at, s.module_version,
+          s.run_mode, s.record_count, s.summary
+        FROM integration_sync_state s
+        JOIN integration_keys k ON k.id = s.integration_key_id AND k.active
+        WHERE s.warehouse_id = $1 ORDER BY s.received_at DESC, s.stage`, [warehouseId]);
       return {
         pendingEvents: pending,
         lastSeenAt: lastSeen.rows[0].last_seen,
+        pushStages: batches.rows,
         ...counts.rows[0],
       };
     });
@@ -183,6 +193,7 @@ function pushHandler(upsertFn) {
 
       const results = await withTenantContext({ warehouseId }, async (client) => {
         const out = await upsertFn(client, warehouseId, records);
+        await recordBatch(client, req, records, out);
         await client.query(
           `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
           [integrationKeyId],
@@ -233,6 +244,7 @@ function pushHandlerWithDefaultCompany(upsertFn) {
       const results = await withTenantContext({ warehouseId }, async (client) => {
         const defaultCompanyId = await resolveDefaultCompanyId(client, warehouseId, defaultCompanyName);
         const out = await upsertFn(client, warehouseId, records, { defaultCompanyId });
+        await recordBatch(client, req, records, out);
         await client.query(
           `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
           [integrationKeyId],

@@ -35,12 +35,13 @@ const { pool, withTenantContext } = require('../src/db/pool');
 
     const warehouseId=JSON.parse(Buffer.from(token.split('.')[1],'base64url')).warehouseId;
     const inv=await api('POST','/api/invoices',token,{companyId:b.id,number:'SOURCE-1C',direction:'in',items:[{name:'Product',sku:'SOURCE',declaredQty:100}]},201);
-    await withTenantContext({warehouseId},c=>c.query("UPDATE invoices SET source='1c',external_id='test-example-source' WHERE id=$1",[inv.id]));
+    await withTenantContext({warehouseId},c=>c.query("UPDATE invoices SET source='1c',external_id='test-example-source',source_document_type='supplier_order',source_document_date='2026-09-11T00:15:00' WHERE id=$1",[inv.id]));
     const before=await api('GET','/api/sellers/stock',sa);
     await api('POST','/api/sellers/document-examples',sa,{companyId:a.id,invoiceId:inv.id},403);
     const example=await api('POST','/api/sellers/document-examples',token,{companyId:a.id,invoiceId:inv.id},201);
     const again=await api('POST','/api/sellers/document-examples',token,{companyId:a.id,invoiceId:inv.id},201);assert.equal(again.id,example.id);
     const list=await api('GET','/api/sellers/document-examples',sa);assert.equal(list.rows.length,1);assert.equal(list.rows[0].preview,true);assert.equal(list.rows[0].declared_qty,100);
+    assert.equal(list.rows[0].source_invoice_id,inv.id);assert.equal(list.rows[0].source_document_type,'supplier_order');assert.equal(list.rows[0].source_document_date,'2026-09-11T00:15:00');
     const detail=await api('GET','/api/sellers/document-examples/'+example.id,sa);assert.equal(detail.number,'SOURCE-1C');assert.equal(detail.items[0].declared_qty,'100');assert.equal(detail.items[0].accepted_qty,null);
     await api('GET','/api/sellers/document-examples/'+example.id,sb,null,404);
     assert.equal((await api('GET','/api/sellers/document-examples?companyId='+a.id,sb)).rows.length,0);
@@ -50,8 +51,17 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await api('POST','/api/sellers/document-examples',other.token,{companyId:a.id,invoiceId:inv.id},404);
     await api('DELETE','/api/sellers/document-examples/'+example.id,other.token,null,404);
     await api('DELETE','/api/sellers/document-examples/'+example.id,sa,null,403);
+    // If ownership is resolved later, the actual document replaces its preview.
+    await withTenantContext({warehouseId},async c=>{
+      await c.query('UPDATE invoices SET company_id=$2 WHERE id=$1',[inv.id,a.id]);
+      await c.query('UPDATE invoice_items SET company_id=$2 WHERE invoice_id=$1',[inv.id,a.id]);
+    });
+    assert.equal((await api('GET','/api/sellers/document-examples',sa)).rows.length,0);
+    assert.equal((await api('GET','/api/sellers/document-examples?companyId='+a.id,token)).rows.length,0);
+    const ownedDocs=await api('GET','/api/sellers/documents',sa);assert.equal(ownedDocs.rows.length,1);
+    assert.equal(ownedDocs.rows[0].source_document_type,'supplier_order');assert.equal(ownedDocs.rows[0].source_document_date,'2026-09-11T00:15:00');
     await api('DELETE','/api/sellers/document-examples/'+example.id,token);
     await api('GET','/api/sellers/document-examples/'+example.id,sa,null,404);
-    console.log('PASS examples: real source snapshot, owner-only publish/revoke, tenant and seller isolation, no source access, no stock changes, no fake receipts, idempotent publication');
+    console.log('PASS examples: real source snapshot, owner-only publish/revoke, tenant and seller isolation, no source access, no stock changes, no fake receipts, idempotent publication, dedup after ownership mapping, source type/date preserved');
   }finally{await new Promise(r=>server.close(r));await pool.end();}
 })().catch(e=>{console.error(e.message);process.exitCode=1;});

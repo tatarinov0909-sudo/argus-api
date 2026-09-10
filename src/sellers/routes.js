@@ -36,7 +36,7 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
 router.get('/source-documents', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
-      `SELECT i.id,i.number,i.direction,i.status,i.source,i.created_at,i.company_id,c.name AS company_name,
+      `SELECT i.id,i.number,i.direction,i.status,i.source,i.created_at,i.source_document_type,i.source_document_date,i.company_id,c.name AS company_name,
               count(ii.id)::int AS item_count,COALESCE(SUM(ii.declared_qty),0) AS declared_qty
        FROM invoices i JOIN companies c ON c.id=i.company_id LEFT JOIN invoice_items ii ON ii.invoice_id=i.id
        WHERE i.warehouse_id=$1 AND i.source='1c' AND i.external_id IS NOT NULL AND i.direction='in'
@@ -187,7 +187,7 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400,'Укажите продавца');
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
-      `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at,
+      `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type, i.source_document_date,
               count(ii.id)::int AS item_count, COALESCE(SUM(ii.declared_qty),0) AS declared_qty
        FROM invoices i LEFT JOIN invoice_items ii ON ii.invoice_id=i.id AND ii.company_id=$1
        WHERE i.company_id=$1 AND i.direction IN ('in','return')
