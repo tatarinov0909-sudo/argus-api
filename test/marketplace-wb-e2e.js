@@ -104,10 +104,12 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       const present = forbidden.filter((n) => typeof wb[n] === 'function');
       assert.deepEqual(present, [], `появились методы записи: ${present.join(', ')}`);
     });
-    check('и в исходнике нет ни PUT, ни POST, ни PATCH, ни DELETE', () => {
+    check('в исходнике нет PUT, PATCH и DELETE; POST только для чтения каталога', () => {
       const src = require('fs').readFileSync(require.resolve('../src/marketplaces/wb.js'), 'utf8');
-      const calls = src.match(/method:\s*'(PUT|POST|PATCH|DELETE)'/g) || [];
+      const calls = src.match(/method:\s*'(PUT|PATCH|DELETE)'/g) || [];
       assert.deepEqual(calls, [], `найдены изменяющие вызовы: ${calls.join(', ')}`);
+      assert.equal((src.match(/method:\s*'POST'/g)||[]).length, 1);
+      assert.ok(src.includes("'/content/v2/get/cards/list'"));
     });
 
     // ---------- Подготовка склада ----------

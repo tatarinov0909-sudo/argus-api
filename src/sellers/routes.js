@@ -22,8 +22,10 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
         SELECT sku,mp_sku AS nm_id,mp_article AS article FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb'
         UNION SELECT sku,mp_nm_id,mp_article FROM invoice_items WHERE company_id=$1 AND mp_nm_id IS NOT NULL
       ), skus AS (SELECT sku FROM products WHERE company_id=$1 UNION SELECT sku FROM links)
-      SELECT s.sku,p.category,l.nm_id,l.article FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1
-      LEFT JOIN links l ON l.sku=s.sku ORDER BY s.sku,l.nm_id`, [companyId])).rows;
+      SELECT s.sku,p.category,l.nm_id,l.article,m.photo_url FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1
+      LEFT JOIN links l ON l.sku=s.sku
+      LEFT JOIN marketplace_product_media m ON m.company_id=$1 AND m.nm_id=l.nm_id
+      ORDER BY s.sku,l.nm_id`, [companyId])).rows;
     });
     res.set('Cache-Control', 'no-store').json({ products: combineCatalog(rows) });
   } catch (err) { next(err); }

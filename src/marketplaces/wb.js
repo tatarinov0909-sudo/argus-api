@@ -16,6 +16,7 @@ const { HttpError } = require('../middleware/errorHandler');
 // угадывать.
 
 const HOSTS = {
+  content: 'https://content-api.wildberries.ru',
   common: 'https://common-api.wildberries.ru',
   marketplace: 'https://marketplace-api.wildberries.ru',
 };
@@ -108,4 +109,11 @@ function normalizeOrder(o) {
   };
 }
 
-module.exports = { sellerInfo, warehouses, newOrders };
+// POST is the read-only catalog listing method, not a card mutation.
+async function productCards(token, cursor = {}) {
+  return call(token, 'content', '/content/v2/get/cards/list', {
+    method: 'POST', body: { settings: { sort: { ascending: true },
+      cursor: { ...cursor, limit: 100 }, filter: { withPhoto: -1 } } },
+  });
+}
+module.exports = { sellerInfo, warehouses, newOrders, productCards };

@@ -1,5 +1,7 @@
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const sync = require('./sync');
+const credentials = require('./credentials');
+const { syncPhotos } = require('./photos');
 
 // Опрос площадок по расписанию.
 //
@@ -45,6 +47,12 @@ async function runOnce() {
           console.log(`маркетплейсы: ${r.company} — новых заказов ${r.created}`
             + `, не сопоставлено ${r.unmapped.length}`);
         }
+      }
+      // Separate transactions: a catalog failure cannot roll back received orders.
+      const pairs = await withTenantContext({ warehouseId }, client => credentials.list(client, warehouseId));
+      for (const pair of pairs.filter(p => p.marketplace === 'wb')) {
+        try { await withTenantContext({ warehouseId }, client => syncPhotos(client, warehouseId, pair.companyId)); }
+        catch { console.error('маркетплейсы: не удалось обновить кэш фотографий'); }
       }
       done += 1;
     } catch (err) {

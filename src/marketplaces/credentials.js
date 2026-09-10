@@ -17,10 +17,12 @@ async function save(client, warehouseId, { companyId, marketplace, token }) {
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (company_id, marketplace)
      DO UPDATE SET encrypted_payload = EXCLUDED.encrypted_payload,
-                   updated_at = now()
+                   updated_at = now(), photo_cursor = '{}', photo_sync_after = NULL
      RETURNING id, marketplace, write_enabled, last_used_at`,
     [warehouseId, companyId, marketplace, payload],
   );
+  // A replacement key may belong to a different WB account. Never keep its old images.
+  await client.query('DELETE FROM marketplace_product_media WHERE credential_id=$1 AND warehouse_id=$2', [r.rows[0].id, warehouseId]);
   return { ...r.rows[0], tokenMask: mask(token) };
 }
 

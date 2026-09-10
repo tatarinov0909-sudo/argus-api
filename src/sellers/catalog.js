@@ -6,7 +6,7 @@ function combineCatalog(rows) {
     const product = products.get(r.sku);
     if (!r.nm_id || !/^\d+$/.test(r.nm_id)) continue;
     if (product.cards.some(c => c.nmId === r.nm_id && c.vendorCode === (r.article || null))) continue;
-    product.cards.push({ nmId: r.nm_id, vendorCode: r.article || null });
+    product.cards.push({ nmId: r.nm_id, vendorCode: r.article || null, photoUrl: r.photo_url || null });
   }
   return [...products.values()];
 }
