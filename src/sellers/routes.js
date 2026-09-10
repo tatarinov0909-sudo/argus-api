@@ -10,6 +10,7 @@ const { loadStock } = require('./stock');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
 const router = express.Router();
+router.use('/document-examples', require('./document-examples'));
 
 router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
