@@ -57,6 +57,14 @@ const { pool, withTenantContext } = require('../src/db/pool');
     console.log('PASS zero 1C balance and barcode preserved; 1C never overrides Argus stock');
 
     const order = await invoice(a,'out',30);
+    const orders = await api('GET','/api/sellers/orders',sa);
+    assert.equal(orders.rows.length,1); assert.equal(Number(orders.rows[0].qty),30);
+    assert.equal(orders.rows[0].id,order.id); assert.equal(orders.hasMore,false);
+    assert.equal((await api('GET','/api/sellers/orders',sb)).rows.length,0);
+    assert.equal((await api('GET','/api/sellers/orders?companyId='+a.id,sb)).rows.length,0);
+    assert.equal((await api('GET','/api/sellers/orders?companyId='+a.id,token)).rows.length,1);
+    await api('GET','/api/sellers/orders',null,undefined,401);
+    console.log('PASS seller orders and company isolation, including query override');
     row=await stock(); assert.equal(row.available,70); assert.equal(row.ordered,30);
     await api('POST','/api/shipping',worker,{invoiceItemId:order.items[0].id,pickedQty:10,cellBlockId:cells[0].id,isFinal:false},201);
     row=await stock(); assert.equal(row.qty,90); assert.equal(row.staged,10); assert.equal(row.onHand,100); assert.equal(row.available,70);

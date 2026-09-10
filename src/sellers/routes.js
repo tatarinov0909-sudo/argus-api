@@ -43,6 +43,24 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
 // компанию, и политика на cell_stock пропускает ровно его строки. Никакой
 // фильтрации «руками» здесь нет намеренно — на такой фильтрации проект уже
 // однажды получил утечку между компаниями.
+router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => (
+      await client.query(
+        `SELECT i.id, i.number, i.status, i.source, i.created_at,
+                ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid
+         FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+         WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
+         ORDER BY (i.status = 'shipped'), i.created_at DESC, i.id, ii.id
+         LIMIT 1001`, [companyId],
+      )
+    ).rows);
+    res.json({ rows: rows.slice(0, 1000), hasMore: rows.length > 1000 });
+  } catch (err) { next(err); }
+});
+
 router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
