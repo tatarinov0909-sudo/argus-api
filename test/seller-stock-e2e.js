@@ -162,6 +162,9 @@ async function api(method, path, { token, body } = {}) {
       body: { invoiceItemId: order.body.items[0].id, pickedQty: 30, cellBlockId: blocks[0].id },
     });
     assert.equal(shipped.status, 201, JSON.stringify(shipped.body));
+    // Picking alone is not departure. Finish the real shipment before checking movements.
+    const departure = await api('POST', `/api/shipping/${order.body.id}/ship`, { token: ownerToken });
+    assert.equal(departure.status, 200);
 
     const afterShip = await api('GET', '/api/sellers/stock', { token: alphaToken });
     check('после отгрузки остаток УМЕНЬШИЛСЯ', () => {

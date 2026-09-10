@@ -48,7 +48,7 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
     const ctx = tenantContextFromAuth(req.auth);
     // Владелец смотрит глазами конкретного продавца — иначе он увидел бы
     // склад целиком, а вопрос здесь другой: «что видит мой клиент».
-    const companyId = req.auth.role === 'owner' ? req.query.companyId : req.auth.companyId;
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
 
     const rows = await withTenantContext(ctx, async (client) => {
@@ -62,14 +62,16 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
            SELECT sku,
                   SUM(qty) FILTER (WHERE quality = 'good') AS good_qty,
                   SUM(qty) FILTER (WHERE quality <> 'good') AS bad_qty,
+                  SUM(qty) FILTER (WHERE quality = 'defective') AS defective_qty,
+                  SUM(qty) FILTER (WHERE quality = 'packaging_defect') AS packaging_qty,
                   count(DISTINCT cell_block_id) AS cells
            FROM cell_stock
            WHERE company_id = $1 AND qty > 0
            GROUP BY sku
          ), prod AS (
-           SELECT sku, name, stock_qty_1c, stock_at
+           SELECT sku, name, barcode, stock_qty_1c, stock_at
            FROM products
-           WHERE company_id = $1 AND COALESCE(stock_qty_1c, 0) <> 0
+           WHERE company_id = $1
          ), ordered AS (
            -- Сколько этого товара уже обещано заказами и ещё не уехало.
            --
@@ -85,8 +87,17 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
            JOIN invoice_items ii ON ii.invoice_id = i.id
            WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
            GROUP BY ii.sku
+         ), staged AS (
+           -- Picks have left their cells, but remain on site until shipment.
+           -- Include partial picks as well as fully assembled orders.
+           SELECT ii.sku, SUM(sr.picked_qty) AS qty
+           FROM shipping_records sr
+           JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+           JOIN invoices i ON i.id = ii.invoice_id
+           WHERE sr.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
+           GROUP BY ii.sku
          ), skus AS (
-           SELECT sku FROM prod
+           SELECT sku FROM prod WHERE stock_qty_1c IS NOT NULL
            UNION SELECT sku FROM cells
            UNION SELECT sku FROM ordered
          )
@@ -95,13 +106,14 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
                                   WHERE ii.company_id = $1 AND ii.sku = s.sku
                                   ORDER BY ii.id DESC LIMIT 1),
                          s.sku) AS name,
-                c.good_qty, c.bad_qty, c.cells,
-                p.stock_qty_1c, p.stock_at,
+                c.good_qty, c.bad_qty, c.defective_qty, c.packaging_qty, c.cells,
+                p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
                 o.qty AS ordered_qty, o.orders, o.picked_orders
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
          LEFT JOIN ordered o ON o.sku = s.sku
+         LEFT JOIN staged st ON st.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
@@ -109,16 +121,18 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
     });
 
     res.json(rows.map((r) => {
-      // «На складе» — цифра того источника, который для этого товара есть:
-      // учёт 1С, если обмен его отдал, иначе то, что Аргус разложил сам.
-      // Смешивать нельзя: одна и та же величина, посчитанная двумя разными
-      // способами, в сумме даст третью, неверную.
-      const onHand = r.stock_qty_1c === null || r.stock_qty_1c === undefined
-        ? Number(r.good_qty || 0) : Number(r.stock_qty_1c);
+      // Warehouse stock includes picked goods still waiting for departure.
+      // 1C is a separate reconciliation source, never a fallback balance.
+      const staged = Number(r.staged_qty || 0);
+      const onHand = Number(r.good_qty || 0) + staged;
       const ordered = Number(r.ordered_qty || 0);
       return {
       sku: r.sku,
       name: r.name,
+      barcode: r.barcode || null,
+      staged,
+      defective: Number(r.defective_qty || 0),
+      packagingDefect: Number(r.packaging_qty || 0),
       // Годное и негодное раздельно: «на складе 40» без оговорки, что 8 из них
       // брак, — это обещание отгрузить то, что отгружено не будет.
       qty: Number(r.good_qty || 0),
@@ -133,8 +147,7 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
       onHand,
       ordered,
       orderedOrders: Number(r.orders || 0),
-      // Из них уже сняты с полки и ждут машину — продавцу это объясняет,
-      // почему «на складе» больше, чем он видит в ячейках.
+      // Count of fully assembled orders, not the number of picked units.
       orderedPicked: Number(r.picked_orders || 0),
       // Отрицательным быть не может: заказов больше, чем товара, — это
       // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
@@ -159,7 +172,7 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
 router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
-    const companyId = req.auth.role === 'owner' ? req.query.companyId : req.auth.companyId;
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
 
     const out = await withTenantContext(ctx, async (client) => {
@@ -169,7 +182,7 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
          FROM shipping_records sr
          JOIN invoice_items ii ON ii.id = sr.invoice_item_id
          JOIN invoices i ON i.id = ii.invoice_id
-         WHERE sr.company_id = $1 AND sr.picked_qty IS NOT NULL
+         WHERE sr.company_id = $1 AND sr.picked_qty IS NOT NULL AND i.status = 'shipped'
          ORDER BY sr.finished_at DESC NULLS LAST
          LIMIT 300`,
         [companyId],
@@ -214,6 +227,45 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
   } catch (err) {
     next(err);
   }
+});
+
+// A seller-scoped document history. Pick timestamps are never called departure dates.
+router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : '';
+    if (!companyId || !sku || sku.length > 200) throw new HttpError(400, 'Укажите продавца и артикул');
+    const events = await withTenantContext(tenantContextFromAuth(req.auth), async (client) => {
+      const result = await client.query(
+        `SELECT * FROM (
+           SELECT rr.id, rr.finished_at AS at, 'received' AS kind,
+                  rr.accepted_qty AS qty, i.number AS document, NULL::text AS note,
+                  NULL::text AS quality, i.status::text AS status
+           FROM receiving_records rr
+           JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+           JOIN invoices i ON i.id = ii.invoice_id
+           WHERE rr.company_id = $1 AND ii.sku = $2 AND rr.accepted_qty IS NOT NULL
+           UNION ALL
+           SELECT sr.id, sr.finished_at, 'picked', sr.picked_qty, i.number, NULL, NULL, i.status::text
+           FROM shipping_records sr
+           JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+           JOIN invoices i ON i.id = ii.invoice_id
+           WHERE sr.company_id = $1 AND ii.sku = $2 AND sr.picked_qty IS NOT NULL
+           UNION ALL
+           SELECT rr.id, rr.finished_at, 'returned', rr.qty, i.number, rr.defect_note,
+                  rr.quality_bucket::text, i.status::text
+           FROM return_records rr
+           JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+           JOIN invoices i ON i.id = ii.invoice_id
+           WHERE rr.company_id = $1 AND ii.sku = $2
+           UNION ALL
+           SELECT op.id, op.created_at, op.kind, op.qty, NULL, NULL, NULL, NULL
+           FROM stock_operations op WHERE op.company_id = $1 AND op.sku = $2
+         ) events ORDER BY at DESC NULLS LAST, id DESC LIMIT 201`, [companyId, sku]);
+      return result.rows;
+    });
+    res.json({ events: events.slice(0, 200).map(r => ({ ...r, qty: Number(r.qty) })), hasMore: events.length > 200 });
+  } catch (err) { next(err); }
 });
 
 router.post('/companies', requireAuth, requireGrant('clients'), async (req, res, next) => {
