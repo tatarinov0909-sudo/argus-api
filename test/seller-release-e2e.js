@@ -112,6 +112,21 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(emptyCell.onHand,0); assert.equal(emptyCell.stockKnown,true); assert.equal(emptyCell.available,0);
     assert.equal((await api('GET','/api/sellers/export/1c?download=1',sb)).items[0].onHand,0);
     console.log('PASS profile, documents and export isolation; unknown blocked; leading zeros preserved; depleted stock stays known zero');
+    await withTenantContext({warehouseId},c=>c.query(
+      `INSERT INTO product_marketplace_skus(warehouse_id,company_id,sku,marketplace,mp_sku,mp_article)
+       VALUES($1,$2,'SAME-SKU','wb','123456789','SELLER-A'),($1,$3,'SAME-SKU','wb','987654321','SELLER-B')`,[warehouseId,a.id,b.id]));
+    const catalog=await api('GET','/api/sellers/catalog?companyId='+a.id,sb);
+    assert.equal(catalog.products[0].cards[0].nmId,'987654321');
+    assert.ok(!JSON.stringify(catalog).includes('123456789'));
+    await api('GET','/api/sellers/source-documents',sa,undefined,403);
+    await withTenantContext({warehouseId},c=>c.query("UPDATE invoices SET external_id='TEST-1C-'||id::text WHERE warehouse_id=$1 AND direction='in'",[warehouseId]));
+    await invoice(a,'in',1,'MANUAL-ONLY');
+    const source=await api('GET','/api/sellers/source-documents',token);
+    assert.equal(source.rows.length,2);assert.ok(source.rows.every(r=>r.direction==='in'&&r.source==='1c'));
+    await withTenantContext({warehouseId},c=>c.query('UPDATE invoice_items SET mp_nm_id=$2,mp_article=$3 WHERE invoice_id=$1',[order.id,'123456789','SELLER-A']));
+    const enriched=await api('GET','/api/sellers/orders',sa);
+    assert.equal(enriched.rows.find(r=>r.id===order.id).mp_nm_id,'123456789');
+    console.log('PASS real marketplace IDs; catalog company isolation; source documents denied to sellers and available to owner');
   } finally {
     await new Promise(r=>server.close(r)); await pool.end();
   }

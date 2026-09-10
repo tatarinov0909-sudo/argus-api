@@ -8,7 +8,39 @@ const { tenantContextFromAuth } = require('../auth/tenantContext');
 
 const { loadStock } = require('./stock');
 const { prepareInventoryExport } = require('./export');
+const { combineCatalog } = require('./catalog');
 const router = express.Router();
+
+router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
+      const company = (await c.query('SELECT id FROM companies WHERE id=$1', [companyId])).rows[0];
+      if (!company) throw new HttpError(404, 'Компания не найдена');
+      return (await c.query(`WITH links AS (
+        SELECT sku,mp_sku AS nm_id,mp_article AS article FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb'
+        UNION SELECT sku,mp_nm_id,mp_article FROM invoice_items WHERE company_id=$1 AND mp_nm_id IS NOT NULL
+      ), skus AS (SELECT sku FROM products WHERE company_id=$1 UNION SELECT sku FROM links)
+      SELECT s.sku,p.category,l.nm_id,l.article FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1
+      LEFT JOIN links l ON l.sku=s.sku ORDER BY s.sku,l.nm_id`, [companyId])).rows;
+    });
+    res.set('Cache-Control', 'no-store').json({ products: combineCatalog(rows) });
+  } catch (err) { next(err); }
+});
+
+// Explicit owner-only view of source documents, without rebinding them to a seller.
+router.get('/source-documents', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
+      `SELECT i.id,i.number,i.direction,i.status,i.source,i.created_at,i.company_id,c.name AS company_name,
+              count(ii.id)::int AS item_count,COALESCE(SUM(ii.declared_qty),0) AS declared_qty
+       FROM invoices i JOIN companies c ON c.id=i.company_id LEFT JOIN invoice_items ii ON ii.invoice_id=i.id
+       WHERE i.warehouse_id=$1 AND i.source='1c' AND i.external_id IS NOT NULL AND i.direction='in'
+       GROUP BY i.id,c.name ORDER BY i.created_at DESC,i.id LIMIT 1001`, [req.auth.warehouseId])).rows);
+    res.set('Cache-Control','no-store').json({rows:rows.slice(0,1000),hasMore:rows.length>1000});
+  } catch (err) { next(err); }
+});
 
 router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
@@ -100,7 +132,7 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => (
       await client.query(
         `SELECT i.id, i.number, i.status, i.source, i.created_at,
-                ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid
+                ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
          ORDER BY (i.status = 'shipped'), i.created_at DESC, i.id, ii.id
