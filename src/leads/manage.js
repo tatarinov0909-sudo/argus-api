@@ -62,7 +62,16 @@ router.post('/telegram/connect', safe(async(req,res) => {
   if (!/^\d{5,20}:[A-Za-z0-9_-]{25,100}$/.test(token)) throw new HttpError(400,'Введите полный токен бота из BotFather');
   let me,webhook;
   try { me=await telegram.call(token,'getMe'); webhook=await telegram.call(token,'getWebhookInfo'); }
-  catch(e) { throw new HttpError(502,'Telegram не подтвердил токен. Проверьте его или повторите позже.'); }
+  catch(e) {
+    // A transport failure says nothing about the token. Keeping it out of the
+    // database is deliberate: the owner can safely retry after support fixes
+    // the outbound route without first revoking a valid new bot.
+    if (e?.code==='network') throw new HttpError(503,
+      'Сервер Аргуса сейчас не может связаться с Telegram. Токен не сохранён. Обратитесь в поддержку Аргуса.');
+    if (e?.code==='invalid_token') throw new HttpError(400,
+      'Telegram отклонил токен. Получите новый токен у BotFather и введите его полностью.');
+    throw new HttpError(502,'Telegram временно не подтвердил подключение. Повторите позже.');
+  }
   if (!me?.is_bot || !/^[A-Za-z0-9_]+$/.test(me.username)) throw new HttpError(400,'Не удалось определить бота');
   if (webhook?.url) throw new HttpError(409,'У бота уже подключён другой сервис. Создайте отдельного бота для заявок Аргуса.');
   const nonce=crypto.randomBytes(24).toString('base64url');

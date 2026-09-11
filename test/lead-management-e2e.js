@@ -32,6 +32,11 @@ async function main(){
   assert.equal((await api(prefix+'/'+row.id+'/status','PATCH',{status:'contacted'},t)).status,200);passed++;
   const settings=await api(prefix+'/telegram','GET',undefined,t);assert.equal(settings.body.connected,false);assert.ok(!('token_ciphertext' in settings.body));passed++;
   const originalCall=telegram.call;
+  telegram.call=async()=>{throw new TelegramError('network');};
+  const networkFailure=await api(prefix+'/telegram/connect','POST',{token:'123456:'+ 'a'.repeat(32)},t);
+  assert.equal(networkFailure.status,503);assert.match(networkFailure.body.error,/не может связаться с Telegram/);
+  const afterNetworkFailure=await api(prefix+'/telegram','GET',undefined,t);
+  assert.ok(!afterNetworkFailure.body.pending);passed++;
   let startText='';
   telegram.call=async(_token,method)=>method==='getMe'?{is_bot:true,username:'Argus_test_bot'}:method==='getWebhookInfo'?{url:''}:method==='getUpdates'?[{update_id:1,message:{text:startText,chat:{type:'group',id:-123},from:{is_bot:false}}}]:{message_id:111};
   const pairing=await api(prefix+'/telegram/connect','POST',{token:'123456:'+ 'a'.repeat(32)},t);
