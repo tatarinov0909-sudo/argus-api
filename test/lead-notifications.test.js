@@ -36,3 +36,7 @@ test('private relay receives only an allowed method and keeps the bot token out 
     if (beforeToken===undefined) delete process.env.TELEGRAM_RELAY_TOKEN; else process.env.TELEGRAM_RELAY_TOKEN=beforeToken;
   }
 });
+test('Telegram 404 for a fixed method is treated as an invalid bot token',async()=>{
+  await assert.rejects(call('test','getMe',{},async()=>({ok:false,status:404,json:async()=>({ok:false,error_code:404})})),
+    error=>error instanceof TelegramError && error.code==='invalid_token');
+});

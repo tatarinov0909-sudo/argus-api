@@ -28,7 +28,7 @@ async function call(token, method, body = {}, fetcher = fetch) {
   } catch { throw new TelegramError('network'); } // Never retain URL/token or raw provider response.
   if (!response.ok || data.ok !== true) {
     const code = data.error_code || response.status;
-    throw new TelegramError(code === 429 ? 'rate_limit' : code === 401 ? 'invalid_token'
+    throw new TelegramError(code === 429 ? 'rate_limit' : (code === 401 || code === 404) ? 'invalid_token'
       : code === 403 ? 'blocked' : code === 409 ? 'another_connection' : 'provider_error',
     Math.max(0, Math.min(Number(data.parameters?.retry_after) || 0, 86400)));
   }
