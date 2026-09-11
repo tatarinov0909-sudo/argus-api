@@ -43,7 +43,7 @@ async function upsertCompanies(client, warehouseId, records) {
     }
 
     const byExternal = await client.query(
-      `SELECT id FROM companies WHERE warehouse_id = $1 AND external_id = $2`,
+      `SELECT id FROM companies WHERE warehouse_id = $1 AND external_id = $2 AND archived_at IS NULL`,
       [warehouseId, externalId],
     );
     if (byExternal.rows[0]) {
@@ -54,7 +54,7 @@ async function upsertCompanies(client, warehouseId, records) {
 
     const byName = await client.query(
       `SELECT id FROM companies
-       WHERE warehouse_id = $1 AND name = $2 AND external_id IS NULL
+       WHERE warehouse_id = $1 AND name = $2 AND external_id IS NULL AND archived_at IS NULL
        ORDER BY created_at LIMIT 1`,
       [warehouseId, name],
     );
@@ -107,7 +107,7 @@ async function upsertCounterparties(client, warehouseId, records) {
 async function resolveCompany(client, warehouseId, companyExternalId) {
   if (!companyExternalId) return null;
   const result = await client.query(
-    `SELECT id FROM companies WHERE warehouse_id = $1 AND external_id = $2`,
+    `SELECT id FROM companies WHERE warehouse_id = $1 AND external_id = $2 AND archived_at IS NULL`,
     [warehouseId, companyExternalId],
   );
   return result.rows[0]?.id || null;
@@ -207,7 +207,7 @@ async function upsertCellCatalog(client, warehouseId, records) {
   return results;
 }
 
-async function upsertCells1c(client, warehouseId, records, options = {}) {
+async function upsertCells1c(client, warehouseId, records) {
   const results = [];
   const resolved = [];
   for (const rec of records) {
@@ -223,7 +223,7 @@ async function upsertCells1c(client, warehouseId, records, options = {}) {
       results.push({ sku, status: 'error', error: 'Контрагент 1С ещё не связан с компанией Argus' });
       continue;
     }
-    const companyId = explicitCompanyId || options.defaultCompanyId || null;
+    const companyId = explicitCompanyId || null;
     const lookup = await resolveProductForRecord(client, warehouseId, rec, companyId);
     if (!lookup.product) {
       results.push({ sku, status: 'error', error: lookup.error });
@@ -264,7 +264,7 @@ async function upsertCells1c(client, warehouseId, records, options = {}) {
   return results;
 }
 
-async function upsertStock(client, warehouseId, records, options = {}) {
+async function upsertStock(client, warehouseId, records) {
   const results = [];
   const now = new Date();
 
@@ -287,7 +287,7 @@ async function upsertStock(client, warehouseId, records, options = {}) {
       results.push({ sku, status: 'error', error: 'Контрагент 1С ещё не связан с компанией Argus' });
       continue;
     }
-    const companyId = explicitCompanyId || options.defaultCompanyId || null;
+    const companyId = explicitCompanyId || null;
     const lookup = await resolveProductForRecord(client, warehouseId, rec, companyId);
     if (!lookup.product) {
       results.push({ sku, productExternalId: rec.productExternalId || null, status: 'error', code: lookup.code || 'product_not_resolved', error: lookup.error });
@@ -309,7 +309,7 @@ async function upsertStock(client, warehouseId, records, options = {}) {
   return results;
 }
 
-async function upsertProducts(client, warehouseId, records, options = {}) {
+async function upsertProducts(client, warehouseId, records) {
   const results = [];
   for (const rec of records) {
     const externalId = trimmed(rec.externalId);
@@ -320,9 +320,9 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       continue;
     }
 
-    // Некоторые базы (в частности старые УТ 10.3) не связывают номенклатуру
-    // с контрагентом вообще — тогда весь пуш идёт под одну явно указанную
-    // владельцем компанию, а не по externalId на каждую запись.
+    // Номенклатура без контрагента может обновить уже известную карточку по
+    // стабильному productExternalId, но новая карточка не получает выдуманного
+    // владельца. Её назначит документ с контрагентом или владелец склада.
     const explicitCompanyId = await resolveCompany(client, warehouseId, rec.companyExternalId);
     if (rec.companyExternalId && !explicitCompanyId) {
       results.push({
@@ -331,7 +331,7 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       });
       continue;
     }
-    const companyId = explicitCompanyId || options.defaultCompanyId || null;
+    const companyId = explicitCompanyId || null;
 
     // Штрихкод и резерв приходят из 1С и не пересчитываются у нас: первый
     // напечатан на коробке, второй знает только 1С. Обоих может не быть —
@@ -364,9 +364,18 @@ async function upsertProducts(client, warehouseId, records, options = {}) {
       [warehouseId, companyId, sku],
     )).rows[0] : null);
 
+    if (!target && !companyId) {
+      results.push({
+        externalId,
+        status: 'skipped_unmapped_company',
+        error: 'Новый товар не привязан к продавцу; карточка не создана',
+      });
+      continue;
+    }
+
     if (target) {
       // Повторная загрузка каталога не вправе переопределять уже назначенного
-      // продавца, в том числе через старый пакетный defaultCompanyName.
+      // продавца. Принадлежность меняется только по явной связи с контрагентом.
       if (companyId && target.company_id && companyId !== target.company_id) {
         results.push({ externalId, status: 'ownership_conflict', error: 'Товар уже назначен другой компании; связь сохранена' });
         continue;
@@ -518,7 +527,7 @@ async function claimProductOwnership(client, warehouseId, companyId, item) {
   return { status: 'merged', sku: target.sku, productId: target.id };
 }
 
-async function upsertInvoices(client, warehouseId, records, options = {}) {
+async function upsertInvoices(client, warehouseId, records) {
   const results = [];
   for (const rec of records) {
     const externalId = trimmed(rec.externalId);
@@ -535,7 +544,7 @@ async function upsertInvoices(client, warehouseId, records, options = {}) {
     // Явно указанный, но не связанный контрагент никогда не подменяется
     // пакетной компанией: иначе документ чужого продавца попадёт в её кабинет.
     const explicitCompanyId = await resolveCompany(client, warehouseId, rec.companyExternalId);
-    const companyId = rec.companyExternalId ? explicitCompanyId : options.defaultCompanyId || null;
+    const companyId = rec.companyExternalId ? explicitCompanyId : null;
     if (!companyId) {
       results.push({
         externalId, companyExternalId: rec.companyExternalId || null, status: 'skipped_unmapped_company',

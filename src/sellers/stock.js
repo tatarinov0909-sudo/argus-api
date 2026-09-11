@@ -32,7 +32,7 @@ async function loadStock(client, companyId) {
          ), prod AS (
            SELECT sku, name, barcode, stock_qty_1c, stock_at
            FROM products
-           WHERE company_id = $1
+           WHERE company_id = $1 AND active = true
          ), ordered AS (
            -- Сколько этого товара уже обещано заказами и ещё не уехало.
            --

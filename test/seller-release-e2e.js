@@ -45,15 +45,22 @@ const { pool, withTenantContext } = require('../src/db/pool');
       await api('POST', '/api/receiving', worker, {invoiceItemId:inv.items[0].id,acceptedQty:qty,cellBlockId:cell.id},201);
     }
     const warehouseId = JSON.parse(Buffer.from(token.split('.')[1], 'base64url')).warehouseId;
-    await withTenantContext({warehouseId}, c => c.query(
+    await withTenantContext({warehouseId}, async c => {
+      await c.query(
       `INSERT INTO products(warehouse_id,company_id,sku,name,barcode,stock_qty_1c,stock_at)
        VALUES($1,$2,'SAME-SKU','Synthetic product','0000123456789',0,now()),
-             ($1,$2,'ONLY-1C','Not received yet',NULL,900,now())`, [warehouseId,a.id]));
+             ($1,$2,'ONLY-1C','Not received yet',NULL,900,now())`, [warehouseId,a.id]);
+      await c.query(
+        `INSERT INTO products(warehouse_id,company_id,sku,name,active)
+         VALUES($1,$2,'INACTIVE-PILOT-FIXTURE','Inactive fixture',false)`, [warehouseId,a.id]);
+    });
     async function stock() { return (await api('GET','/api/sellers/stock',sa)).find(r=>r.sku==='SAME-SKU'); }
     let row = await stock();
     assert.equal(row.qtyIn1c,0); assert.equal(row.barcode,'0000123456789'); assert.equal(row.onHand,100);
     const only1c = (await api('GET','/api/sellers/stock',sa)).find(r=>r.sku==='ONLY-1C');
     assert.equal(only1c.onHand,null); assert.equal(only1c.available,null); assert.equal(only1c.stockKnown,false); assert.equal(only1c.qtyIn1c,900);
+    assert.equal((await api('GET','/api/sellers/stock',sa)).some(r=>r.sku==='INACTIVE-PILOT-FIXTURE'),false);
+    assert.equal((await api('GET','/api/sellers/catalog',sa)).products.some(r=>r.sku==='INACTIVE-PILOT-FIXTURE'),false);
     console.log('PASS zero 1C balance and barcode preserved; 1C never overrides Argus stock');
 
     const order = await invoice(a,'out',30);

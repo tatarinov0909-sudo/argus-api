@@ -10,7 +10,7 @@ async function list(client, warehouseId, after = null) {
       i.mp_stock_returned_at, i.supply_id,
       COALESCE((SELECT sum(sr.picked_qty) FROM invoice_items ii
         JOIN shipping_records sr ON sr.invoice_item_id=ii.id WHERE ii.invoice_id=i.id),0) AS picked_qty
-    FROM invoices i JOIN companies c ON c.id=i.company_id
+    FROM invoices i JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL
     WHERE i.warehouse_id=$1 AND i.source='wb' AND i.mp_closed_at IS NOT NULL
       AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
       AND (i.mp_close_reason='fulfilled' OR i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM invoice_items ii
@@ -27,7 +27,7 @@ async function invoice(client, warehouseId, id, lock = false) {
       AND (SELECT COALESCE(sum(sr.picked_qty),0) FROM shipping_records sr WHERE sr.invoice_item_id=ii.id) <> ii.declared_qty)
       AND EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id=i.id) AS fully_picked
     FROM invoices i
-    JOIN companies c ON c.id=i.company_id
+    JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL
     WHERE i.warehouse_id=$1 AND i.id=$2 AND i.source='wb' AND i.direction='out'
     ${lock ? 'FOR UPDATE OF i' : ''}`, [warehouseId, id]);
   if (!r.rows[0]) throw new HttpError(404, 'Заказ WB не найден');

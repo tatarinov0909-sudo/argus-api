@@ -202,6 +202,21 @@ async function api(method, path, { token, body } = {}) {
     });
     check('merged cell reads as occupied', () => assert.equal(afterMerge.state, 'occupied'));
 
+    const rebuildStocked = await api('POST', '/api/cells/rows', {
+      token: ownerToken,
+      body: { configs: [{ rackCount: 2, tierCount: 2 }] },
+    });
+    check('full layout rebuild is refused while physical stock exists', () => {
+      assert.equal(rebuildStocked.status, 409, JSON.stringify(rebuildStocked.body));
+      assert.match(rebuildStocked.body.error, /физический товар/i);
+    });
+    row = await getRow();
+    check('refused rebuild preserves the occupied cell and its quantity', () => {
+      const still = blockAt(row, 4, 1);
+      assert.ok(still, 'occupied cell disappeared');
+      assert.equal(still.stock[0].qty, 25);
+    });
+
     console.log('\nSplit\n');
 
     // ---------- Splitting an occupied block is refused ----------

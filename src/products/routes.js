@@ -31,7 +31,7 @@ router.get('/', requireAuth, async (req, res, next) => {
                 p.length_mm, p.width_mm, p.height_mm, p.weight_g,
                 p.active, p.external_id, p.created_at, p.updated_at
          FROM products p
-         JOIN companies c ON c.id = p.company_id
+         JOIN companies c ON c.id = p.company_id AND c.archived_at IS NULL
          WHERE ($1::uuid IS NULL OR p.company_id = $1::uuid)
            AND ($2::boolean IS TRUE OR p.active = true)
          ORDER BY c.name, p.name`,
@@ -68,7 +68,7 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
 
     const product = await withTenantContext({ warehouseId }, async (client) => {
       const companyResult = await client.query(
-        `SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2`,
+        `SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
         [companyId, warehouseId],
       );
       if (!companyResult.rows[0]) throw new HttpError(404, 'Компания не найдена');

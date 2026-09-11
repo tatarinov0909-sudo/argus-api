@@ -23,7 +23,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // отгрузки. Именно этот случай и есть «утро, заказов много».
   const invoices = await client.query(
     `SELECT i.id, i.number, i.company_id, c.name AS company_name
-     FROM invoices i JOIN companies c ON c.id = i.company_id
+     FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
        AND i.status IN ('open', 'in_progress')
        AND i.mp_closed_at IS NULL

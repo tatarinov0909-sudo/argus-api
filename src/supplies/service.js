@@ -86,7 +86,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
              OR EXISTS (SELECT 1 FROM invoice_items ii
                          WHERE ii.invoice_id = i.id
                            AND (${UNPICKABLE_SQL}))) AS has_unpickable
-       FROM invoices i JOIN companies c ON c.id = i.company_id
+       FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
       WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[]) ORDER BY i.id FOR UPDATE OF i`,
     [warehouseId, invoiceIds],
   );
@@ -155,7 +155,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
 async function contents(client, warehouseId, supplyId) {
   const head = await client.query(
     `SELECT s.*, c.name AS company_name FROM supplies s
-       JOIN companies c ON c.id = s.company_id
+       JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
       WHERE s.warehouse_id = $1 AND s.id = $2`,
     [warehouseId, supplyId],
   );
@@ -374,7 +374,7 @@ async function list(client, warehouseId, { status = null } = {}) {
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             count(i.id)::int AS orders
        FROM supplies s
-       JOIN companies c ON c.id = s.company_id
+       JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
       GROUP BY s.id, c.name
@@ -401,7 +401,7 @@ async function pendingByCompany(client, warehouseId) {
             min(i.created_at) AS oldest,
             count(DISTINCT i.id) FILTER (WHERE ${UNPICKABLE_SQL})::int AS incomplete
        FROM invoices i
-       JOIN companies c ON c.id = i.company_id
+       JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
       WHERE i.warehouse_id = $1
         AND i.direction = 'out'

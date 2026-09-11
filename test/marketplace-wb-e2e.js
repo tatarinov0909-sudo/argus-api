@@ -310,12 +310,15 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
     // ---------- Заказ из 1С с тем же номером ----------
     const key = await api('POST', '/api/sync/keys', { token: ownerToken, body: { label: 'Тест' } });
     const syncLogin = await api('POST', '/api/sync/auth', { body: { keyCode: key.body.key_code } });
+    await run((c) => c.query(
+      'UPDATE companies SET external_id=$2 WHERE id=$1',
+      [companyId, 'company-slim-team'],
+    ));
     const pushed = await api('POST', '/api/sync/push/invoices', {
       token: syncLogin.body.token,
       body: {
-        defaultCompanyName: 'Слим Тим',
         records: [{
-          externalId: '5000000001', number: 'ПРХ-ИЗ-1С', direction: 'in',
+          externalId: '5000000001', number: 'ПРХ-ИЗ-1С', direction: 'in', companyExternalId: 'company-slim-team',
           items: [{ sku: 'PB-A', name: 'Печенье овсяное', declaredQty: 5 }],
         }],
       },

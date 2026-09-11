@@ -52,8 +52,12 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     await api('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Ромашка' } });
     const key = await api('POST', '/api/sync/keys', { token: ownerToken, body: { label: 'Тест' } });
     const syncToken = (await api('POST', '/api/sync/auth', { body: { keyCode: key.body.key_code } })).body.token;
+    await api('POST', '/api/sync/push/companies', {
+      token: syncToken, body: { records: [{ externalId: 'company-romashka', name: 'Ромашка' }] },
+    });
     const push = (path, records) => api('POST', path, {
-      token: syncToken, body: { defaultCompanyName: 'Ромашка', records },
+      token: syncToken,
+      body: { records: records.map((record) => ({ ...record, companyExternalId: 'company-romashka' })) },
     });
 
     const orphan = await push('/api/sync/push/cells', [{ sku: 'PB-NONE', cell: 'А-01-02' }]);

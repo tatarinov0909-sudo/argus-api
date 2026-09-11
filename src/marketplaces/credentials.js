@@ -53,7 +53,7 @@ async function list(client, warehouseId) {
     `SELECT mc.id, mc.company_id, c.name AS company_name, mc.marketplace,
             mc.write_enabled, mc.last_used_at, mc.created_at
      FROM marketplace_credentials mc
-     JOIN companies c ON c.id = mc.company_id
+     JOIN companies c ON c.id = mc.company_id AND c.archived_at IS NULL
      WHERE mc.warehouse_id = $1
      ORDER BY c.name, mc.marketplace`,
     [warehouseId],

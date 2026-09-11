@@ -11,20 +11,35 @@ const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
 const router = express.Router();
-router.use('/document-examples', require('./document-examples'));
+
+async function requireActiveCompany(client, companyId) {
+  const company = (await client.query(
+    'SELECT id FROM companies WHERE id=$1 AND archived_at IS NULL',
+    [companyId],
+  )).rows[0];
+  if (!company) throw new HttpError(404, 'Компания не найдена');
+}
 
 router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
-      const company = (await c.query('SELECT id FROM companies WHERE id=$1', [companyId])).rows[0];
+      const company = (await c.query('SELECT id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
       if (!company) throw new HttpError(404, 'Компания не найдена');
       return (await c.query(`WITH links AS (
         SELECT sku,mp_sku AS nm_id,mp_article AS article FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb'
         UNION SELECT sku,mp_nm_id,mp_article FROM invoice_items WHERE company_id=$1 AND mp_nm_id IS NOT NULL
-      ), skus AS (SELECT sku FROM products WHERE company_id=$1 UNION SELECT sku FROM links)
-      SELECT s.sku,p.category,l.nm_id,l.article,m.photo_url FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1
+      ), skus AS (
+        SELECT sku FROM products WHERE company_id=$1 AND active=true
+        UNION
+        SELECT l.sku FROM links l
+        WHERE NOT EXISTS (
+          SELECT 1 FROM products hidden
+          WHERE hidden.company_id=$1 AND hidden.sku=l.sku AND hidden.active=false
+        )
+      )
+      SELECT s.sku,p.category,l.nm_id,l.article,m.photo_url FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1 AND p.active=true
       LEFT JOIN links l ON l.sku=s.sku
       LEFT JOIN marketplace_product_media m ON m.company_id=$1 AND m.nm_id=l.nm_id
       ORDER BY s.sku,l.nm_id`, [companyId])).rows;
@@ -39,7 +54,7 @@ router.get('/source-documents', requireAuth, requireRole('owner', 'manager'), as
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
       `SELECT i.id,i.number,i.direction,i.status,i.source,i.created_at,i.source_document_type,i.source_document_date,i.company_id,c.name AS company_name,
               count(ii.id)::int AS item_count,COALESCE(SUM(ii.declared_qty),0) AS declared_qty
-       FROM invoices i JOIN companies c ON c.id=i.company_id LEFT JOIN invoice_items ii ON ii.invoice_id=i.id
+       FROM invoices i JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL LEFT JOIN invoice_items ii ON ii.invoice_id=i.id
        WHERE i.warehouse_id=$1 AND i.source='1c' AND i.external_id IS NOT NULL AND i.direction='in'
        GROUP BY i.id,c.name ORDER BY i.created_at DESC,i.id LIMIT 1001`, [req.auth.warehouseId])).rows);
     res.set('Cache-Control','no-store').json({rows:rows.slice(0,1000),hasMore:rows.length>1000});
@@ -50,7 +65,7 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     const profile = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
-      const company = (await c.query('SELECT id, name, warehouse_id FROM companies WHERE id=$1', [companyId])).rows[0];
+      const company = (await c.query('SELECT id, name, warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
       if (!company) throw new HttpError(404, 'Компания не найдена');
       // Warehouse identity is non-secret. Seller context cannot read warehouse rows.
       return { id: company.id, name: company.name, warehouseId: company.warehouse_id };
@@ -65,7 +80,7 @@ router.get('/export/1c', requireAuth, requireRole('seller', 'owner', 'manager'),
     if (!companyId) throw new HttpError(400,'Укажите продавца');
     const prepared = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
       // All quantities come from one loadStock SQL statement (one MVCC snapshot).
-      const company = (await c.query('SELECT id,name,warehouse_id FROM companies WHERE id=$1',[companyId])).rows[0];
+      const company = (await c.query('SELECT id,name,warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL',[companyId])).rows[0];
       if (!company) throw new HttpError(404,'Компания не найдена');
       return prepareInventoryExport(await loadStock(c,companyId), {
         seller: { id:company.id,name:company.name }, warehouse: { id:company.warehouse_id },
@@ -93,7 +108,7 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
          LEFT JOIN seller_keys sk ON sk.company_id = c.id
          LEFT JOIN integration_counterparties ic
            ON ic.warehouse_id = c.warehouse_id AND ic.external_id = c.external_id
-         WHERE c.warehouse_id = $1
+         WHERE c.warehouse_id = $1 AND c.archived_at IS NULL
          GROUP BY c.id, ic.name ORDER BY c.created_at ASC`,
         [warehouseId],
       );
@@ -135,7 +150,7 @@ router.put('/companies/:companyId/1c-counterparty', requireAuth, requireGrant('c
     const externalId = typeof req.body?.externalId === 'string' ? req.body.externalId.trim() : '';
     const company = await withTenantContext({ warehouseId }, async (client) => {
       const found = (await client.query(
-        'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2',
+        'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
         [companyId, warehouseId],
       )).rows[0];
       if (!found) throw new HttpError(404, 'Компания не найдена');
@@ -187,13 +202,15 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400,'Укажите продавца');
-    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
-      `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type, i.source_document_date,
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
+      await requireActiveCompany(c, companyId);
+      return (await c.query(
+        `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type, i.source_document_date,
               count(ii.id)::int AS item_count, COALESCE(SUM(ii.declared_qty),0) AS declared_qty
        FROM invoices i LEFT JOIN invoice_items ii ON ii.invoice_id=i.id AND ii.company_id=$1
        WHERE i.company_id=$1 AND i.direction IN ('in','return')
-       GROUP BY i.id ORDER BY i.created_at DESC,i.id LIMIT 1001`,[companyId],
-    )).rows);
+       GROUP BY i.id ORDER BY i.created_at DESC,i.id LIMIT 1001`, [companyId])).rows;
+    });
     res.set('Cache-Control','no-store').json({ rows:rows.slice(0,1000),hasMore:rows.length>1000 });
   } catch (err) { next(err); }
 });
@@ -202,8 +219,9 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
-    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => (
-      await client.query(
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
+      await requireActiveCompany(client, companyId);
+      return (await client.query(
         `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
                 i.mp_close_reason, i.mp_stock_returned_at,
@@ -214,9 +232,8 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
          ORDER BY (i.status = 'shipped' OR i.mp_closed_at IS NOT NULL), i.created_at DESC, i.id, ii.id
-         LIMIT 1001`, [companyId],
-      )
-    ).rows);
+         LIMIT 1001`, [companyId])).rows;
+    });
     res.json({ rows: rows.slice(0, 1000), hasMore: rows.length > 1000 });
   } catch (err) { next(err); }
 });
@@ -225,7 +242,10 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
-    const rows = await withTenantContext(tenantContextFromAuth(req.auth), client => loadStock(client, companyId));
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
+      await requireActiveCompany(client, companyId);
+      return loadStock(client, companyId);
+    });
     res.set('Cache-Control', 'no-store').json(rows);
   } catch (err) { next(err); }
 });
@@ -246,6 +266,7 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
 
     const out = await withTenantContext(ctx, async (client) => {
+      await requireActiveCompany(client, companyId);
       const shipped = await client.query(
         `SELECT sr.id, sr.picked_qty AS qty, COALESCE(i.shipped_at,s.shipped_at) AS at,
                 ii.name, ii.sku, i.number AS invoice_number, i.source
@@ -307,8 +328,10 @@ router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), a
     const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : '';
     if (!companyId || !sku || sku.length > 200) throw new HttpError(400, 'Укажите продавца и артикул');
     const page = readPage(req.query, companyId, sku);
-    const result = await withTenantContext(tenantContextFromAuth(req.auth),
-      client => loadHistory(client, companyId, sku, page));
+    const result = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
+      await requireActiveCompany(client, companyId);
+      return loadHistory(client, companyId, sku, page);
+    });
     res.set('Cache-Control', 'no-store').json(result);
   } catch (err) { next(err); }
 });
@@ -332,6 +355,40 @@ router.post('/companies', requireAuth, requireGrant('clients'), async (req, res,
   }
 });
 
+// Retiring a client is reversible and keeps its source history for audit.
+// Access is revoked in the same transaction so an already issued key cannot
+// keep an archived company operational.
+router.patch('/companies/:companyId/archive', requireAuth, requireGrant('clients'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { companyId } = req.params;
+    if (typeof req.body?.archived !== 'boolean') {
+      throw new HttpError(400, 'Передайте archived: true или false');
+    }
+    const company = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await client.query(
+        `UPDATE companies
+            SET archived_at = CASE WHEN $3 THEN COALESCE(archived_at, now()) ELSE NULL END,
+                external_id = CASE WHEN $3 THEN NULL ELSE external_id END
+          WHERE id = $1 AND warehouse_id = $2
+          RETURNING id, name, archived_at`,
+        [companyId, warehouseId, req.body.archived],
+      );
+      if (!result.rows[0]) return null;
+      if (req.body.archived) {
+        await client.query(
+          `UPDATE seller_keys SET active=false, revoked_at=COALESCE(revoked_at,now())
+            WHERE company_id=$1 AND warehouse_id=$2 AND active=true`,
+          [companyId, warehouseId],
+        );
+      }
+      return result.rows[0];
+    });
+    if (!company) throw new HttpError(404, 'Компания не найдена');
+    res.json(company);
+  } catch (err) { next(err); }
+});
+
 router.post('/companies/:companyId/keys', requireAuth, requireGrant('clients'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
@@ -339,7 +396,7 @@ router.post('/companies/:companyId/keys', requireAuth, requireGrant('clients'), 
 
     const key = await withTenantContext({ warehouseId }, async (client) => {
       const companyResult = await client.query(
-        `SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2`,
+        `SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
         [companyId, warehouseId],
       );
       const company = companyResult.rows[0];

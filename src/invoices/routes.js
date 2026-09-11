@@ -29,7 +29,7 @@ router.get('/', requireAuth, async (req, res, next) => {
                 i.source, i.external_id, i.mp_status, i.mp_supplier_status,
                 i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
                 c.name AS company_name
-         FROM invoices i JOIN companies c ON c.id = i.company_id
+         FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
          ORDER BY i.created_at DESC`,
@@ -54,7 +54,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
                 i.source, i.mp_status, i.mp_supplier_status,
                 i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
                 c.name AS company_name
-         FROM invoices i JOIN companies c ON c.id = i.company_id WHERE i.id = $1`,
+         FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL WHERE i.id = $1`,
         [id],
       );
       const inv = invoiceResult.rows[0];
@@ -168,7 +168,7 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
 
     const invoice = await withTenantContext({ warehouseId }, async (client) => {
       const companyResult = await client.query(
-        `SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2`,
+        `SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
         [companyId, warehouseId],
       );
       if (!companyResult.rows[0]) throw new HttpError(404, 'Компания не найдена');

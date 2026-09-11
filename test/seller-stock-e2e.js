@@ -123,8 +123,12 @@ async function api(method, path, { token, body } = {}) {
     const syncToken = (await api('POST', '/api/sync/auth', {
       body: { keyCode: syncKey.body.key_code },
     })).body.token;
+    await api('POST', '/api/sync/push/companies', {
+      token: syncToken, body: { records: [{ externalId: 'company-alpha', name: 'Альфа' }] },
+    });
     const pushAs = (path, records) => api('POST', path, {
-      token: syncToken, body: { defaultCompanyName: 'Альфа', records },
+      token: syncToken,
+      body: { records: records.map((record) => ({ ...record, companyExternalId: 'company-alpha' })) },
     });
     await pushAs('/api/sync/push/products', [
       { externalId: 'p-only1c', sku: 'PB-ONLY-1C', name: 'Только в 1С' },

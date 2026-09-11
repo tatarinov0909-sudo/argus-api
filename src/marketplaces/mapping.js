@@ -23,7 +23,7 @@ async function list(client, warehouseId, companyId) {
             m.mp_sku, m.mp_article, m.mp_barcode, m.updated_at,
             p.name AS product_name
        FROM product_marketplace_skus m
-       JOIN companies c ON c.id = m.company_id
+       JOIN companies c ON c.id = m.company_id AND c.archived_at IS NULL
        LEFT JOIN products p ON p.warehouse_id = m.warehouse_id
                            AND p.company_id = m.company_id AND p.sku = m.sku
       WHERE m.warehouse_id = $1 AND ($2::uuid IS NULL OR m.company_id = $2::uuid)
@@ -65,7 +65,7 @@ async function unresolved(client, warehouseId) {
             min(i.created_at) AS oldest
        FROM invoices i
        JOIN invoice_items ii ON ii.invoice_id = i.id
-       JOIN companies c ON c.id = i.company_id
+       JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
       WHERE i.warehouse_id = $1
         AND i.direction = 'out'
         AND i.supply_id IS NULL

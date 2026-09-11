@@ -83,8 +83,13 @@ const whIdOf = (token) => JSON.parse(
       body: { keyCode: key.body.key_code },
     })).body.token;
 
+    await api('POST', '/api/sync/push/companies', {
+      token: syncToken, body: { records: [{ externalId: 'company-romashka', name: 'Ромашка' }] },
+    });
+
     const push = (path, records) => api('POST', path, {
-      token: syncToken, body: { defaultCompanyName: 'Ромашка', records },
+      token: syncToken,
+      body: { records: records.map((record) => ({ ...record, companyExternalId: 'company-romashka' })) },
     });
 
     // ---------- Остаток без номенклатуры принять нельзя ----------

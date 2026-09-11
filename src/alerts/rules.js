@@ -91,7 +91,7 @@ async function unsortedReturns(client, warehouseId) {
 async function readyNotShipped(client, warehouseId) {
   const r = await client.query(
     `SELECT i.number, c.name AS company, i.created_at
-     FROM invoices i JOIN companies c ON c.id = i.company_id
+     FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.status = 'ready'
        AND i.mp_closed_at IS NULL
        AND i.created_at < now() - ($2 || ' hours')::interval

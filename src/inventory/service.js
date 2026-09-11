@@ -207,8 +207,9 @@ async function cellContents(client, warehouseId, cellBlockId) {
      FROM cell_stock cs
      LEFT JOIN products p ON p.warehouse_id = cs.warehouse_id
        AND p.company_id = cs.company_id AND p.sku = cs.sku
-     LEFT JOIN companies c ON c.id = cs.company_id AND c.warehouse_id = cs.warehouse_id
+     LEFT JOIN companies c ON c.id = cs.company_id AND c.warehouse_id = cs.warehouse_id AND c.archived_at IS NULL
      WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2 AND cs.qty > 0
+       AND (cs.company_id IS NULL OR c.id IS NOT NULL)
      GROUP BY cs.sku, cs.company_id, cs.quality, p.name, c.name
      ORDER BY name`,
     [warehouseId, cellBlockId],
@@ -238,7 +239,7 @@ async function searchProducts(client, warehouseId, query) {
        WHERE ii.warehouse_id=$1 AND (ii.sku ILIKE $2 OR ii.name ILIKE $2)
      ), chosen AS (
        SELECT DISTINCT ON (x.company_id,x.sku) x.sku,x.company_id,x.name,c.name AS company_name
-       FROM catalog x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1
+       FROM catalog x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1 AND c.archived_at IS NULL
        WHERE x.sku IS NOT NULL AND x.sku<>''
        ORDER BY x.company_id,x.sku,x.priority,x.name
      ) SELECT * FROM chosen ORDER BY company_name,name,sku LIMIT 30`,
@@ -256,7 +257,7 @@ async function identifyCountLines(client, warehouseId, lines) {
        SELECT DISTINCT sku,"companyId" AS company_id
        FROM jsonb_to_recordset($2::jsonb) AS x(sku text,"companyId" uuid)
      ) SELECT x.sku,x.company_id,c.name AS company_name,COALESCE(p.name,ii.name,x.sku) AS name
-     FROM requested x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1
+     FROM requested x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1 AND c.archived_at IS NULL
      LEFT JOIN products p ON p.warehouse_id=$1 AND p.company_id=x.company_id AND p.sku=x.sku
      LEFT JOIN LATERAL (
        SELECT id,name FROM invoice_items

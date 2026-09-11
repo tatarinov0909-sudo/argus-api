@@ -114,17 +114,21 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
       );
       const counts = await client.query(
         `SELECT
-           (SELECT COUNT(*)::int FROM products   WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_products,
-           (SELECT COUNT(*)::int FROM companies  WHERE warehouse_id = $1 AND external_id IS NOT NULL) AS synced_companies,
-           (SELECT COUNT(*)::int FROM invoices   WHERE warehouse_id = $1 AND source = '1c' AND external_id IS NOT NULL) AS synced_invoices,
+           (SELECT COUNT(*)::int FROM products p JOIN companies c ON c.id=p.company_id AND c.archived_at IS NULL
+             WHERE p.warehouse_id = $1 AND p.external_id IS NOT NULL) AS synced_products,
+           (SELECT COUNT(*)::int FROM companies
+             WHERE warehouse_id = $1 AND external_id IS NOT NULL AND archived_at IS NULL) AS synced_companies,
+           (SELECT COUNT(*)::int FROM invoices i JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL
+             WHERE i.warehouse_id = $1 AND i.source = '1c' AND i.external_id IS NOT NULL) AS synced_invoices,
            (SELECT COUNT(*)::int FROM products p
-             LEFT JOIN companies c ON c.id = p.company_id
+             LEFT JOIN companies c ON c.id = p.company_id AND c.archived_at IS NULL
             WHERE p.warehouse_id = $1 AND p.external_id IS NOT NULL
-              AND (p.company_id IS NULL OR c.external_id IS NULL)) AS unassigned_products,
+              AND (p.company_id IS NULL OR (c.id IS NOT NULL AND c.external_id IS NULL))) AS unassigned_products,
            (SELECT COUNT(*)::int FROM integration_counterparties ic
              WHERE ic.warehouse_id = $1 AND NOT EXISTS (
                SELECT 1 FROM companies c
                 WHERE c.warehouse_id = ic.warehouse_id AND c.external_id = ic.external_id
+                  AND c.archived_at IS NULL
              )) AS unmapped_counterparties`,
         [warehouseId],
       );
@@ -217,33 +221,21 @@ function pushHandler(upsertFn) {
 router.post('/push/companies', requireAuth, requireRole('integration'), pushHandler(service.upsertCompanies));
 router.post('/push/counterparties', requireAuth, requireRole('integration'), pushHandler(service.upsertCounterparties));
 
-// Общий хелпер: базы без связи документа/номенклатуры с контрагентом
-// (в частности старая УТ 10.3) шлют весь пуш под одну явно указанную
-// владельцем компанию, а не по externalId на каждую запись.
-async function resolveDefaultCompanyId(client, warehouseId, defaultCompanyName) {
-  if (!defaultCompanyName) return null;
-  const found = await client.query(
-    `SELECT id FROM companies WHERE warehouse_id = $1 AND name = $2`,
-    [warehouseId, defaultCompanyName],
-  );
-  if (!found.rows[0]) {
-    throw new HttpError(400, `Компания "${defaultCompanyName}" не найдена в Аргусе — создайте её в кабинете сначала`);
-  }
-  return found.rows[0].id;
-}
-
-// Отдельно от pushHandler: и товары, и накладные могут нести пакетный
-// defaultCompanyName — см. resolveDefaultCompanyId выше.
-function pushHandlerWithDefaultCompany(upsertFn) {
+// Products and documents must carry a mapped 1C counterparty or resolve by a
+// stable product identifier already assigned to a seller. A package-wide
+// company fallback once routed the whole catalogue into a made-up owner and
+// is intentionally rejected here.
+function mappedPushHandler(upsertFn) {
   return async (req, res, next) => {
     try {
       const { warehouseId, integrationKeyId } = req.auth;
       const records = requireBatch(req.body);
-      const defaultCompanyName = req.body.defaultCompanyName?.trim();
+      if (req.body.defaultCompanyName != null) {
+        throw new HttpError(400, 'defaultCompanyName больше не поддерживается; передайте companyExternalId в каждой записи');
+      }
 
       const results = await withTenantContext({ warehouseId }, async (client) => {
-        const defaultCompanyId = await resolveDefaultCompanyId(client, warehouseId, defaultCompanyName);
-        const out = await upsertFn(client, warehouseId, records, { defaultCompanyId });
+        const out = await upsertFn(client, warehouseId, records);
         await recordBatch(client, req, records, out);
         await client.query(
           `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
@@ -263,13 +255,13 @@ function pushHandlerWithDefaultCompany(upsertFn) {
   };
 }
 
-router.post('/push/products', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertProducts));
-router.post('/push/invoices', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertInvoices));
+router.post('/push/products', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertProducts));
+router.post('/push/invoices', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertInvoices));
 // Остатки: то, чего в обмене не было вовсе, из-за чего Аргус ничего не знал о
 // складе по-настоящему.
-router.post('/push/stock', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertStock));
-router.post('/push/cells', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertCells1c));
-router.post('/push/cell-catalog', requireAuth, requireRole('integration'), pushHandlerWithDefaultCompany(service.upsertCellCatalog));
+router.post('/push/stock', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertStock));
+router.post('/push/cells', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertCells1c));
+router.post('/push/cell-catalog', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertCellCatalog));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 

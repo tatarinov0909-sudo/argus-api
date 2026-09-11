@@ -271,7 +271,7 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
     `SELECT i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name,
             COUNT(ii.id)::int AS item_count
      FROM invoices i
-     JOIN companies c ON c.id = i.company_id
+     JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
      WHERE i.warehouse_id = $1
        AND ($2::invoice_direction IS NULL OR i.direction = $2::invoice_direction)
@@ -298,7 +298,7 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
 async function invoiceDetails(client, warehouseId, number) {
   const inv = await client.query(
     `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name
-     FROM invoices i JOIN companies c ON c.id = i.company_id
+     FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.number ILIKE $2
      ORDER BY i.created_at DESC LIMIT 1`,
     [warehouseId, number],

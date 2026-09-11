@@ -147,7 +147,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
                 c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
-         JOIN companies c ON c.id = ii.company_id
+         JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
          WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
         [invoiceItemId, warehouseId],
       );

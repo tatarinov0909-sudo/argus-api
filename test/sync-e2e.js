@@ -175,8 +175,31 @@ async function api(method, path, { token, body } = {}) {
       token: syncToken,
       body: { records: [{ externalId: 'p-guid-unassigned', sku: 'SKU-U', name: 'Unassigned first' }] },
     });
-    check('1C product can arrive safely before seller mapping is applied to a document', () => {
-      assert.equal(unassignedProduct.body.results[0].status, 'created', JSON.stringify(unassignedProduct.body));
+    check('new 1C product without a seller is quarantined instead of assigned to a made-up company', () => {
+      assert.equal(unassignedProduct.body.results[0].status, 'skipped_unmapped_company', JSON.stringify(unassignedProduct.body));
+    });
+
+    const rejectedFallback = await api('POST', '/api/sync/push/products', {
+      token: syncToken,
+      body: {
+        defaultCompanyName: 'Mapped Seller',
+        records: [{ externalId: 'p-guid-fallback', sku: 'SKU-F', name: 'Fallback product' }],
+      },
+    });
+    check('package-wide default company is rejected', () => {
+      assert.equal(rejectedFallback.status, 400, JSON.stringify(rejectedFallback.body));
+      assert.match(rejectedFallback.body.error, /defaultCompanyName/);
+    });
+
+    const assignedProduct = await api('POST', '/api/sync/push/products', {
+      token: syncToken,
+      body: { records: [{
+        externalId: 'p-guid-unassigned', companyExternalId: 'cp-guid-mapped',
+        sku: 'SKU-U', name: 'Assigned product',
+      }] },
+    });
+    check('mapped 1C product is created for the explicit seller', () => {
+      assert.equal(assignedProduct.body.results[0].status, 'created', JSON.stringify(assignedProduct.body));
     });
 
     const zeroStock = await api('POST', '/api/sync/push/stock', {
@@ -213,6 +236,30 @@ async function api(method, path, { token, body } = {}) {
       // A number from 1C is the reconciliation source. Physical Argus stock
       // remains unknown until the warehouse receives or counts the product.
       assert.equal(row.stockKnown, false);
+    });
+
+    const archived = await api('PATCH', `/api/sellers/companies/${mappedSeller.body.id}/archive`, {
+      token: ownerToken, body: { archived: true },
+    });
+    check('owner can archive a pilot company without deleting its history', () => {
+      assert.equal(archived.status, 200, JSON.stringify(archived.body));
+      assert.ok(archived.body.archived_at);
+    });
+    const afterArchive = await api('GET', '/api/sellers/companies', { token: ownerToken });
+    check('archived company disappears from operational company lists', () => {
+      assert.ok(!afterArchive.body.some((company) => company.id === mappedSeller.body.id), JSON.stringify(afterArchive.body));
+    });
+    const archivedLogin = await api('POST', '/api/auth/seller/login', {
+      body: { keyCode: mappedKey.body.key_code, name: 'Mapped user' },
+    });
+    check('archived seller cannot sign in with an old key', () => {
+      assert.equal(archivedLogin.status, 404, JSON.stringify(archivedLogin.body));
+    });
+    const archivedOwnerView = await api('GET', `/api/sellers/stock?companyId=${mappedSeller.body.id}`, {
+      token: ownerToken,
+    });
+    check('archived seller stock is unavailable in operational routes', () => {
+      assert.equal(archivedOwnerView.status, 404, JSON.stringify(archivedOwnerView.body));
     });
 
     // ---------- Products ----------
@@ -445,10 +492,10 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(status.status, 200, JSON.stringify(status.body));
       assert.ok(status.body.pendingEvents >= 1, JSON.stringify(status.body));
       assert.ok(status.body.lastSeenAt, 'last seen never recorded');
-      assert.equal(status.body.synced_products, 2);
-      assert.equal(status.body.synced_companies, 3);
+      assert.equal(status.body.synced_products, 1);
+      assert.equal(status.body.synced_companies, 2);
       assert.equal(status.body.unassigned_products, 0);
-      assert.equal(status.body.unmapped_counterparties, 0);
+      assert.equal(status.body.unmapped_counterparties, 1);
     });
 
     // ---------- Revocation ----------

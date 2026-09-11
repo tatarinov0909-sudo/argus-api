@@ -123,6 +123,17 @@ router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, ne
     }
 
     const rows = await withTenantContext({ warehouseId }, async (client) => {
+      const existing = await client.query(
+        `SELECT
+           (SELECT count(*)::int FROM cell_stock WHERE warehouse_id=$1) AS stock_positions,
+           (SELECT count(*)::int FROM product_cells_1c WHERE warehouse_id=$1) AS linked_positions`,
+        [warehouseId],
+      );
+      const { stock_positions: stockPositions, linked_positions: linkedPositions } = existing.rows[0];
+      if (stockPositions > 0 || linkedPositions > 0) {
+        throw new HttpError(409,
+          `Схема уже используется: физический товар — ${stockPositions} позиций, адреса из 1С — ${linkedPositions}. Изменяйте ряды и ячейки без полной перестройки.`);
+      }
       await client.query(
         `DELETE FROM warehouse_rows WHERE warehouse_id = $1`, // cascades to cell_blocks/cell_stock
         [warehouseId],

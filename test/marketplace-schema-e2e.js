@@ -132,6 +132,10 @@ async function expectFails(run) {
     const syncLogin = await api('POST', '/api/sync/auth', {
       body: { keyCode: key.body.key_code },
     });
+    await run((c) => c.query(
+      'UPDATE companies SET external_id=$2 WHERE id=$1',
+      [companyId, 'company-romashka'],
+    ));
     // Номер, который существует ТОЛЬКО у площадки. Обмен с 1С обязан создать
     // свой документ, а не подхватить чужой.
     await run((c) => c.query(
@@ -143,8 +147,7 @@ async function expectFails(run) {
     const pushed = await api('POST', '/api/sync/push/invoices', {
       token: syncLogin.body.token,
       body: {
-        defaultCompanyName: 'Ромашка',
-        records: [{ externalId: 'WB-ONLY-1', number: 'ПРХ-ИЗ-1С', direction: 'in',
+        records: [{ externalId: 'WB-ONLY-1', number: 'ПРХ-ИЗ-1С', direction: 'in', companyExternalId: 'company-romashka',
           items: [{ sku: 'PB-MP', name: 'Лимонад', declaredQty: 5 }] }],
       },
     });
@@ -182,8 +185,8 @@ async function expectFails(run) {
     });
 
     const twoOursOneMpSku = await expectFails(() => run((c) => c.query(
-      `INSERT INTO product_marketplace_skus (warehouse_id, company_id, sku, marketplace, mp_sku)
-       VALUES ($1, $2, 'PB-OTHER', 'wb', 'WB-12345')`,
+      `INSERT INTO product_marketplace_skus (warehouse_id, company_id, sku, marketplace, mp_sku, mp_barcode)
+       VALUES ($1, $2, 'PB-OTHER', 'wb', 'WB-12345', '2000000000015')`,
       [warehouseId, companyId],
     )));
     check('артикул площадки ведёт ровно к одному нашему товару', () => {
