@@ -70,6 +70,7 @@ async function unresolved(client, warehouseId) {
         AND i.direction = 'out'
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
+        AND i.mp_closed_at IS NULL
         AND ${UNMAPPED}
       GROUP BY i.company_id, c.name, COALESCE(ii.mp_article, ii.sku)
       ORDER BY count(DISTINCT i.id) DESC
@@ -129,10 +130,11 @@ async function save(client, warehouseId, {
   // собирать заказ придётся угадывая.
   await client.query(
     `DELETE FROM product_marketplace_skus
-      WHERE warehouse_id = $1 AND marketplace = $2
+      WHERE warehouse_id = $1 AND marketplace = $2 AND company_id = $5
         AND ((mp_article IS NOT NULL AND mp_article = $3)
-          OR (mp_sku IS NOT NULL AND mp_sku = $4))`,
-    [warehouseId, marketplace, mpArticle || null, mpSku || null],
+          OR (mp_sku IS NOT NULL AND mp_sku = $4)
+          OR (mp_barcode IS NOT NULL AND mp_barcode = $6))`,
+    [warehouseId, marketplace, mpArticle || null, mpSku || null, companyId, mpBarcode || null],
   );
   const ins = await client.query(
     `INSERT INTO product_marketplace_skus
@@ -159,6 +161,7 @@ async function save(client, warehouseId, {
         AND i.direction = 'out'
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
+        AND i.mp_closed_at IS NULL
         AND ${UNMAPPED}
         AND (($5::text IS NOT NULL AND (ii.mp_article = $5 OR ii.sku = $5))
           OR ($6::text IS NOT NULL AND ii.mp_nm_id::text = $6)

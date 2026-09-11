@@ -366,10 +366,7 @@ async function api(method, path, { token, body } = {}) {
     console.log('Заполненность ячейки');
     console.log('');
 
-    // Раньше приёмка ставила fill_pct = 100 при любом количестве, и карта
-    // красила оранжевым ячейку с горстью товара — то есть сообщала «склад
-    // забит», когда он почти пуст. Процент считается от условной вместимости
-    // в 500 штук (см. src/cells/fill.js).
+    // Реальное количество определяет занятость, но не неизвестную вместимость.
     const fillOf = async (blockId) => {
       const fresh = await api('GET', '/api/cells/rows', { token: ownerToken });
       return fresh.body.flatMap((r) => r.blocks).find((b) => b.id === blockId);
@@ -378,22 +375,24 @@ async function api(method, path, { token, body } = {}) {
     const fillCell = allBlocks[allBlocks.length - 1];
     await receiveInto(fillCell.id, 'FILL-50', 50, companyAId, stamp + '-f1');
     const afterSmall = await fillOf(fillCell.id);
-    check('50 штук из 500 — это 10 процентов, а не сто', () => {
+    check('50 штук занимают ячейку без выдуманного процента', () => {
       assert.equal(afterSmall.state, 'occupied');
-      assert.equal(afterSmall.fill_pct, 10);
+      assert.equal(afterSmall.fill_pct, null);
     });
 
     await receiveInto(fillCell.id, 'FILL-REST', 450, companyAId, stamp + '-f2');
     const afterFull = await fillOf(fillCell.id);
-    check('пятьсот штук заполняют ячейку целиком', () => {
-      assert.equal(afterFull.fill_pct, 100);
+    check('500 штук не доказывают, что ячейка заполнена', () => {
+      assert.equal(afterFull.state, 'occupied');
+      assert.equal(afterFull.fill_pct, null);
     });
 
     const tinyCell = allBlocks[allBlocks.length - 2];
     await receiveInto(tinyCell.id, 'FILL-ONE', 1, companyAId, stamp + '-f3');
     const afterTiny = await fillOf(tinyCell.id);
     check('одна штука не показывается как пустая ячейка', () => {
-      assert.equal(afterTiny.fill_pct, 1);
+      assert.equal(afterTiny.state, 'occupied');
+      assert.equal(afterTiny.fill_pct, null);
     });
 
     console.log('');

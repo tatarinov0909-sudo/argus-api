@@ -227,7 +227,8 @@ const whIdOf = (token) => JSON.parse(
     check('о нехватке места говорит в свободных ячейках, а не в выдуманных процентах', () => {
       const a = listed5.body.alerts.find((x) => x.alert_key === 'no_free_cells');
       assert.ok(a, JSON.stringify(listed5.body.alerts.map((x) => x.alert_key)));
-      assert.ok(a.text.includes('Свободных ячеек'), a.text);
+      assert.ok(a.text.includes(`Все ${blocks.length} ячеек заняты`), a.text);
+      assert.ok(a.text.includes('вместимость занятых ячеек не задана'), a.text);
       assert.ok(!a.text.includes('%'), `процентов быть не должно: ${a.text}`);
     });
 

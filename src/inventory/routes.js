@@ -6,6 +6,16 @@ const service = require('./service');
 
 const router = express.Router();
 
+router.get('/products', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const products = await withTenantContext({ warehouseId }, (c) => (
+      service.searchProducts(c, warehouseId, req.query.q)
+    ));
+    res.json(products);
+  } catch (err) { next(err); }
+});
+
 // Регулировка — только владельцу: как часто считать, сколько ячеек за раз и
 // какая пауза между заходами. Это решение про то, сколько смены отдать под
 // счёт, и принимать его работнику не с чем.
@@ -115,6 +125,7 @@ router.post('/tasks/:id/count', requireAuth, requireRole('owner', 'worker'), asy
     const out = await withTenantContext({ warehouseId }, (c) => (
       service.submitCount(c, warehouseId, req.params.id, {
         lines: req.body.lines, note: req.body.note, workerKeyId: staffKeyId || null,
+        snapshotId: req.body.snapshotId,
       })
     ));
     res.json(out);
@@ -127,7 +138,7 @@ router.post('/tasks/:id/resolve', requireAuth, requireRole('owner', 'manager'), 
     const { warehouseId, ownerId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => (
       service.resolveTask(c, warehouseId, req.params.id, {
-        decision: req.body.decision, ownerId,
+        decision: req.body.decision, ownerId, staffKeyId: req.auth.staffKeyId,
       })
     ));
     res.json(out);

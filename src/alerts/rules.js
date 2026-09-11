@@ -93,6 +93,7 @@ async function readyNotShipped(client, warehouseId) {
     `SELECT i.number, c.name AS company, i.created_at
      FROM invoices i JOIN companies c ON c.id = i.company_id
      WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.status = 'ready'
+       AND i.mp_closed_at IS NULL
        AND i.created_at < now() - ($2 || ' hours')::interval
      ORDER BY i.created_at`,
     [warehouseId, THRESHOLDS.readyNotShippedHours],
@@ -130,9 +131,60 @@ async function syncSilent(client, warehouseId) {
   }];
 }
 
-// Места почти нет. Считаем СВОБОДНЫЕ ЯЧЕЙКИ, а не проценты заполненности:
-// процент считается от условной вместимости в 500 штук, которой никто не
-// измерял, а пустая ячейка — это факт, который видно глазами.
+const SYNC_STAGE_LABELS = {
+  companies: 'компании', counterparties: 'контрагенты', products: 'товары',
+  invoices: 'накладные', stock: 'учётные остатки', cells: 'адреса хранения',
+  'cell-catalog': 'справочник ячеек',
+};
+
+// Авторизация модуля обновляет last_seen_at даже тогда, когда отправка данных
+// оборвалась. Следим отдельно за этапами, которые уже приходили автоматически.
+// Последняя пачка не доказывает полноту обмена; её ошибки тоже показываем именно
+// как ошибки пачки, не всего запуска. Отозванные ключи не создают старые тревоги.
+async function syncBatches(client, warehouseId) {
+  const r = await client.query(
+    `SELECT DISTINCT ON (s.stage) s.stage, s.received_at, s.run_mode, s.summary,
+       (SELECT MAX(k.last_seen_at) FROM integration_keys k
+        WHERE k.warehouse_id = $1 AND k.active) AS last_seen_at
+     FROM integration_sync_state s
+     JOIN integration_keys k ON k.id = s.integration_key_id
+       AND k.warehouse_id = s.warehouse_id AND k.active
+     WHERE s.warehouse_id = $1
+     ORDER BY s.stage, s.received_at DESC`,
+    [warehouseId],
+  );
+  const known = r.rows.filter((row) => Object.hasOwn(SYNC_STAGE_LABELS, row.stage));
+  if (known.length === 0) return [];
+  const now = Date.now();
+  const ageMinutes = (value) => (now - new Date(value).getTime()) / 60000;
+  const stale = known.filter((row) => row.run_mode === 'automatic'
+    && ageMinutes(row.received_at) >= THRESHOLDS.syncSilentMinutes);
+  const found = [];
+  // При полном обрыве связи уже есть sync_silent: не повторяем ту же проблему.
+  const seen = known[0].last_seen_at;
+  if (stale.length && seen && ageMinutes(seen) < THRESHOLDS.syncSilentMinutes) {
+    found.push({
+      key: 'sync_batches_stale',
+      text: `Модуль 1С подключается, но больше ${THRESHOLDS.syncSilentMinutes} минут не обновлялись: `
+        + `${stale.map((row) => SYNC_STAGE_LABELS[row.stage]).join(', ')}. `
+        + 'Проверьте результат автоматического обмена в 1С. В кабинете остаются ранее полученные данные.',
+    });
+  }
+  const errors = known.filter((row) => Number(row.summary?.error) > 0);
+  if (errors.length) {
+    const total = errors.reduce((sum, row) => sum + Number(row.summary.error), 0);
+    found.push({
+      key: 'sync_batch_errors',
+      text: `В последних полученных порциях данных 1С ${total} ${plural(total, 'ошибка', 'ошибки', 'ошибок')}: `
+        + `${errors.map((row) => SYNC_STAGE_LABELS[row.stage]).join(', ')}. `
+        + 'Часть строк не обновлена. Откройте «Подключение 1С» и результат обмена в модуле.',
+    });
+  }
+  return found;
+}
+
+// Считаем незанятые ячейки. Их число не доказывает отсутствие места внутри
+// занятых ячеек: реальная вместимость ещё не задана.
 async function noFreeCells(client, warehouseId) {
   const r = await client.query(
     `SELECT COUNT(*) FILTER (WHERE state = 'empty')::int AS free,
@@ -150,8 +202,8 @@ async function noFreeCells(client, warehouseId) {
   return [{
     key: 'no_free_cells',
     text: free === 0
-      ? `Свободных ячеек не осталось совсем — все ${total} заняты. Следующую поставку класть некуда.`
-      : `Свободных ячеек осталось ${free} из ${total}. Скоро принимать будет некуда.`,
+      ? `Все ${total} ячеек заняты. Проверьте размещение перед следующей приёмкой: вместимость занятых ячеек не задана.`
+      : `Незанятых ячеек осталось ${free} из ${total}. Проверьте размещение перед следующей приёмкой: вместимость занятых ячеек не задана.`,
   }];
 }
 
@@ -175,7 +227,7 @@ async function defectWaiting(client, warehouseId) {
 }
 
 const RULES = [
-  discrepancies, unsortedReturns, readyNotShipped, syncSilent, noFreeCells, defectWaiting,
+  discrepancies, unsortedReturns, readyNotShipped, syncSilent, syncBatches, noFreeCells, defectWaiting,
 ];
 
 // Прогон всех правил. Возвращает список найденного — что с ним делать,

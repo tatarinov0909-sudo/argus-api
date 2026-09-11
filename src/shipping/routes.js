@@ -142,13 +142,13 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       const itemResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
                 ii.external_id,
-                i.direction, i.number AS invoice_number,
+                i.direction, i.status, i.mp_closed_at, i.number AS invoice_number,
                 i.external_id AS invoice_external_id,
                 c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
          JOIN companies c ON c.id = ii.company_id
-         WHERE ii.id = $1 AND ii.warehouse_id = $2`,
+         WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
         [invoiceItemId, warehouseId],
       );
       const item = itemResult.rows[0];
@@ -157,6 +157,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       // shipment — that would silently drain stock that was just accepted.
       if (item.direction !== 'out') {
         throw new HttpError(400, 'Эта накладная не на отгрузку');
+      }
+      if (item.mp_closed_at || item.status === 'shipped') {
+        throw new HttpError(409, 'Заказ уже закрыт. Отбор остановлен; руководитель проверит его в сверке заказов WB.');
       }
 
       const closed = await client.query(
@@ -302,17 +305,18 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req
 
     const invoice = await withTenantContext({ warehouseId }, async (client) => {
       const result = await client.query(
-        `SELECT id, number, status, direction FROM invoices WHERE id = $1 AND warehouse_id = $2`,
+        `SELECT id, number, status, direction, mp_closed_at FROM invoices WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
         [id, warehouseId],
       );
       const inv = result.rows[0];
       if (!inv) throw new HttpError(404, 'Накладная не найдена');
       if (inv.direction !== 'out') throw new HttpError(400, 'Эта накладная не на отгрузку');
+      if (inv.mp_closed_at) throw new HttpError(409, 'Заказ закрыт на WB. Руководитель должен подтвердить судьбу товара в сверке заказов WB.');
       if (inv.status !== 'ready') {
         throw new HttpError(409, 'Заказ ещё не полностью собран');
       }
 
-      await client.query(`UPDATE invoices SET status = 'shipped' WHERE id = $1`, [id]);
+      const shipped = await client.query(`UPDATE invoices SET status = 'shipped', shipped_at=now() WHERE id = $1 RETURNING shipped_at`, [id]);
       await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
@@ -325,7 +329,7 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req
         status: 'auto',
       });
 
-      return { id: inv.id, number: inv.number, status: 'shipped' };
+      return { id: inv.id, number: inv.number, status: 'shipped', shipped_at: shipped.rows[0].shipped_at };
     });
     res.json(invoice);
   } catch (err) {

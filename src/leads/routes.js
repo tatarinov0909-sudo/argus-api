@@ -3,6 +3,7 @@ const { withoutTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 
 const router = express.Router();
+router.use('/manage', require('./manage'));
 
 // Заявка с лендинга — единственная ручка без авторизации.
 //

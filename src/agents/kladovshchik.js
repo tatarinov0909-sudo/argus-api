@@ -255,11 +255,20 @@ const STATUS_LABEL = {
   shipped: 'отгружен',
 };
 
+function invoiceStatusLabel(row) {
+  if (row.status === 'shipped') return row.mp_close_reason === 'canceled'
+    ? 'отгружен со склада; позднее отменён на WB' : STATUS_LABEL.shipped;
+  if (row.mp_stock_returned_at) return 'отменён на WB; товар возвращён в ячейки';
+  if (row.mp_closed_at) return row.mp_close_reason === 'canceled'
+    ? 'отменён на WB' : 'передан в доставку на WB; физическую отгрузку проверяет склад';
+  return STATUS_LABEL[row.status] || row.status;
+}
+
 // «Что сейчас в работе», «какие возвраты приехали», «что вчера приняли».
 // Незакрытые документы идут первыми: незавершённая работа важнее истории.
 async function listInvoices(client, warehouseId, { direction, status, limit = 20 } = {}) {
   const result = await client.query(
-    `SELECT i.number, i.direction, i.status, i.created_at, c.name AS company_name,
+    `SELECT i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name,
             COUNT(ii.id)::int AS item_count
      FROM invoices i
      JOIN companies c ON c.id = i.company_id
@@ -267,15 +276,16 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
      WHERE i.warehouse_id = $1
        AND ($2::invoice_direction IS NULL OR i.direction = $2::invoice_direction)
        AND ($3::invoice_status IS NULL OR i.status = $3::invoice_status)
+       AND ($3::invoice_status IS NULL OR $3::invoice_status = 'shipped' OR i.mp_closed_at IS NULL)
      GROUP BY i.id, i.number, i.direction, i.status, i.created_at, c.name
-     ORDER BY (i.status IN ('completed', 'shipped')) ASC, i.created_at DESC
+     ORDER BY (i.status IN ('completed', 'shipped') OR i.mp_closed_at IS NOT NULL) ASC, i.created_at DESC
      LIMIT $4`,
     [warehouseId, direction || null, status || null, Math.min(limit, 50)],
   );
   return result.rows.map((r) => ({
     number: r.number,
     kind: DIRECTION_LABEL[r.direction] || r.direction,
-    status: STATUS_LABEL[r.status] || r.status,
+    status: invoiceStatusLabel(r),
     company: r.company_name,
     itemCount: r.item_count,
     createdAt: r.created_at,
@@ -287,7 +297,7 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
 // принятое количество, у отгрузки собранное, у возврата — разбор по состоянию.
 async function invoiceDetails(client, warehouseId, number) {
   const inv = await client.query(
-    `SELECT i.id, i.number, i.direction, i.status, i.created_at, c.name AS company_name
+    `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name
      FROM invoices i JOIN companies c ON c.id = i.company_id
      WHERE i.warehouse_id = $1 AND i.number ILIKE $2
      ORDER BY i.created_at DESC LIMIT 1`,
@@ -313,7 +323,7 @@ async function invoiceDetails(client, warehouseId, number) {
   return {
     number: doc.number,
     kind: DIRECTION_LABEL[doc.direction] || doc.direction,
-    status: STATUS_LABEL[doc.status] || doc.status,
+    status: invoiceStatusLabel(doc),
     company: doc.company_name,
     items: items.rows.map((it) => {
       const row = { name: it.name, sku: it.sku, declaredQty: Number(it.declared_qty) };
@@ -338,8 +348,7 @@ async function invoiceDetails(client, warehouseId, number) {
 async function warehouseSummary(client, warehouseId) {
   const cells = await client.query(
     `SELECT COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE state = 'occupied')::int AS occupied,
-            COALESCE(ROUND(AVG(fill_pct) FILTER (WHERE state = 'occupied')), 0)::int AS avg_fill
+            COUNT(*) FILTER (WHERE state = 'occupied')::int AS occupied
      FROM cell_blocks WHERE warehouse_id = $1`,
     [warehouseId],
   );
@@ -366,7 +375,7 @@ async function warehouseSummary(client, warehouseId) {
   );
   const openDocs = await client.query(
     `SELECT COUNT(*)::int AS n FROM invoices
-     WHERE warehouse_id = $1 AND status NOT IN ('completed', 'shipped')`,
+     WHERE warehouse_id = $1 AND status NOT IN ('completed', 'shipped') AND mp_closed_at IS NULL`,
     [warehouseId],
   );
 
@@ -376,7 +385,9 @@ async function warehouseSummary(client, warehouseId) {
     cellsTotal: c.total,
     cellsOccupied: c.occupied,
     cellsFree: c.total - c.occupied,
-    averageFillOfOccupiedPct: c.avg_fill,
+    averageFillOfOccupiedPct: null,
+    capacityKnown: false,
+    capacityNote: 'Вместимость ячеек не задана. Число занятых ячеек не показывает заполненность по объёму или весу.',
     distinctSkus: stock.rows[0].skus,
     totalUnits: Number(stock.rows[0].units),
     onShelvesByState: byQuality.rows.map((r) => ({
@@ -457,4 +468,3 @@ module.exports = {
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary,
   listDiscrepancies, pickList, runTool, recordSuggestion, recordSuggestionOutcome,
 };
-

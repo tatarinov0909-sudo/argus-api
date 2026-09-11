@@ -63,10 +63,10 @@ if (!items.length) {
     // опечатка — и проявится она как «заказ пришёл, а собрать нечего».
     const skus = [...new Set(items.map((i) => i.sku))];
     const known = await client.query(
-      `SELECT sku FROM products WHERE warehouse_id = $1 AND sku = ANY($2::text[])
-       UNION SELECT sku FROM cell_stock WHERE warehouse_id = $1 AND sku = ANY($2::text[])
-       UNION SELECT sku FROM invoice_items WHERE warehouse_id = $1 AND sku = ANY($2::text[])`,
-      [warehouseId, skus],
+      `SELECT sku FROM products WHERE warehouse_id = $1 AND company_id=$3 AND sku = ANY($2::text[])
+       UNION SELECT sku FROM cell_stock WHERE warehouse_id = $1 AND company_id=$3 AND sku = ANY($2::text[])
+       UNION SELECT sku FROM invoice_items WHERE warehouse_id = $1 AND company_id=$3 AND sku = ANY($2::text[])`,
+      [warehouseId, skus, companyId],
     );
     const knownSet = new Set(known.rows.map((r) => r.sku));
     const unknown = skus.filter((s) => !knownSet.has(s));
@@ -78,11 +78,13 @@ if (!items.length) {
 
     for (const it of items) {
       const existing = await client.query(
-        `SELECT sku, mp_article, mp_barcode FROM product_marketplace_skus
-         WHERE warehouse_id = $1 AND marketplace = $2
+        `SELECT id, sku, mp_article, mp_barcode FROM product_marketplace_skus
+         WHERE warehouse_id = $1 AND marketplace = $2 AND company_id=$5
            AND COALESCE(mp_sku, '') = COALESCE($3, '')
-           AND COALESCE(mp_article, '') = COALESCE($4, '')`,
-        [warehouseId, it.marketplace, it.mpSku, it.mpArticle || null],
+           AND COALESCE(mp_article, '') = COALESCE($4, '')
+           AND (($3::text IS NOT NULL OR $4::text IS NOT NULL) OR mp_barcode=$6)
+         ORDER BY updated_at DESC, id LIMIT 1`,
+        [warehouseId, it.marketplace, it.mpSku, it.mpArticle || null, companyId, it.mpBarcode || null],
       );
       const before = existing.rows[0];
       const same = before
@@ -93,13 +95,19 @@ if (!items.length) {
       if (before) stats.updated += 1; else stats.added += 1;
       if (!apply) continue;
 
+      if (before) {
+        await client.query(`UPDATE product_marketplace_skus SET sku=$4,mp_barcode=$5,updated_at=now()
+          WHERE warehouse_id=$1 AND company_id=$2 AND id=$3`,
+        [warehouseId, companyId, before.id, it.sku, it.mpBarcode || null]);
+        continue;
+      }
+
       await client.query(
         `INSERT INTO product_marketplace_skus
            (warehouse_id, company_id, sku, marketplace, mp_sku, mp_article, mp_barcode)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (warehouse_id, marketplace, COALESCE(mp_sku, ''), COALESCE(mp_article, ''))
+         ON CONFLICT (warehouse_id, company_id, marketplace, COALESCE(mp_sku, ''), COALESCE(mp_article, ''), COALESCE(mp_barcode, ''))
          DO UPDATE SET sku = EXCLUDED.sku,
-                       company_id = EXCLUDED.company_id,
                        mp_barcode = EXCLUDED.mp_barcode,
                        updated_at = now()`,
         [warehouseId, companyId, it.sku, it.marketplace,

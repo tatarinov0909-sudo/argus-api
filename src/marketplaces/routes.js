@@ -6,6 +6,7 @@ const credentials = require('./credentials');
 const mapping = require('./mapping');
 const sync = require('./sync');
 const wb = require('./wb');
+const reconciliation = require('./reconciliation');
 
 const router = express.Router();
 
@@ -18,6 +19,27 @@ const router = express.Router();
 // к чужому кабинету, и это решение владельца. Поэтому список и синхронизация
 // открыты обоим, а ключи — за отдельным правом.
 router.use(requireAuth, requireRole('owner', 'manager'));
+
+router.get('/reconciliation', requireRole('owner'), async (req, res, next) => {
+  try {
+    const result = await withTenantContext({ warehouseId: req.auth.warehouseId },
+      c => reconciliation.list(c, req.auth.warehouseId, req.query.after || null));
+    res.json(result);
+  } catch (err) { next(err); }
+});
+router.get('/reconciliation/:id', requireRole('owner'), async (req, res, next) => {
+  try {
+    res.json(await withTenantContext({ warehouseId: req.auth.warehouseId },
+      c => reconciliation.preview(c, req.auth.warehouseId, req.params.id)));
+  } catch (err) { next(err); }
+});
+router.post('/reconciliation/:id', requireRole('owner'), async (req, res, next) => {
+  try {
+    res.json(await withTenantContext({ warehouseId: req.auth.warehouseId },
+      c => reconciliation.resolve(c, req.auth.warehouseId, req.params.id,
+        { ...req.body, ownerId: req.auth.ownerId })));
+  } catch (err) { next(err); }
+});
 
 router.get('/', async (req, res, next) => {
   try {

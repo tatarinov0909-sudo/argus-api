@@ -42,11 +42,16 @@ async function loadStock(client, companyId) {
            -- реализация проводится при отгрузке. Не вычти его — и продавцу
            -- обещано то, что физически уже уезжает.
            SELECT ii.sku, SUM(ii.declared_qty) AS qty,
+                  SUM(ii.declared_qty) FILTER (WHERE i.mp_closed_at IS NOT NULL) AS blocked_qty,
                   count(DISTINCT i.id) AS orders,
                   count(DISTINCT i.id) FILTER (WHERE i.status = 'ready') AS picked_orders
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
            WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
+             AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND (i.mp_close_reason='fulfilled' OR EXISTS (
+               SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
+               WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
+             ))))
            GROUP BY ii.sku
          ), staged AS (
            -- Picks have left their cells, but remain on site until shipment.
@@ -56,6 +61,7 @@ async function loadStock(client, companyId) {
            JOIN invoice_items ii ON ii.id = sr.invoice_item_id
            JOIN invoices i ON i.id = ii.invoice_id
            WHERE sr.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
+             AND i.mp_stock_returned_at IS NULL
            GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
@@ -71,7 +77,7 @@ async function loadStock(client, companyId) {
                 c.good_qty, c.bad_qty, c.defective_qty, c.packaging_qty, c.cells,
                 c.stock_records, GREATEST(c.counted_at,obs.at) AS counted_at, obs.sku AS observed_sku,
                 p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
-                o.qty AS ordered_qty, o.orders, o.picked_orders
+                o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
@@ -111,6 +117,7 @@ async function loadStock(client, companyId) {
       // Три числа, которые продавец и звонит спрашивать.
       onHand: stockKnown ? onHand : null,
       ordered,
+      blockedOrdered: Number(r.blocked_qty || 0),
       orderedOrders: Number(r.orders || 0),
       // Count of fully assembled orders, not the number of picked units.
       orderedPicked: Number(r.picked_orders || 0),

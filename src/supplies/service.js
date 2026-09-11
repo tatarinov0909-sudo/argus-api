@@ -81,13 +81,13 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   }
 
   const orders = await client.query(
-    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.supply_id, c.name AS company_name,
+    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id, c.name AS company_name,
             (NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
              OR EXISTS (SELECT 1 FROM invoice_items ii
                          WHERE ii.invoice_id = i.id
                            AND (${UNPICKABLE_SQL}))) AS has_unpickable
        FROM invoices i JOIN companies c ON c.id = i.company_id
-      WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[])`,
+      WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[]) ORDER BY i.id FOR UPDATE OF i`,
     [warehouseId, invoiceIds],
   );
   if (orders.rows.length !== invoiceIds.length) {
@@ -99,6 +99,8 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
     throw new HttpError(400, `«${wrongDirection.number}» — это не заказ на отгрузку`);
   }
   const alreadyIn = orders.rows.find((o) => o.supply_id);
+  const closed = orders.rows.find((o) => o.mp_closed_at || o.status === 'shipped');
+  if (closed) throw new HttpError(409, `«${closed.number}» уже закрыт. Его нельзя включить в новую поставку.`);
   if (alreadyIn) {
     throw new HttpError(409, `«${alreadyIn.number}» уже в другой поставке`);
   }
@@ -158,6 +160,9 @@ async function contents(client, warehouseId, supplyId) {
     [warehouseId, supplyId],
   );
   if (!head.rows[0]) throw new HttpError(404, 'Поставка не найдена');
+  const closed = await client.query(`SELECT number FROM invoices WHERE warehouse_id=$1 AND supply_id=$2
+    AND mp_closed_at IS NOT NULL AND status <> 'shipped' LIMIT 1`, [warehouseId, supplyId]);
+  if (closed.rows.length) throw new HttpError(409, `Заказ «${closed.rows[0].number}» закрыт на WB. Сначала откройте сверку заказов WB; печать поставки остановлена.`);
 
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
@@ -274,11 +279,18 @@ const NEXT = { collecting: 'ready', ready: 'shipped' };
 
 async function advance(client, warehouseId, supplyId, { to, destination = null, actor }) {
   const cur = await client.query(
-    `SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2`,
+    `SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
   );
   if (!cur.rows[0]) throw new HttpError(404, 'Поставка не найдена');
   const from = cur.rows[0].status;
+
+  // Synchronization and picking lock these same rows. A cancellation cannot
+  // slip between checking a supply and marking its orders as shipped.
+  const orderLocks = await client.query(`SELECT id, number, mp_closed_at FROM invoices
+    WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
+  const ended = orderLocks.rows.find(o => o.mp_closed_at);
+  if (ended) throw new HttpError(409, `Заказ «${ended.number}» закрыт на WB. Руководитель должен разобрать его в сверке заказов WB.`);
 
   if (NEXT[from] !== to) {
     throw new HttpError(409, from === 'shipped'
@@ -327,7 +339,9 @@ async function advance(client, warehouseId, supplyId, { to, destination = null, 
   // на складе, которого там уже нет.
   if (to === 'shipped') {
     await client.query(
-      `UPDATE invoices SET status = 'shipped' WHERE warehouse_id = $1 AND supply_id = $2`,
+      `UPDATE invoices i SET status='shipped', shipped_at=COALESCE(i.shipped_at,s.shipped_at)
+       FROM supplies s WHERE i.warehouse_id=$1 AND i.supply_id=$2
+         AND s.id=i.supply_id AND s.company_id=i.company_id`,
       [warehouseId, supplyId],
     );
   }
@@ -393,6 +407,7 @@ async function pendingByCompany(client, warehouseId) {
         AND i.direction = 'out'
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
+        AND i.mp_closed_at IS NULL
       GROUP BY c.id, c.name, i.source
       ORDER BY count(DISTINCT i.id) DESC, c.name`,
     [warehouseId],
@@ -425,6 +440,7 @@ async function pendingOrders(client, warehouseId, companyId) {
         AND i.direction = 'out'
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
+        AND i.mp_closed_at IS NULL
       ORDER BY i.created_at DESC, i.number`,
     [warehouseId, companyId],
   );
@@ -460,7 +476,7 @@ async function pendingOrders(client, warehouseId, companyId) {
 // а уехавшую поставку не разбирают в базе, её разгружают руками.
 async function disband(client, warehouseId, supplyId, { actor }) {
   const s = await client.query(
-    'SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2',
+    'SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
     [warehouseId, supplyId],
   );
   const supply = s.rows[0];
@@ -470,6 +486,7 @@ async function disband(client, warehouseId, supplyId, { actor }) {
       `Поставка «${supply.number}» уже ${STATUS_NAMES[supply.status] || supply.status}`
       + ' — разобрать её в Аргусе нельзя.');
   }
+  await client.query(`SELECT id FROM invoices WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
   // Отобранное вернуть в очередь молча нельзя: товар уже снят с полки, и
   // «вернулось в очередь» означало бы, что его отберут второй раз.
   const picked = await client.query(

@@ -1,5 +1,6 @@
 const wb = require('./wb');
 const credentials = require('./credentials');
+const statuses = require('./statuses');
 
 // Забрать заказы с площадки и превратить их в накладные склада.
 //
@@ -35,16 +36,28 @@ async function loadMapping(client, warehouseId, companyId, marketplace) {
   // однозначно, и угадывать нельзя: выберем не тот товар — отгрузим не то.
   // Такой номер просто перестаёт быть ключом, решает артикул или штрихкод.
   const ambiguous = new Set();
+  const ambiguousArticles = new Set();
+  const ambiguousBarcodes = new Set();
   for (const row of r.rows) {
     if (row.mp_sku) {
       const key = String(row.mp_sku);
       if (byNm.has(key) && byNm.get(key) !== row.sku) ambiguous.add(key);
       byNm.set(key, row.sku);
     }
-    if (row.mp_article) byArticle.set(String(row.mp_article), row.sku);
-    if (row.mp_barcode) byBarcode.set(String(row.mp_barcode), row.sku);
+    if (row.mp_article) {
+      const key = String(row.mp_article);
+      if (byArticle.has(key) && byArticle.get(key) !== row.sku) ambiguousArticles.add(key);
+      byArticle.set(key, row.sku);
+    }
+    if (row.mp_barcode) {
+      const key = String(row.mp_barcode);
+      if (byBarcode.has(key) && byBarcode.get(key) !== row.sku) ambiguousBarcodes.add(key);
+      byBarcode.set(key, row.sku);
+    }
   }
   for (const key of ambiguous) byNm.delete(key);
+  for (const key of ambiguousArticles) byArticle.delete(key);
+  for (const key of ambiguousBarcodes) byBarcode.delete(key);
   return (order) => {
     if (order.nmId && byNm.has(order.nmId)) return byNm.get(order.nmId);
     // дальше — артикул и штрихкод: они же выручают, когда номер оказался общим
@@ -73,10 +86,14 @@ async function loadNames(client, warehouseId, companyId, skus) {
 const QTY_PER_ORDER = 1;
 
 async function pullWildberries(client, warehouseId, { companyId }) {
+  const lock = await client.query(`SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked`,
+    [`wb-sync:${warehouseId}:${companyId}`]);
+  if (!lock.rows[0]?.locked) return { marketplace: 'wb', skipped: true, seen: 0, created: 0, existed: 0, unmapped: [] };
   const token = await credentials.tokenFor(client, warehouseId, companyId, 'wb');
   const orders = await wb.newOrders(token);
   await credentials.markUsed(client, warehouseId, companyId, 'wb');
-  return importOrders(client, warehouseId, { companyId, orders });
+  const imported = await importOrders(client, warehouseId, { companyId, orders });
+  return { ...imported, statuses: await statuses.reconcile(client, warehouseId, companyId, token) };
 }
 
 // Сохранение заказов отдельно от их получения.
@@ -181,12 +198,16 @@ async function pullAll(client, warehouseId) {
   const results = [];
   for (const pair of pairs) {
     if (pair.marketplace !== 'wb') continue;
+    await client.query('SAVEPOINT marketplace_seller');
     try {
       results.push({
         company: pair.company,
         ...await pullWildberries(client, warehouseId, { companyId: pair.companyId }),
       });
+      await client.query('RELEASE SAVEPOINT marketplace_seller');
     } catch (err) {
+      await client.query('ROLLBACK TO SAVEPOINT marketplace_seller');
+      await client.query('RELEASE SAVEPOINT marketplace_seller');
       results.push({ company: pair.company, marketplace: pair.marketplace, error: err.message });
     }
   }

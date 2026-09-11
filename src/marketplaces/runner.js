@@ -47,6 +47,8 @@ async function runOnce() {
           console.log(`маркетплейсы: ${r.company} — новых заказов ${r.created}`
             + `, не сопоставлено ${r.unmapped.length}`);
         }
+        if (r.statuses?.error) console.error(`маркетплейсы: ${r.company} — ${r.statuses.error}`);
+        if (r.statuses?.closed) console.log(`маркетплейсы: ${r.company} — закрыто по WB ${r.statuses.closed}, на сверку ${r.statuses.conflicts}`);
       }
       // Separate transactions: a catalog failure cannot roll back received orders.
       const pairs = await withTenantContext({ warehouseId }, client => credentials.list(client, warehouseId));

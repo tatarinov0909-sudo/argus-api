@@ -21,9 +21,8 @@ const HOSTS = {
   marketplace: 'https://marketplace-api.wildberries.ru',
 };
 
-// У WB на каждую категорию свой поддомен и своя квота. Ошибки отдаются json-ом
-// с полем detail — его и показываем: «401 Unauthorized» владельцу ничего не
-// говорит, «token is expired» говорит всё.
+// Each category has its own host/quota. Provider error bodies may echo request
+// details, so return a useful local error without copying tokens or raw payloads.
 async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -37,7 +36,7 @@ async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000
     });
   } catch (err) {
     if (err.name === 'AbortError') throw new HttpError(504, 'Wildberries не ответил вовремя');
-    throw new HttpError(502, `Не удалось связаться с Wildberries: ${err.message}`);
+    throw new HttpError(502, 'Не удалось связаться с Wildberries');
   } finally {
     clearTimeout(timer);
   }
@@ -47,13 +46,12 @@ async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000
   try { json = text ? JSON.parse(text) : null; } catch { json = null; }
 
   if (!res.ok) {
-    const detail = json?.detail || json?.errorText || text.slice(0, 200);
-    if (res.status === 401) throw new HttpError(401, `Ключ Wildberries не принят: ${detail}`);
+    if (res.status === 401) throw new HttpError(401, 'Ключ Wildberries не принят или срок его действия закончился');
     if (res.status === 403) {
-      throw new HttpError(403, `У ключа нет доступа к этому разделу: ${detail}`);
+      throw new HttpError(403, 'У ключа нет доступа к этому разделу Wildberries');
     }
     if (res.status === 429) throw new HttpError(429, 'Wildberries просит сбавить темп');
-    throw new HttpError(502, `Wildberries ответил ${res.status}: ${detail}`);
+    throw new HttpError(502, `Wildberries ответил с ошибкой ${res.status}`);
   }
   return json;
 }
@@ -116,4 +114,21 @@ async function productCards(token, cursor = {}) {
       cursor: { ...cursor, limit: 100 }, filter: { withPhoto: -1 } } },
   });
 }
-module.exports = { sellerInfo, warehouses, newOrders, productCards };
+
+// POST reads statuses; it does not confirm/cancel an order on WB.
+// https://dev.wildberries.ru/en/openapi/orders-fbs — Get Assembly Orders Statuses.
+async function orderStatuses(token, orderIds) {
+  if (!Array.isArray(orderIds) || orderIds.length < 1 || orderIds.length > 1000
+      || orderIds.some(id => !/^\d+$/.test(String(id))
+        || !Number.isSafeInteger(Number(id)) || Number(id) <= 0)) {
+    throw new HttpError(400, 'Для проверки WB нужны от 1 до 1000 корректных номеров заказов');
+  }
+  const r = await call(token, 'marketplace', '/api/v3/orders/status', {
+    method: 'POST', body: { orders: orderIds.map(Number) },
+  });
+  if (!r || !Array.isArray(r.orders)) {
+    throw new HttpError(502, 'Wildberries не передал список статусов заказов');
+  }
+  return r.orders;
+}
+module.exports = { sellerInfo, warehouses, newOrders, productCards, orderStatuses };

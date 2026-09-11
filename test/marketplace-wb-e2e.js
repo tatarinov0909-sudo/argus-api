@@ -67,6 +67,8 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
   // настоящие: именно там живут ошибки, ради которых пишется тест.
   const realSellerInfo = wb.sellerInfo;
   const realNewOrders = wb.newOrders;
+  const realOrderStatuses = wb.orderStatuses;
+  wb.orderStatuses = async (_, ids) => ids.map(id => ({ id: Number(id), supplierStatus:'new', wbStatus:'waiting' }));
   wb.sellerInfo = async () => ({
     name: 'ООО «Тест»', inn: '1234567890', tradeMark: 'Test', sellerId: 'sid-1',
   });
@@ -104,12 +106,13 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       const present = forbidden.filter((n) => typeof wb[n] === 'function');
       assert.deepEqual(present, [], `появились методы записи: ${present.join(', ')}`);
     });
-    check('в исходнике нет PUT, PATCH и DELETE; POST только для чтения каталога', () => {
+    check('в исходнике нет PUT, PATCH и DELETE; POST только для чтения каталога и статусов', () => {
       const src = require('fs').readFileSync(require.resolve('../src/marketplaces/wb.js'), 'utf8');
       const calls = src.match(/method:\s*'(PUT|PATCH|DELETE)'/g) || [];
       assert.deepEqual(calls, [], `найдены изменяющие вызовы: ${calls.join(', ')}`);
-      assert.equal((src.match(/method:\s*'POST'/g)||[]).length, 1);
+      assert.equal((src.match(/method:\s*'POST'/g)||[]).length, 2);
       assert.ok(src.includes("'/content/v2/get/cards/list'"));
+      assert.ok(src.includes("'/api/v3/orders/status'"));
     });
 
     // ---------- Подготовка склада ----------
@@ -408,6 +411,7 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
   } finally {
     wb.sellerInfo = realSellerInfo;
     wb.newOrders = realNewOrders;
+    wb.orderStatuses = realOrderStatuses;
     server.close();
   }
 

@@ -1,6 +1,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const outbox = require('../sync/outbox');
+const { validateCountLines, keyOf } = require('./count');
 
 // Пересчёт ячейки: назначение, счёт, решение владельца.
 //
@@ -198,15 +199,17 @@ async function createRun(client, warehouseId, ownerId) {
 async function cellContents(client, warehouseId, cellBlockId) {
   const r = await client.query(
     `SELECT cs.sku, cs.company_id, cs.quality, SUM(cs.qty)::numeric AS qty,
+            c.name AS company_name,
             COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
-                              WHERE ii.warehouse_id = $1 AND ii.sku = cs.sku
+                              WHERE ii.warehouse_id = $1 AND ii.company_id = cs.company_id AND ii.sku = cs.sku
                               ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
             MAX(cs.updated_at) AS updated_at
      FROM cell_stock cs
      LEFT JOIN products p ON p.warehouse_id = cs.warehouse_id
        AND p.company_id = cs.company_id AND p.sku = cs.sku
+     LEFT JOIN companies c ON c.id = cs.company_id AND c.warehouse_id = cs.warehouse_id
      WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2 AND cs.qty > 0
-     GROUP BY cs.sku, cs.company_id, cs.quality, p.name
+     GROUP BY cs.sku, cs.company_id, cs.quality, p.name, c.name
      ORDER BY name`,
     [warehouseId, cellBlockId],
   );
@@ -214,10 +217,93 @@ async function cellContents(client, warehouseId, cellBlockId) {
     sku: x.sku,
     name: x.name,
     companyId: x.company_id,
+    companyName: x.company_name,
     quality: x.quality,
     qty: Number(x.qty),
     updatedAt: x.updated_at,
   }));
+}
+
+async function searchProducts(client, warehouseId, query) {
+  const q = typeof query === 'string' ? query.trim() : '';
+  if (q.length < 2 || q.length > 120) {
+    throw new HttpError(400, 'Введите от 2 до 120 символов названия или артикула');
+  }
+  const r = await client.query(
+    `WITH catalog AS (
+       SELECT p.sku, p.company_id, p.name, 0 AS priority FROM products p
+       WHERE p.warehouse_id=$1 AND (p.sku ILIKE $2 OR p.name ILIKE $2)
+       UNION ALL
+       SELECT ii.sku, ii.company_id, ii.name, 1 FROM invoice_items ii
+       WHERE ii.warehouse_id=$1 AND (ii.sku ILIKE $2 OR ii.name ILIKE $2)
+     ), chosen AS (
+       SELECT DISTINCT ON (x.company_id,x.sku) x.sku,x.company_id,x.name,c.name AS company_name
+       FROM catalog x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1
+       WHERE x.sku IS NOT NULL AND x.sku<>''
+       ORDER BY x.company_id,x.sku,x.priority,x.name
+     ) SELECT * FROM chosen ORDER BY company_name,name,sku LIMIT 30`,
+    [warehouseId, `%${q.replace(/[\\%_]/g, '\\$&')}%`],
+  );
+  return r.rows.map((p) => ({ sku: p.sku, name: p.name, companyId: p.company_id, companyName: p.company_name }));
+}
+
+// Validation is independent of what the browser offered in its search results.
+// Existing stock and invoice lines remain countable even without a product card.
+async function identifyCountLines(client, warehouseId, lines) {
+  if (!lines.length) return lines;
+  const r = await client.query(
+    `WITH requested AS (
+       SELECT DISTINCT sku,"companyId" AS company_id
+       FROM jsonb_to_recordset($2::jsonb) AS x(sku text,"companyId" uuid)
+     ) SELECT x.sku,x.company_id,c.name AS company_name,COALESCE(p.name,ii.name,x.sku) AS name
+     FROM requested x JOIN companies c ON c.id=x.company_id AND c.warehouse_id=$1
+     LEFT JOIN products p ON p.warehouse_id=$1 AND p.company_id=x.company_id AND p.sku=x.sku
+     LEFT JOIN LATERAL (
+       SELECT id,name FROM invoice_items
+       WHERE warehouse_id=$1 AND company_id=x.company_id AND sku=x.sku ORDER BY id DESC LIMIT 1
+     ) ii ON true
+     WHERE p.id IS NOT NULL OR ii.id IS NOT NULL OR EXISTS (
+       SELECT 1 FROM cell_stock s WHERE s.warehouse_id=$1 AND s.company_id=x.company_id AND s.sku=x.sku
+     )`,
+    [warehouseId, JSON.stringify(lines)],
+  );
+  const known = new Map(r.rows.map((row) => [`${row.company_id}|${row.sku}`, row]));
+  return lines.map((line) => {
+    const product = known.get(`${line.companyId}|${line.sku}`);
+    if (!product) throw new HttpError(400, 'Товар не найден у выбранного продавца этого склада. Уточните карточку товара');
+    return { ...line, name: product.name, companyName: product.company_name };
+  });
+}
+
+async function lockCell(client, warehouseId, cellBlockId, lockStock = false) {
+  try {
+    const r = await client.query(
+      `SELECT stock_revision FROM cell_blocks WHERE id=$1 AND warehouse_id=$2 FOR UPDATE NOWAIT`,
+      [cellBlockId, warehouseId],
+    );
+    if (!r.rows[0]) throw new HttpError(404, 'Ячейка не найдена');
+    if (lockStock) {
+      // Other operations may hold a stock row before their revision trigger.
+      // Do not wait in reverse lock order: reject and keep every row untouched.
+      await client.query(
+        `SELECT id FROM cell_stock WHERE cell_block_id=$1 AND warehouse_id=$2 ORDER BY id FOR UPDATE NOWAIT`,
+        [cellBlockId, warehouseId],
+      );
+    }
+    return String(r.rows[0].stock_revision);
+  } catch (err) {
+    if (err.code === '55P03' || err.code === '40P01') {
+      throw new HttpError(409, 'В ячейке сейчас идёт работа. Повторите после завершения операции');
+    }
+    throw err;
+  }
+}
+
+function requireFresh(task, revision) {
+  if (task.opened_stock_revision === null || task.opened_stock_revision === undefined
+    || String(task.opened_stock_revision) !== revision) {
+    throw new HttpError(409, 'После открытия пересчёта содержимое ячейки менялось. Назначьте «Посчитать заново»');
+  }
 }
 
 async function listTasks(client, warehouseId, statuses) {
@@ -250,17 +336,19 @@ async function listTasks(client, warehouseId, statuses) {
 // считается относительно ЭТОГО снимка, а не того, что будет через полчаса.
 async function openTask(client, warehouseId, taskId) {
   const t = await client.query(
-    `SELECT * FROM inventory_tasks WHERE id = $1 AND warehouse_id = $2`,
+    `SELECT * FROM inventory_tasks WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
     [taskId, warehouseId],
   );
   const task = t.rows[0];
   if (!task) throw new HttpError(404, 'Задание не найдено');
   if (task.status !== 'pending') throw new HttpError(409, 'Это задание уже посчитано');
 
+  const revision = await lockCell(client, warehouseId, task.cell_block_id);
   const contents = await cellContents(client, warehouseId, task.cell_block_id);
-  await client.query(
-    `UPDATE inventory_tasks SET expected = $2, opened_at = now() WHERE id = $1`,
-    [taskId, JSON.stringify(contents)],
+  const snapshot = await client.query(
+    `UPDATE inventory_tasks SET expected = $2, opened_at = now(), opened_stock_revision=$3,
+     opened_snapshot_id=gen_random_uuid() WHERE id = $1 RETURNING opened_snapshot_id`,
+    [taskId, JSON.stringify(contents), revision],
   );
   const label = await client.query(
     `SELECT wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
@@ -273,11 +361,12 @@ async function openTask(client, warehouseId, taskId) {
     label: cellLabel(label.rows[0]),
     reason: task.reason,
     expected: contents,
+    snapshotId: snapshot.rows[0].opened_snapshot_id,
   };
 }
 
 // Работник посчитал. Здесь ничего не исправляется — только записывается.
-async function submitCount(client, warehouseId, taskId, { lines, note, workerKeyId }) {
+async function submitCount(client, warehouseId, taskId, { lines, note, workerKeyId, snapshotId }) {
   const t = await client.query(
     `SELECT * FROM inventory_tasks WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
     [taskId, warehouseId],
@@ -286,32 +375,13 @@ async function submitCount(client, warehouseId, taskId, { lines, note, workerKey
   if (!task) throw new HttpError(404, 'Задание не найдено');
   if (task.status !== 'pending') throw new HttpError(409, 'Это задание уже посчитано');
   if (!task.opened_at) throw new HttpError(409, 'Сначала откройте ячейку — нужен снимок остатка');
-  if (!Array.isArray(lines)) throw new HttpError(400, 'Нужен список посчитанного');
-
-  // Если в ячейке шла работа, пока считали, — счёт устарел. Принять его значит
-  // внести ошибку вместо того, чтобы её убрать.
-  const moved = await client.query(
-    `SELECT 1 FROM cell_stock
-     WHERE warehouse_id = $1 AND cell_block_id = $2 AND updated_at > $3 LIMIT 1`,
-    [warehouseId, task.cell_block_id, task.opened_at],
-  );
-  if (moved.rows[0]) {
-    throw new HttpError(409, 'В ячейке была работа, пока вы считали — посчитайте заново');
+  if (!task.opened_snapshot_id || typeof snapshotId !== 'string'
+    || snapshotId.toLowerCase() !== task.opened_snapshot_id) {
+    throw new HttpError(409, 'Задание открыли повторно или в другом окне. Откройте ячейку заново и повторите пересчёт');
   }
-
-  const counted = lines
-    .filter((l) => l && l.sku)
-    .map((l) => ({
-      sku: String(l.sku),
-      companyId: l.companyId || null,
-      quality: l.quality || 'good',
-      qty: Number(l.qty),
-    }));
-  if (counted.some((l) => !Number.isFinite(l.qty) || l.qty < 0)) {
-    throw new HttpError(400, 'Количество не может быть отрицательным');
-  }
-
+  requireFresh(task, await lockCell(client, warehouseId, task.cell_block_id));
   const expected = task.expected || [];
+  const counted = await identifyCountLines(client, warehouseId, validateCountLines(lines, expected));
   const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 500) : null;
   // Отметка «нашёл лишнее» — это расхождение, даже если посчитанное сошлось
   // строка в строку: в ячейке лежит то, чего Аргус не знает.
@@ -330,8 +400,6 @@ async function submitCount(client, warehouseId, taskId, { lines, note, workerKey
 
 // Сравниваем по тройке «артикул + продавец + состояние»: 40 годных и 40
 // бракованных того же товара — не одно и то же.
-const keyOf = (l) => `${l.sku}|${l.companyId || ''}|${l.quality || 'good'}`;
-
 function sameContents(expected, counted) {
   const a = new Map(expected.map((l) => [keyOf(l), Number(l.qty)]));
   const b = new Map(counted.map((l) => [keyOf(l), Number(l.qty)]));
@@ -358,9 +426,9 @@ function diffOf(expected, counted) {
 }
 
 // Решение владельца. Только здесь остаток вообще меняется.
-async function resolveTask(client, warehouseId, taskId, { decision, ownerId }) {
-  if (decision !== 'apply' && decision !== 'reject') {
-    throw new HttpError(400, 'Решение может быть apply или reject');
+async function resolveTask(client, warehouseId, taskId, { decision, ownerId, staffKeyId }) {
+  if (!['apply', 'reject', 'recount'].includes(decision)) {
+    throw new HttpError(400, 'Решение может быть apply, reject или recount');
   }
   const t = await client.query(
     `SELECT * FROM inventory_tasks WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
@@ -375,21 +443,37 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId }) {
   if (decision === 'reject') {
     await client.query(
       `UPDATE inventory_tasks SET status = 'rejected', resolved_at = now(),
-       resolved_by_owner_id = $2 WHERE id = $1`,
-      [taskId, ownerId || null],
+       resolved_by_owner_id = $2, resolved_by_staff_key_id=$3 WHERE id = $1`,
+      [taskId, ownerId || null, staffKeyId || null],
     );
     return { applied: false, changes: [] };
   }
 
+  if (decision === 'recount') {
+    await client.query(
+      `UPDATE inventory_tasks SET status='pending', expected=NULL, counted=NULL, note=NULL,
+       opened_at=NULL, opened_stock_revision=NULL, opened_snapshot_id=NULL, counted_at=NULL, worker_key_id=NULL,
+       resolved_at=NULL, resolved_by_owner_id=NULL, resolved_by_staff_key_id=NULL WHERE id=$1`, [taskId],
+    );
+    return { applied: false, recount: true, changes: [] };
+  }
+
+  if (task.note) {
+    throw new HttpError(409, 'Остался неуказанный товар из отметки работника. Назначьте пересчёт с выбором товара и количества');
+  }
+  requireFresh(task, await lockCell(client, warehouseId, task.cell_block_id, true));
+  const counted = await identifyCountLines(client, warehouseId,
+    validateCountLines(task.counted, task.expected || []));
+
   // Принять пересчёт — значит сделать ячейку такой, какой её увидел человек.
   // Стираем всё, что числилось, и кладём посчитанное: любая попытка «поправить
   // разницу» построчно рано или поздно оставит хвост, которого нет на полке.
-  const changes = diffOf(task.expected || [], task.counted || []);
+  const changes = diffOf(task.expected || [], counted);
   await client.query(
     `DELETE FROM cell_stock WHERE warehouse_id = $1 AND cell_block_id = $2`,
     [warehouseId, task.cell_block_id],
   );
-  for (const line of (task.counted || [])) {
+  for (const line of counted) {
     if (Number(line.qty) <= 0) continue;
     await client.query(
       `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
@@ -425,17 +509,18 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId }) {
     await client.query(
       `INSERT INTO stock_operations
          (warehouse_id, company_id, kind, sku, qty, to_cell_block_id, details, worker_key_id)
-       VALUES ($1, $2, 'inventory', $3, $4, $5, $6, NULL)`,
+       VALUES ($1, $2, 'inventory', $3, $4, $5, $6, $7)`,
       [warehouseId, line.companyId || null, line.sku, Math.abs(line.diff), task.cell_block_id,
         JSON.stringify({ expectedQty: line.expectedQty, countedQty: line.countedQty,
-          quality: line.quality, taskId })],
+          quality: line.quality, taskId, countedByStaffKeyId: task.worker_key_id,
+          resolvedByOwnerId: ownerId || null, resolvedByStaffKeyId: staffKeyId || null }), task.worker_key_id],
     );
   }
 
   await client.query(
     `UPDATE inventory_tasks SET status = 'applied', resolved_at = now(),
-     resolved_by_owner_id = $2 WHERE id = $1`,
-    [taskId, ownerId || null],
+     resolved_by_owner_id = $2, resolved_by_staff_key_id=$3 WHERE id = $1`,
+    [taskId, ownerId || null, staffKeyId || null],
   );
   return { applied: true, changes };
 }
@@ -597,4 +682,5 @@ function plural(n, one, few, many) {
 module.exports = {
   DEFAULTS, getSettings, saveSettings, pickCells, createRun,
   cellContents, listTasks, openTask, submitCount, resolveTask, diffOf, advice,
+  searchProducts,
 };

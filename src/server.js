@@ -2,6 +2,7 @@ require('dotenv').config();
 const { createApp } = require('./app');
 const alerts = require('./alerts/runner');
 const marketplaces = require('./marketplaces/runner');
+const leadNotifications = require('./leads/runner');
 
 const app = createApp();
 const port = process.env.PORT || 3000;
@@ -12,4 +13,5 @@ app.listen(port, () => {
   alerts.start();
   // Опрос площадок — только чтение: заказы забираем, ничего не меняем.
   marketplaces.start();
+  leadNotifications.start();
 });

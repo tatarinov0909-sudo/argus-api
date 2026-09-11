@@ -1,7 +1,7 @@
 // Execute only with an explicitly named disposable database.
 const assert = require('node:assert/strict');
 const dbName = new URL(process.env.DATABASE_URL || 'postgres://invalid/').pathname;
-if (!/^\/argus_seller_test_/.test(dbName)) throw Error('Requires a dedicated argus_seller_test_* database');
+if (!/^\/argus_seller_test_/.test(dbName) && !(dbName === '/argus_pilot_test_20260911' && process.env.ARGUS_TEST_ALLOW_WRITES === '1')) throw Error('Requires an explicitly provisioned isolated test database');
 const { createApp } = require('../src/app');
 const { pool, withTenantContext } = require('../src/db/pool');
 

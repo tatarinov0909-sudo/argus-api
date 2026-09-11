@@ -26,6 +26,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
      FROM invoices i JOIN companies c ON c.id = i.company_id
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
        AND i.status IN ('open', 'in_progress')
+       AND i.mp_closed_at IS NULL
        AND ($2::uuid[] IS NULL OR i.id = ANY($2::uuid[]))
      ORDER BY i.created_at`,
     [warehouseId, invoiceIds.length ? invoiceIds : null],

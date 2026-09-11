@@ -9,6 +9,9 @@
 //   JWT_SECRET=test node test/inventory-e2e.js
 
 const assert = require('node:assert');
+if (!process.env.DATABASE_URL?.includes('test') || process.env.ARGUS_TEST_ALLOW_WRITES !== '1') {
+  throw new Error('Inventory E2E requires an isolated test database and ARGUS_TEST_ALLOW_WRITES=1');
+}
 const { createApp } = require('../src/app');
 const { withTenantContext } = require('../src/db/pool');
 
@@ -29,7 +32,10 @@ function check(name, fn) {
   }
 }
 
+const snapshots = new Map();
 async function api(method, path, { token, body } = {}) {
+  const taskPath = path.match(/^\/api\/inventory\/tasks\/([^/]+)\/(open|count)$/);
+  if (taskPath?.[2] === 'count') body = { ...body, snapshotId: snapshots.get(taskPath[1]) };
   const res = await fetch(BASE + path, {
     method,
     headers: {
@@ -41,6 +47,7 @@ async function api(method, path, { token, body } = {}) {
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+  if (taskPath?.[2] === 'open' && res.status === 200) snapshots.set(taskPath[1], json.snapshotId);
   return { status: res.status, body: json };
 }
 
@@ -95,6 +102,10 @@ const whIdOf = (token) => JSON.parse(
 
     await receive('PB-A', 'Печенье овсяное', 100, blocks[0].id, `ПРХ-A-${stamp}`);
     await receive('PB-B', 'Мармелад', 40, blocks[1].id, `ПРХ-B-${stamp}`);
+    const lostCard = await api('POST', '/api/products', {
+      token: ownerToken, body: { companyId, sku: 'PB-LOST', name: 'Найденный товар для теста' },
+    });
+    assert.equal(lostCard.status, 201, JSON.stringify(lostCard.body));
 
     // ---------- Работник не начинает пересчёт сам ----------
     const workerRun = await api('POST', '/api/inventory/runs', { token: workerToken, body: {} });
@@ -197,7 +208,10 @@ const whIdOf = (token) => JSON.parse(
     // Это два расхождения сразу — одного не стало, другое появилось.
     const found = await api('POST', `/api/inventory/tasks/${second.id}/count`, {
       token: workerToken,
-      body: { lines: [{ sku: 'PB-LOST', companyId, quality: 'good', qty: 7 }] },
+      body: { lines: [
+        { sku: 'PB-B', companyId, quality: 'good', qty: 0 },
+        { sku: 'PB-LOST', companyId, quality: 'good', qty: 7 },
+      ] },
     });
     check('расхождение уходит владельцу, а не применяется само', () => {
       assert.equal(found.status, 200, JSON.stringify(found.body));

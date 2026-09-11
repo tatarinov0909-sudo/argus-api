@@ -3,7 +3,6 @@ const { requireAuth, requireRole, requireGrant } = require('../middleware/auth')
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
-const { CELL_CAPACITY_UNITS } = require('./fill');
 const { moveStock } = require('./move');
 const journal = require('../journal/repository');
 
@@ -377,14 +376,13 @@ router.post('/blocks/merge-rect', requireAuth, requireGrant('warehouse'), async 
       const updated = await client.query(
         `UPDATE cell_blocks
          SET rack_start = $2, rack_end = $3, tier_start = $4, tier_end = $5,
-             state = CASE WHEN EXISTS (SELECT 1 FROM cell_stock WHERE cell_block_id = $1)
+             state = CASE WHEN EXISTS (SELECT 1 FROM cell_stock WHERE cell_block_id = $1 AND qty>0)
                           THEN 'occupied'::cell_state ELSE 'empty'::cell_state END,
-             fill_pct = COALESCE((SELECT LEAST(100, GREATEST(1, round(SUM(qty) / $6::numeric * 100)::int))
-                                  FROM cell_stock WHERE cell_block_id = $1), 0),
+             fill_pct = NULL,
              updated_at = now()
          WHERE id = $1
          RETURNING id, warehouse_row_id, rack_start, rack_end, tier_start, tier_end, state, fill_pct`,
-        [keeper.id, rackLo, rackHi, tierLo, tierHi, CELL_CAPACITY_UNITS],
+        [keeper.id, rackLo, rackHi, tierLo, tierHi],
       );
       return updated.rows[0];
     });

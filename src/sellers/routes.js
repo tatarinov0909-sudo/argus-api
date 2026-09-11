@@ -7,6 +7,7 @@ const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 
 const { loadStock } = require('./stock');
+const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
 const router = express.Router();
@@ -203,11 +204,16 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => (
       await client.query(
-        `SELECT i.id, i.number, i.status, i.source, i.created_at,
+        `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at,
+                i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
+                i.mp_close_reason, i.mp_stock_returned_at,
+                (i.mp_close_reason='fulfilled' OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
+                        WHERE si.invoice_id=i.id AND sr.company_id=$1 AND si.company_id=$1 AND sr.picked_qty>0))
+                  AND i.mp_closed_at IS NOT NULL AND i.mp_stock_returned_at IS NULL AND i.status<>'shipped' AS stock_conflict,
                 ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-         ORDER BY (i.status = 'shipped'), i.created_at DESC, i.id, ii.id
+         ORDER BY (i.status = 'shipped' OR i.mp_closed_at IS NOT NULL), i.created_at DESC, i.id, ii.id
          LIMIT 1001`, [companyId],
       )
     ).rows);
@@ -241,13 +247,14 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
 
     const out = await withTenantContext(ctx, async (client) => {
       const shipped = await client.query(
-        `SELECT sr.id, sr.picked_qty AS qty, sr.finished_at AS at,
+        `SELECT sr.id, sr.picked_qty AS qty, COALESCE(i.shipped_at,s.shipped_at) AS at,
                 ii.name, ii.sku, i.number AS invoice_number, i.source
          FROM shipping_records sr
          JOIN invoice_items ii ON ii.id = sr.invoice_item_id
          JOIN invoices i ON i.id = ii.invoice_id
-         WHERE sr.company_id = $1 AND sr.picked_qty IS NOT NULL AND i.status = 'shipped'
-         ORDER BY sr.finished_at DESC NULLS LAST
+         LEFT JOIN supplies s ON s.id=i.supply_id AND s.company_id=$1 AND s.status='shipped'
+         WHERE sr.company_id = $1 AND ii.company_id=$1 AND i.company_id=$1 AND sr.picked_qty IS NOT NULL AND i.status = 'shipped'
+         ORDER BY COALESCE(i.shipped_at,s.shipped_at) DESC NULLS LAST,sr.id DESC
          LIMIT 300`,
         [companyId],
       );
@@ -257,7 +264,7 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
          FROM return_records rr
          JOIN invoice_items ii ON ii.id = rr.invoice_item_id
          JOIN invoices i ON i.id = ii.invoice_id
-         WHERE rr.company_id = $1
+         WHERE rr.company_id = $1 AND ii.company_id=$1 AND i.company_id=$1
          ORDER BY rr.finished_at DESC
          LIMIT 300`,
         [companyId],
@@ -293,42 +300,16 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
   }
 });
 
-// A seller-scoped document history. Pick timestamps are never called departure dates.
+// History remains under seller RLS, including every page requested by its cursor.
 router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : '';
     if (!companyId || !sku || sku.length > 200) throw new HttpError(400, 'Укажите продавца и артикул');
-    const events = await withTenantContext(tenantContextFromAuth(req.auth), async (client) => {
-      const result = await client.query(
-        `SELECT * FROM (
-           SELECT rr.id, rr.finished_at AS at, 'received' AS kind,
-                  rr.accepted_qty AS qty, i.number AS document, NULL::text AS note,
-                  NULL::text AS quality, i.status::text AS status
-           FROM receiving_records rr
-           JOIN invoice_items ii ON ii.id = rr.invoice_item_id
-           JOIN invoices i ON i.id = ii.invoice_id
-           WHERE rr.company_id = $1 AND ii.sku = $2 AND rr.accepted_qty IS NOT NULL
-           UNION ALL
-           SELECT sr.id, sr.finished_at, 'picked', sr.picked_qty, i.number, NULL, NULL, i.status::text
-           FROM shipping_records sr
-           JOIN invoice_items ii ON ii.id = sr.invoice_item_id
-           JOIN invoices i ON i.id = ii.invoice_id
-           WHERE sr.company_id = $1 AND ii.sku = $2 AND sr.picked_qty IS NOT NULL
-           UNION ALL
-           SELECT rr.id, rr.finished_at, 'returned', rr.qty, i.number, rr.defect_note,
-                  rr.quality_bucket::text, i.status::text
-           FROM return_records rr
-           JOIN invoice_items ii ON ii.id = rr.invoice_item_id
-           JOIN invoices i ON i.id = ii.invoice_id
-           WHERE rr.company_id = $1 AND ii.sku = $2
-           UNION ALL
-           SELECT op.id, op.created_at, op.kind, op.qty, NULL, NULL, NULL, NULL
-           FROM stock_operations op WHERE op.company_id = $1 AND op.sku = $2
-         ) events ORDER BY at DESC NULLS LAST, id DESC LIMIT 201`, [companyId, sku]);
-      return result.rows;
-    });
-    res.json({ events: events.slice(0, 200).map(r => ({ ...r, qty: Number(r.qty) })), hasMore: events.length > 200 });
+    const page = readPage(req.query, companyId, sku);
+    const result = await withTenantContext(tenantContextFromAuth(req.auth),
+      client => loadHistory(client, companyId, sku, page));
+    res.set('Cache-Control', 'no-store').json(result);
   } catch (err) { next(err); }
 });
 

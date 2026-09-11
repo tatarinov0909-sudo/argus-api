@@ -26,12 +26,14 @@ router.get('/', requireAuth, async (req, res, next) => {
         // выглядят одинаково, пока не сказано, откуда они. Без этого поля
         // выгрузка честно подписывала «1С» под каждым заказом Wildberries.
         `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
-                i.source, i.external_id,
+                i.source, i.external_id, i.mp_status, i.mp_supplier_status,
+                i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
                 c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
+           AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
          ORDER BY i.created_at DESC`,
-        [direction || null],
+        [direction || null, req.auth.role === 'worker'],
       );
       return result.rows;
     });
@@ -49,6 +51,8 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     const invoice = await withTenantContext(ctx, async (client) => {
       const invoiceResult = await client.query(
         `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
+                i.source, i.mp_status, i.mp_supplier_status,
+                i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
                 c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id WHERE i.id = $1`,
         [id],

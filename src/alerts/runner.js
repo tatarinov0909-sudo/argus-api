@@ -93,7 +93,7 @@ async function maybeDigest(client, warehouseId) {
   const work = await client.query(
     `SELECT
        (SELECT COUNT(*)::int FROM invoices
-        WHERE warehouse_id = $1 AND direction = 'out' AND status IN ('open', 'in_progress')) AS to_pick,
+        WHERE warehouse_id = $1 AND direction = 'out' AND status IN ('open', 'in_progress') AND mp_closed_at IS NULL) AS to_pick,
        (SELECT COUNT(*)::int FROM invoices
         WHERE warehouse_id = $1 AND direction = 'in' AND status IN ('open', 'in_progress')) AS to_receive,
        (SELECT COUNT(*)::int FROM invoices

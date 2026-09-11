@@ -24,6 +24,13 @@ REVOKE DELETE ON journal_entries FROM argus_app;
 -- not just by which methods the repository happens to export.
 REVOKE UPDATE ON journal_entries FROM argus_app;
 
+-- Provisioning platform administrators is an operator action, never an app permission.
+DO $$ BEGIN
+  IF to_regclass('public.platform_administrators') IS NOT NULL THEN
+    REVOKE INSERT,UPDATE,DELETE ON platform_administrators FROM argus_app;
+  END IF;
+END $$;
+
 -- Login lookups for staff/seller keys run as SECURITY DEFINER functions
 -- (see 1754395300000_login-lookup-functions.js) precisely so they can see
 -- past RLS for that one narrow, safe-by-uniqueness query. argus_app needs
