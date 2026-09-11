@@ -41,9 +41,19 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
       throw new HttpError(400, 'resolution должен быть confirm или rollback');
     }
 
-    const entry = await withTenantContext({ warehouseId }, (client) => repository.resolveEntry(client, {
-      warehouseId, originalEntryId: id, resolution, resolvedByOwnerId: ownerId, note,
-    }));
+    const entry = await withTenantContext({ warehouseId }, async (client) => {
+      const original = await client.query(
+        'SELECT agent FROM journal_entries WHERE id = $1 AND warehouse_id = $2',
+        [id, warehouseId],
+      );
+      if (!original.rows[0]) return null;
+      if (original.rows[0].agent === 'Обмен с WB') {
+        throw new HttpError(409, 'Решение по заказу WB принимается в разделе «Сверка заказов WB»');
+      }
+      return repository.resolveEntry(client, {
+        warehouseId, originalEntryId: id, resolution, resolvedByOwnerId: ownerId, note,
+      });
+    });
     if (!entry) throw new HttpError(404, 'Запись не найдена');
     res.status(201).json(entry);
   } catch (err) {

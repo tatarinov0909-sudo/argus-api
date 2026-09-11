@@ -225,7 +225,7 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
         `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
                 i.mp_close_reason, i.mp_stock_returned_at,
-                (i.mp_close_reason='fulfilled' OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
+                (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
                         WHERE si.invoice_id=i.id AND sr.company_id=$1 AND si.company_id=$1 AND sr.picked_qty>0))
                   AND i.mp_closed_at IS NOT NULL AND i.mp_stock_returned_at IS NULL AND i.status<>'shipped' AS stock_conflict,
                 ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article

@@ -48,7 +48,7 @@ async function loadStock(client, companyId) {
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
            WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
-             AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND (i.mp_close_reason='fulfilled' OR EXISTS (
+             AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND (i.supply_id IS NOT NULL OR EXISTS (
                SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
                WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
              ))))

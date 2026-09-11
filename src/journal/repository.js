@@ -70,7 +70,7 @@ async function resolveEntry(client, {
   const status = resolution === 'confirm' ? 'confirmed' : 'rolled_back';
   const actionText = resolution === 'confirm'
     ? `Подтверждено владельцем: ${note || original.action_text}`
-    : `Откат правки: ${note || original.action_text}`;
+    : `Отклонено владельцем: ${note || original.action_text}`;
 
   const result = await client.query(
     `INSERT INTO journal_entries

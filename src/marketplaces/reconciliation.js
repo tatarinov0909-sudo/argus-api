@@ -13,7 +13,7 @@ async function list(client, warehouseId, after = null) {
     FROM invoices i JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL
     WHERE i.warehouse_id=$1 AND i.source='wb' AND i.mp_closed_at IS NOT NULL
       AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
-      AND (i.mp_close_reason='fulfilled' OR i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM invoice_items ii
+      AND (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM invoice_items ii
         JOIN shipping_records sr ON sr.invoice_item_id=ii.id WHERE ii.invoice_id=i.id AND sr.picked_qty>0))
       AND ($2::uuid IS NULL OR i.id>$2::uuid)
     ORDER BY i.id LIMIT 51`, [warehouseId, after]);

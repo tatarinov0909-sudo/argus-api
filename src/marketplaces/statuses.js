@@ -85,7 +85,11 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
     const becameCanceled = inv.mp_close_reason === 'fulfilled' && reason === 'canceled';
     if (reason && (!inv.mp_closed_at || becameCanceled)) {
       if (!inv.mp_closed_at) closed++;
-      const conflict = inv.status !== 'shipped' && (reason === 'fulfilled' || inv.has_picks || Boolean(inv.supply_id));
+      // A terminal WB status by itself is not a physical discrepancy. Orders
+      // that were completed before the warehouse started using Argus have no
+      // local pick or supply to reconcile. Only interrupt the owner when Argus
+      // actually recorded stock movement or put the order in a local supply.
+      const conflict = inv.status !== 'shipped' && (inv.has_picks || Boolean(inv.supply_id));
       if (conflict) conflicts++;
       await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
         entityType: 'invoice', entityId: inv.id, invoiceId: inv.id, status: conflict ? 'pending' : 'auto',

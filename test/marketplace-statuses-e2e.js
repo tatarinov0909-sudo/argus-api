@@ -76,7 +76,7 @@ const { loadStock } = require('../src/sellers/stock');
     ];
     const result=await run(q=>reconcile(q,warehouseId,company.id,'synthetic-token',{fetchStatuses:async()=>response}));
     check('explicit statuses close six; missing, unknown, duplicate and foreign IDs do not',()=>{
-      assert.equal(result.closed,6);assert.equal(result.missing,2);assert.equal(result.conflicts,5);
+      assert.equal(result.closed,6);assert.equal(result.missing,2);assert.equal(result.conflicts,4);
     });
     const afterSync=await physical();
     check('sync never changes physical cell stock',()=>assert.deepEqual(afterSync.rows,before.rows));
@@ -93,7 +93,13 @@ const { loadStock } = require('../src/sellers/stock');
     const cannotShip=await api('POST',`/api/shipping/${picked.id}/ship`,worker.token,{});
     check('server rejects ordinary shipping of a closed order',()=>assert.equal(cannotShip.status,409));
     const issues=await must('GET','/api/marketplaces/reconciliation',owner.token);
-    check('all physical/supply/unrecorded-departure conflicts are visible',()=>assert.equal(issues.rows.length,5));
+    check('only orders with local picks or a supply require physical reconciliation',()=>{
+      assert.equal(issues.rows.length,4);assert.ok(!issues.rows.some(row=>row.id===noPicks.id));
+    });
+    const ownerJournal=await must('GET','/api/journal',owner.token);
+    const wbPending=ownerJournal.find(row=>row.invoice_id===picked.id&&row.agent==='Обмен с WB'&&row.status==='pending');
+    const directJournalDecision=await api('POST',`/api/journal/${wbPending.id}/resolve`,owner.token,{resolution:'confirm'});
+    check('WB discrepancies cannot bypass the physical reconciliation workflow',()=>assert.equal(directJournalDecision.status,409));
     const preview=await must('GET',`/api/marketplaces/reconciliation/${picked.id}`,owner.token);
     check('return preview shows exact recorded quantity and original cell',()=>{
       assert.equal(preview.action,'return_to_cells');assert.equal(preview.lines[0].qty,2);assert.equal(preview.lines[0].cellBlockId,cell);
@@ -181,8 +187,8 @@ const { loadStock } = require('../src/sellers/stock');
     const staleDelivery=await api('POST',`/api/marketplaces/reconciliation/${partial.id}`,owner.token,
       {action:oldPartialPreview.action,version:oldPartialPreview.version,confirmed:true,departedAt:new Date().toISOString()});
     const reservedAfterLateCancel=(await run(q=>loadStock(q,company.id)))[0].ordered;
-    check('changed WB status invalidates old departure preview and only untouched cancellation releases demand',()=>{
-      assert.equal(staleDelivery.status,409);assert.equal(reservedAfterLateCancel,reservedBeforeLateCancel-2);
+    check('changed WB status invalidates old departure preview without changing reserved picked stock',()=>{
+      assert.equal(staleDelivery.status,409);assert.equal(reservedAfterLateCancel,reservedBeforeLateCancel);
     });
     const alreadyResolved=await run(q=>q.query(`SELECT id,status,mp_close_reason,mp_stock_returned_at FROM invoices WHERE id=ANY($1::uuid[])`,[[fulfilled.id,picked.id]]));
     check('late provider responses never undo confirmed departure or confirmed return',()=>{
