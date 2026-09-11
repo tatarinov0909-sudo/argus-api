@@ -8,10 +8,22 @@ async function call(token, method, body = {}, fetcher = fetch) {
   if (!ALLOWED_METHODS.has(method)) throw new TelegramError('method_forbidden');
   let response, data;
   try {
-    response = await fetcher(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: 'error',
-    });
+    const relayUrl = process.env.TELEGRAM_RELAY_URL;
+    const relayToken = process.env.TELEGRAM_RELAY_TOKEN;
+    if (relayUrl || relayToken) {
+      if (!relayUrl || !relayToken) throw new Error('Telegram relay is not fully configured');
+      const endpoint = new URL(`/telegram/${method}`, relayUrl);
+      if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') throw new Error('Telegram relay protocol');
+      response = await fetcher(endpoint, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${relayToken}` },
+        body: JSON.stringify({ token, body }), signal: AbortSignal.timeout(12000), redirect: 'error',
+      });
+    } else {
+      response = await fetcher(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: 'error',
+      });
+    }
     data = await response.json();
   } catch { throw new TelegramError('network'); } // Never retain URL/token or raw provider response.
   if (!response.ok || data.ok !== true) {

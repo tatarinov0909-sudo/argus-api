@@ -21,3 +21,18 @@ test('no arbitrary Telegram endpoints or redirect destinations',async()=>{
     return {ok:true,json:async()=>({ok:true,result:{is_bot:true}})};
   });
 });
+test('private relay receives only an allowed method and keeps the bot token out of its URL',async()=>{
+  const beforeUrl=process.env.TELEGRAM_RELAY_URL,beforeToken=process.env.TELEGRAM_RELAY_TOKEN;
+  process.env.TELEGRAM_RELAY_URL='http://10.77.0.2:8787';process.env.TELEGRAM_RELAY_TOKEN='relay-test-secret';
+  try {
+    await call('123456:'+ 'a'.repeat(32),'getMe',{},async(url,options)=>{
+      assert.equal(String(url),'http://10.77.0.2:8787/telegram/getMe');
+      assert.equal(options.headers.Authorization,'Bearer relay-test-secret');
+      assert.deepEqual(JSON.parse(options.body),{token:'123456:'+ 'a'.repeat(32),body:{}});
+      return {ok:true,json:async()=>({ok:true,result:{is_bot:true}})};
+    });
+  } finally {
+    if (beforeUrl===undefined) delete process.env.TELEGRAM_RELAY_URL; else process.env.TELEGRAM_RELAY_URL=beforeUrl;
+    if (beforeToken===undefined) delete process.env.TELEGRAM_RELAY_TOKEN; else process.env.TELEGRAM_RELAY_TOKEN=beforeToken;
+  }
+});
