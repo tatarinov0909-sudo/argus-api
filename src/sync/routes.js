@@ -133,7 +133,7 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
         [warehouseId],
       );
       const batches = await client.query(`SELECT s.stage, s.received_at, s.module_version,
-          s.run_mode, s.record_count, s.summary
+          s.run_mode, s.record_count, s.summary, s.stock_calculation, s.stock_calculation_status
         FROM integration_sync_state s
         JOIN integration_keys k ON k.id = s.integration_key_id AND k.active
         WHERE s.warehouse_id = $1 ORDER BY s.received_at DESC, s.stage`, [warehouseId]);
