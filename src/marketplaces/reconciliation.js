@@ -3,6 +3,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const { formatBlockLabel } = require('../cells/label');
 const journal = require('../journal/repository');
+const { refreshSupplyStatus } = require('../supplies/state');
 
 async function list(client, warehouseId, after = null) {
   const result = await client.query(`SELECT i.id, i.number, i.company_id, c.name AS company,
@@ -139,9 +140,7 @@ async function resolve(client, warehouseId, id, { action, version, confirmed, ow
 
   if (inv.supply_id) {
     await client.query(`UPDATE invoices SET supply_id=NULL WHERE warehouse_id=$1 AND id=$2`, [warehouseId, id]);
-    // A changed manifest must be checked again before the remaining supply is sent.
-    await client.query(`UPDATE supplies SET status='collecting',ready_at=NULL
-      WHERE warehouse_id=$1 AND id=$2 AND status='ready'`, [warehouseId, inv.supply_id]);
+    await refreshSupplyStatus(client, warehouseId, inv.supply_id);
   }
   await journal.createEntry(client, { warehouseId, agent: 'Сверка заказов WB',
     actorType: 'owner', actorId: ownerId, entityType: 'invoice', entityId: id, invoiceId: id,

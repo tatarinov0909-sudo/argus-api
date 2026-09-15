@@ -156,6 +156,15 @@ router.get('/companies', requireAuth, requireRole('owner', 'manager'), async (re
       );
       return result.rows;
     });
+    // Ключ продавца — это вход в его кабинет. Видит его только тот, кому
+    // владелец доверил клиентов: без этого права менеджер не может ключ
+    // выдать, но мог его просто прочитать и войти за продавца.
+    const mayReadKeys = req.auth.role === 'owner' || (req.auth.grants || []).includes('clients');
+    if (!mayReadKeys) {
+      for (const row of rows) {
+        row.keys = row.keys.map((k) => ({ ...k, keyCode: `${String(k.keyCode).slice(0, 2)}-••••••-K` }));
+      }
+    }
     res.json(rows);
   } catch (err) {
     next(err);
@@ -266,7 +275,7 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
       return (await client.query(
         `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
-                i.mp_close_reason, i.mp_stock_returned_at,
+                i.mp_close_reason, i.mp_stock_returned_at, (i.supply_id IS NOT NULL) AS in_supply,
                 (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
                         WHERE si.invoice_id=i.id AND sr.company_id=$1 AND si.company_id=$1 AND sr.picked_qty>0))
                   AND i.mp_closed_at IS NOT NULL AND i.mp_stock_returned_at IS NULL AND i.status<>'shipped' AS stock_conflict,

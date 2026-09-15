@@ -47,9 +47,10 @@ test('partial responses, duplicate IDs and unrelated seller IDs do not close loc
   const invoices = new Map(Array.from({length:5},(_,i) => [String(i+1), {id:String(i+1), number:`WB-${i+1}`, status:'open', mp_closed_at:null, has_picks:i===1, supply_id:null}]));
   const client = { query: async (sql, args) => {
     queries.push({sql,args});
-    if (sql.includes('SELECT id, external_id')) return {rows:[...invoices.values()].map(i=>({id:i.id,external_id:i.id}))};
+    if (sql.includes('i.external_id FROM invoices')) return {rows:[...invoices.values()].map(i=>({id:i.id,external_id:i.id}))};
+    if (sql.includes('SELECT supply_id FROM invoices')) return {rows:[{supply_id:invoices.get(args[1]).supply_id}]};
     if (sql.includes('FOR UPDATE OF i')) return {rows:[{...invoices.get(args[2])}]};
-    if (sql.includes('mp_supplier_status=$4') && args[5]) invoices.get(args[2]).mp_closed_at='observed';
+    if (sql.includes('mp_supplier_status=$4') && args[6]) invoices.get(args[2]).mp_closed_at='observed';
     return {rows:[{}]};
   }};
   const fetchStatuses = async (_, ids) => {

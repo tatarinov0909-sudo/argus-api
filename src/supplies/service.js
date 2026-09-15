@@ -71,6 +71,13 @@ const MAPPED_SQL = `EXISTS (SELECT 1 FROM products p
 const UNPICKABLE_SQL = `NOT ${MAPPED_SQL}
    OR (i.source <> '1c' AND ii.mp_rid IS NULL)`;
 
+// Заказ, который уже подтвердили в кабинете WB, минуя Аргус: для площадки он
+// «на сборке», его собирают по её поставке. Взять его в поставку Аргуса —
+// значит собрать один заказ дважды. Так в ПС-1409-01 попали шесть заказов,
+// которых продавец не нашёл среди новых на WB.
+const WB_CONFIRMED_SQL = `(i.source <> '1c' AND i.mp_supplier_status IS NOT NULL
+   AND i.mp_supplier_status <> 'new')`;
+
 // Собрать поставку из заказов.
 //
 // Заказы обязаны быть одной компании: поставка уезжает по документам одного
@@ -82,6 +89,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
 
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id, c.name AS company_name,
+            ${WB_CONFIRMED_SQL} AS wb_confirmed,
             (NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
              OR EXISTS (SELECT 1 FROM invoice_items ii
                          WHERE ii.invoice_id = i.id
@@ -103,6 +111,11 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   if (closed) throw new HttpError(409, `«${closed.number}» уже закрыт. Его нельзя включить в новую поставку.`);
   if (alreadyIn) {
     throw new HttpError(409, `«${alreadyIn.number}» уже в другой поставке`);
+  }
+  const confirmed = orders.rows.find((o) => o.wb_confirmed);
+  if (confirmed) {
+    throw new HttpError(409, `«${confirmed.number}» уже подтверждён в кабинете WB — `
+      + 'его собирают по поставке WB, второй раз собирать его не нужно.');
   }
   const companies = [...new Set(orders.rows.map((o) => o.company_id))];
   if (companies.length > 1) {
@@ -160,9 +173,9 @@ async function contents(client, warehouseId, supplyId) {
     [warehouseId, supplyId],
   );
   if (!head.rows[0]) throw new HttpError(404, 'Поставка не найдена');
-  const closed = await client.query(`SELECT number FROM invoices WHERE warehouse_id=$1 AND supply_id=$2
-    AND mp_closed_at IS NOT NULL AND status <> 'shipped' LIMIT 1`, [warehouseId, supplyId]);
-  if (closed.rows.length) throw new HttpError(409, `Заказ «${closed.rows[0].number}» закрыт на WB. Сначала откройте сверку заказов WB; печать поставки остановлена.`);
+  // Закрытых на WB заказов в поставке нет: обмен убирает их из неё в той же
+  // транзакции, где закрывает (marketplaces/statuses.js). Печать поэтому
+  // больше не останавливается из-за одного заказа.
 
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
@@ -204,7 +217,9 @@ async function contents(client, warehouseId, supplyId) {
   // магазина: кладовщик знает, что взять, и не знает, куда идти.
   //
   // Только годное: брак лежит на тех же полках, и отправить его клиенту
-  // вместо товара — худшее, что может сделать склад.
+  // вместо товара — худшее, что может сделать склад. И только этого
+  // продавца: одинаковый артикул у двух продавцов — два разных товара,
+  // и лист не должен посылать к полке с чужим.
   const skus = [...bySku.keys()];
   const places = skus.length === 0 ? { rows: [] } : await client.query(
     `SELECT cs.sku, SUM(cs.qty) AS qty, wr.row_num, cb.label,
@@ -212,12 +227,12 @@ async function contents(client, warehouseId, supplyId) {
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-      WHERE cs.warehouse_id = $1 AND cs.sku = ANY($2::text[])
+      WHERE cs.warehouse_id = $1 AND cs.company_id = $3 AND cs.sku = ANY($2::text[])
         AND cs.qty > 0 AND cs.quality = 'good'
       GROUP BY cs.sku, cb.id, wr.row_num, cb.label,
                cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
       ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-    [warehouseId, skus],
+    [warehouseId, skus, head.rows[0].company_id],
   );
   for (const row of places.rows) {
     const item = bySku.get(row.sku);
@@ -275,9 +290,13 @@ async function contents(client, warehouseId, supplyId) {
   };
 }
 
-const NEXT = { collecting: 'ready', ready: 'shipped' };
-
-async function advance(client, warehouseId, supplyId, { to, destination = null, actor }) {
+// Поставка уехала: машина ушла, и вместе с ней все заказы поставки.
+//
+// «Собрана» ставится само, когда собран последний заказ (state.js), —
+// отдельной кнопки для неё нет. Уехать может только собранная поставка:
+// иначе заказы получили бы «отгружено», а товар остался бы на полке
+// и продолжал числиться в остатке.
+async function ship(client, warehouseId, supplyId, { destination = null, actor }) {
   const cur = await client.query(
     `SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
@@ -287,71 +306,39 @@ async function advance(client, warehouseId, supplyId, { to, destination = null, 
 
   // Synchronization and picking lock these same rows. A cancellation cannot
   // slip between checking a supply and marking its orders as shipped.
-  const orderLocks = await client.query(`SELECT id, number, mp_closed_at FROM invoices
+  const orderLocks = await client.query(`SELECT id, number, status, mp_closed_at FROM invoices
     WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
   const ended = orderLocks.rows.find(o => o.mp_closed_at);
   if (ended) throw new HttpError(409, `Заказ «${ended.number}» закрыт на WB. Руководитель должен разобрать его в сверке заказов WB.`);
 
-  if (NEXT[from] !== to) {
-    throw new HttpError(409, from === 'shipped'
-      ? 'Поставка уже уехала — назад её не вернуть, заведите новую'
-      : `Из «${STATUS_NAMES[from]}» нельзя перейти в «${STATUS_NAMES[to] || to}»`);
+  if (from === 'shipped') throw new HttpError(409, 'Поставка уже уехала — назад её не вернуть, заведите новую');
+  if (orderLocks.rows.length === 0) throw new HttpError(409, 'В поставке нет ни одного заказа — отгружать нечего');
+  const notPicked = orderLocks.rows.filter(o => o.status !== 'ready');
+  if (from !== 'ready' || notPicked.length > 0) {
+    const names = notPicked.slice(0, 3).map(o => `«${o.number}»`).join(', ');
+    throw new HttpError(409, `Ещё не собрано: ${names}. Уехать может только поставка, в которой собран каждый заказ.`);
   }
 
-  // Собранной поставка становится только когда собран КАЖДЫЙ заказ в ней.
-  //
-  // Без этой проверки поставку можно было отгрузить, не сняв с полки ни одной
-  // коробки: заказы получали «отгружено», продавец видел, что товар уехал,
-  // а товар лежал в ячейке и продолжал числиться в остатке. Отдельная охрана
-  // на отгрузке одного заказа (shipping/routes.js) при этом была — и поставка
-  // её обходила, потому что писала статус напрямую.
-  if (to === 'ready') {
-    const notPicked = await client.query(
-      `SELECT i.number, i.status FROM invoices i
-        WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND i.status <> 'ready'
-        ORDER BY i.number LIMIT 3`,
-      [warehouseId, supplyId],
-    );
-    if (notPicked.rows.length > 0) {
-      const names = notPicked.rows.map((r) => `«${r.number}»`).join(', ');
-      throw new HttpError(409,
-        `Ещё не собрано: ${names}. Поставка считается собранной, когда собран каждый заказ в ней.`);
-    }
-    const empty = await client.query(
-      `SELECT 1 FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 LIMIT 1`,
-      [warehouseId, supplyId],
-    );
-    if (empty.rows.length === 0) {
-      throw new HttpError(409, 'В поставке нет ни одного заказа — собирать нечего');
-    }
-  }
-
-  const stampColumn = to === 'ready' ? 'ready_at' : 'shipped_at';
   const updated = await client.query(
-    `UPDATE supplies SET status = $3::supply_status, ${stampColumn} = now(),
-            destination = COALESCE($4, destination)
+    `UPDATE supplies SET status = 'shipped', shipped_at = now(), destination = COALESCE($3, destination)
       WHERE warehouse_id = $1 AND id = $2
       RETURNING id, number, status, destination, ready_at, shipped_at`,
-    [warehouseId, supplyId, to, destination],
+    [warehouseId, supplyId, destination],
   );
 
   // Уехала — значит уехали и заказы в ней. Иначе продавец видел бы товар
   // на складе, которого там уже нет.
-  if (to === 'shipped') {
-    await client.query(
-      `UPDATE invoices i SET status='shipped', shipped_at=COALESCE(i.shipped_at,s.shipped_at)
-       FROM supplies s WHERE i.warehouse_id=$1 AND i.supply_id=$2
-         AND s.id=i.supply_id AND s.company_id=i.company_id`,
-      [warehouseId, supplyId],
-    );
-  }
+  await client.query(
+    `UPDATE invoices i SET status='shipped', shipped_at=COALESCE(i.shipped_at,s.shipped_at)
+     FROM supplies s WHERE i.warehouse_id=$1 AND i.supply_id=$2
+       AND s.id=i.supply_id AND s.company_id=i.company_id`,
+    [warehouseId, supplyId],
+  );
 
   await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
-    actionText: to === 'shipped'
-      ? `Поставка «${cur.rows[0].number}» уехала${updated.rows[0].destination ? ` — ${updated.rows[0].destination}` : ''}.`
-      : `Поставка «${cur.rows[0].number}» собрана, ждёт отгрузки.`,
+    actionText: `Поставка «${cur.rows[0].number}» уехала${updated.rows[0].destination ? ` — ${updated.rows[0].destination}` : ''}.`,
     entityType: 'supply',
     entityId: supplyId,
     actorType: actor?.type || 'owner',
@@ -372,7 +359,8 @@ async function list(client, warehouseId, { status = null } = {}) {
   const r = await client.query(
     `SELECT s.id, s.number, s.status, s.destination, s.marketplace, s.mp_supply_id,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
-            count(i.id)::int AS orders
+            count(i.id)::int AS orders,
+            count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked
        FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
        LEFT JOIN invoices i ON i.supply_id = s.id
@@ -396,10 +384,11 @@ async function list(client, warehouseId, { status = null } = {}) {
 async function pendingByCompany(client, warehouseId) {
   const r = await client.query(
     `SELECT c.id AS company_id, c.name AS company_name, i.source AS marketplace,
-            count(DISTINCT i.id)::int AS orders,
-            COALESCE(sum(ii.declared_qty), 0)::numeric AS units,
-            min(i.created_at) AS oldest,
-            count(DISTINCT i.id) FILTER (WHERE ${UNPICKABLE_SQL})::int AS incomplete
+            count(DISTINCT i.id) FILTER (WHERE NOT ${WB_CONFIRMED_SQL})::int AS orders,
+            COALESCE(sum(ii.declared_qty) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}), 0)::numeric AS units,
+            min(i.created_at) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}) AS oldest,
+            count(DISTINCT i.id) FILTER (WHERE NOT ${WB_CONFIRMED_SQL} AND (${UNPICKABLE_SQL}))::int AS incomplete,
+            count(DISTINCT i.id) FILTER (WHERE ${WB_CONFIRMED_SQL})::int AS wb_confirmed
        FROM invoices i
        JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -423,6 +412,8 @@ async function pendingByCompany(client, warehouseId) {
     // их нельзя, и лучше сказать об этом до того, как менеджер нажмёт
     // «всё на сборку», а не после.
     incomplete: x.incomplete,
+    // Уже подтверждённые в кабинете WB: в число новых не входят.
+    wbConfirmed: x.wb_confirmed,
   }));
 }
 
@@ -432,7 +423,8 @@ async function pendingOrders(client, warehouseId, companyId) {
     `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
             ii.mp_nm_id, ii.mp_rid,
-            NOT (${UNPICKABLE_SQL}) AS pickable
+            NOT (${UNPICKABLE_SQL}) AS pickable,
+            ${WB_CONFIRMED_SQL} AS wb_confirmed
        FROM invoices i
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
       WHERE i.warehouse_id = $1
@@ -465,7 +457,8 @@ async function pendingOrders(client, warehouseId, companyId) {
     // лишь «есть номер отправления», и 36 несобираемых заказов уехали
     // в поставку вместе с остальными — кладовщик пошёл бы искать на полке
     // артикул, которого на складе нет.
-    ready: Boolean(x.pickable),
+    wbConfirmed: Boolean(x.wb_confirmed),
+    ready: Boolean(x.pickable) && !x.wb_confirmed,
   }));
 }
 
@@ -522,5 +515,5 @@ async function disband(client, warehouseId, supplyId, { actor }) {
 }
 
 module.exports = {
-  create, contents, advance, list, pendingByCompany, pendingOrders, disband, STATUS_NAMES,
+  create, contents, ship, list, pendingByCompany, pendingOrders, disband, STATUS_NAMES,
 };

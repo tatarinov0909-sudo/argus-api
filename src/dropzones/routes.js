@@ -10,7 +10,7 @@ const router = express.Router();
 // вставке — потолок нужен только чтобы поймать опечатку.
 const MAX_ZONES = 60;
 
-router.get('/', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+router.get('/', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const zones = await withTenantContext({ warehouseId }, async (client) => {

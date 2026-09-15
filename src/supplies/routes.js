@@ -70,24 +70,15 @@ router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'selle
   } catch (err) { next(err); }
 });
 
-// Собрана. Может отметить и работник: он её и собирал.
-router.post('/:id/ready', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
-  try {
-    const { warehouseId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => service.advance(
-      client, warehouseId, req.params.id, { to: 'ready', actor: actorOf(req.auth) },
-    ));
-    res.json(out);
-  } catch (err) { next(err); }
-});
-
 // Уехала. Событие в физическом мире, и назад его не отменить — см. service.
-router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+// Отмечает тот, кто видит машину: менеджер, владелец или грузчик.
+// «Собрана» отдельной кнопки не имеет — она ставится сама по отбору.
+router.post('/:id/ship', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => service.advance(
+    const out = await withTenantContext({ warehouseId }, (client) => service.ship(
       client, warehouseId, req.params.id,
-      { to: 'shipped', destination: (req.body || {}).destination || null, actor: actorOf(req.auth) },
+      { destination: (req.body || {}).destination || null, actor: actorOf(req.auth) },
     ));
     res.json(out);
   } catch (err) { next(err); }

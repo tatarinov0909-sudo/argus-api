@@ -5,6 +5,8 @@ const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
+const { requireQty } = require('../middleware/qty');
+const { refreshSupplyStatus, lockSupplyOfInvoice } = require('../supplies/state');
 const { buildPickList, parseInvoiceIds } = require('./pickList');
 
 const router = express.Router();
@@ -134,16 +136,22 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     if (!invoiceItemId || pickedQty == null || !cellBlockId) {
       throw new HttpError(400, 'Нужны позиция накладной, количество и ячейка');
     }
-    if (Number(pickedQty) <= 0) {
-      throw new HttpError(400, 'Количество должно быть больше нуля');
-    }
+    // Целое и больше нуля: «NaN» и «1.5» проходили прежнюю проверку и
+    // записывались в остаток ячейки как есть.
+    const qty = requireQty(pickedQty, 'Количество', { min: 1 });
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
+      const pre = await client.query(
+        'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
+        [invoiceItemId, warehouseId],
+      );
+      if (!pre.rows[0]) throw new HttpError(404, 'Позиция накладной не найдена');
+      const supplyId = await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
       const itemResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
                 ii.external_id,
                 i.direction, i.status, i.mp_closed_at, i.number AS invoice_number,
-                i.external_id AS invoice_external_id,
+                i.external_id AS invoice_external_id, i.source, i.supply_id,
                 c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
@@ -153,6 +161,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       );
       const item = itemResult.rows[0];
       if (!item) throw new HttpError(404, 'Позиция накладной не найдена');
+      if ((item.supply_id || null) !== supplyId) {
+        throw new HttpError(409, 'Заказ только что перенесли в другую поставку — обновите экран');
+      }
       // Guard against a receiving invoice being picked as if it were a
       // shipment — that would silently drain stock that was just accepted.
       if (item.direction !== 'out') {
@@ -161,12 +172,26 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       if (item.mp_closed_at || item.status === 'shipped') {
         throw new HttpError(409, 'Заказ уже закрыт. Отбор остановлен; руководитель проверит его в сверке заказов WB.');
       }
+      // Заказ с площадки собирают только в составе поставки: какие заказы
+      // уезжают сегодня, решает менеджер, а не тот, кто первым открыл список.
+      if (item.source !== '1c' && !item.supply_id) {
+        throw new HttpError(409, 'Этот заказ ещё не отправлен на сборку — его включает в поставку менеджер');
+      }
 
       const closed = await client.query(
         `SELECT id FROM shipping_records WHERE invoice_item_id = $1 AND is_final = true`,
         [invoiceItemId],
       );
       if (closed.rows[0]) throw new HttpError(409, 'Эта позиция уже отгружена');
+
+      const before = await client.query(
+        'SELECT COALESCE(SUM(picked_qty), 0) AS picked FROM shipping_records WHERE invoice_item_id = $1',
+        [invoiceItemId],
+      );
+      const remainingQty = Number(item.declared_qty) - Number(before.rows[0].picked);
+      if (qty > remainingQty) {
+        throw new HttpError(409, `По заказу осталось собрать ${remainingQty} шт., нельзя записать ${qty}`);
+      }
 
       // Lock the stock rows for this cell/sku so two workers picking the same
       // cell at once can't both pass the availability check and drive qty
@@ -186,16 +211,16 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       if (availableInCell <= 0) {
         throw new HttpError(409, 'В этой ячейке нет такого товара');
       }
-      if (Number(pickedQty) > availableInCell) {
+      if (qty > availableInCell) {
         throw new HttpError(
           409,
-          `В ячейке только ${availableInCell}, нельзя забрать ${pickedQty}`,
+          `В ячейке только ${availableInCell}, нельзя забрать ${qty}`,
         );
       }
 
       // Receiving INSERTs a fresh cell_stock row per acceptance, so one cell
       // can hold several rows for the same SKU. Draw down oldest-first.
-      let toTake = Number(pickedQty);
+      let toTake = qty;
       for (const row of stockResult.rows) {
         if (toTake <= 0) break;
         const take = Math.min(toTake, Number(row.qty));
@@ -224,7 +249,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
          VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9)
          RETURNING id, picked_qty, cell_block_id, is_final, finished_at, paused_ms`,
         [
-          invoiceItemId, warehouseId, item.company_id, pickedQty, cellBlockId,
+          invoiceItemId, warehouseId, item.company_id, qty, cellBlockId,
           staffKeyId, isFinal, pausedMs || 0, JSON.stringify(pauseReasons || []),
         ],
       );
@@ -242,7 +267,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       const hasDiscrepancy = isFinal && totalPicked !== declared;
       const actionText = hasDiscrepancy
         ? `Расхождение при отгрузке «${item.name}» (${item.sku}): нужно ${declared}, собрано ${totalPicked}.`
-        : `Собрал «${item.name}» (${item.sku}) — ${pickedQty} шт.${isFinal ? ` Позиция закрыта, итого ${totalPicked}.` : ''}`;
+        : `Собрал «${item.name}» (${item.sku}) — ${qty} шт.${isFinal ? ` Позиция закрыта, итого ${totalPicked}.` : ''}`;
       await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
@@ -286,6 +311,8 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       );
       const newStatus = remaining.rows[0].n === 0 ? 'ready' : 'in_progress';
       await client.query(`UPDATE invoices SET status = $2 WHERE id = $1`, [item.invoice_id, newStatus]);
+      // Последний собранный заказ делает поставку «собранной» — сам.
+      if (item.supply_id) await refreshSupplyStatus(client, warehouseId, item.supply_id);
 
       return { ...recordResult.rows[0], totalPicked, declaredQty: declared };
     });
@@ -305,12 +332,15 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'worker'), async (req
 
     const invoice = await withTenantContext({ warehouseId }, async (client) => {
       const result = await client.query(
-        `SELECT id, number, status, direction, mp_closed_at FROM invoices WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
+        `SELECT id, number, status, direction, mp_closed_at, supply_id FROM invoices WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
         [id, warehouseId],
       );
       const inv = result.rows[0];
       if (!inv) throw new HttpError(404, 'Накладная не найдена');
       if (inv.direction !== 'out') throw new HttpError(400, 'Эта накладная не на отгрузку');
+      // Заказ из поставки уезжает вместе с ней. Отгрузи его отдельно — и
+      // поставка навсегда осталась бы «собирается»: её заказы уже уехали.
+      if (inv.supply_id) throw new HttpError(409, 'Этот заказ уезжает в составе поставки — отметьте «Уехала» у поставки');
       if (inv.mp_closed_at) throw new HttpError(409, 'Заказ закрыт на WB. Руководитель должен подтвердить судьбу товара в сверке заказов WB.');
       if (inv.status !== 'ready') {
         throw new HttpError(409, 'Заказ ещё не полностью собран');

@@ -20,13 +20,17 @@ function cellLabel(r) {
 
 async function buildPickList(client, warehouseId, invoiceIds = []) {
   // Без списка берём всё, что реально ждёт отбора: открытые и начатые
-  // отгрузки. Именно этот случай и есть «утро, заказов много».
+  // отгрузки. Именно этот случай и есть «утро, заказов много». Заказы
+  // с площадки — только отправленные менеджером на сборку, то есть
+  // в поставке: вся очередь WB на листе грузчика означала бы, что решает
+  // не менеджер, а тот, кто первым взял лист.
   const invoices = await client.query(
     `SELECT i.id, i.number, i.company_id, c.name AS company_name
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
        AND i.status IN ('open', 'in_progress')
        AND i.mp_closed_at IS NULL
+       AND (i.source = '1c' OR i.supply_id IS NOT NULL)
        AND ($2::uuid[] IS NULL OR i.id = ANY($2::uuid[]))
      ORDER BY i.created_at`,
     [warehouseId, invoiceIds.length ? invoiceIds : null],

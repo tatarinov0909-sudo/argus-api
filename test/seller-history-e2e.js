@@ -62,7 +62,6 @@ const { withTenantContext, pool } = require('../src/db/pool');
     const second=await invoice(alpha.id,'HISTORY-SUPPLY-ORDER','out',4);
     const supply=await api('POST','/api/supplies',owner,{invoiceIds:[second.id]},201);
     await api('POST','/api/shipping',worker,{invoiceItemId:second.items[0].id,pickedQty:4,cellBlockId:blocks[0].id},201);
-    await api('POST',`/api/supplies/${supply.id}/ready`,owner);
     const departed=await api('POST',`/api/supplies/${supply.id}/ship`,owner);
     const supplyHistory=await api('GET','/api/sellers/history?sku=SharedCase',seller);
     const event=supplyHistory.events.find(e=>e.kind==='shipped'&&e.document==='HISTORY-SUPPLY-ORDER');

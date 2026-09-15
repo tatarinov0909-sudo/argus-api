@@ -4,7 +4,7 @@ const { withTenantContext } = require('../db/pool');
 
 const router = express.Router();
 
-router.get('/me', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+router.get('/me', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const warehouse = await withTenantContext({ warehouseId }, async (client) => {

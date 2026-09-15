@@ -31,7 +31,15 @@ router.get('/', requireAuth, async (req, res, next) => {
                 c.name AS company_name
          FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
+           -- Работнику: закрытые на площадке не нужны, а заказы площадки —
+           -- только отправленные на сборку, то есть в поставке.
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
+           AND (NOT $2::boolean OR i.source = '1c' OR i.supply_id IS NOT NULL)
+           -- Остальным: отменённый или завершённый на площадке заказ, с которым
+           -- склад ничего не делал, — не документ склада, а шум в списке.
+           AND ($2::boolean OR i.source = '1c' OR i.mp_closed_at IS NULL OR i.supply_id IS NOT NULL
+                OR EXISTS (SELECT 1 FROM invoice_items x JOIN shipping_records sr ON sr.invoice_item_id = x.id
+                           WHERE x.invoice_id = i.id))
          ORDER BY i.created_at DESC`,
         [direction || null, req.auth.role === 'worker'],
       );
@@ -53,8 +61,11 @@ router.get('/:id', requireAuth, async (req, res, next) => {
         `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
                 i.source, i.mp_status, i.mp_supplier_status,
                 i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
+                i.supply_id, s.number AS supply_number,
                 c.name AS company_name
-         FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL WHERE i.id = $1`,
+         FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+         LEFT JOIN supplies s ON s.id = i.supply_id
+         WHERE i.id = $1`,
         [id],
       );
       const inv = invoiceResult.rows[0];

@@ -46,7 +46,11 @@ const { loadStock } = require('../src/sellers/stock');
       const inv=await must('POST','/api/invoices',owner.token,{companyId,number:'WB-'+externalId,direction:'out',items:[{sku:'TEST-SKU',name:'Test stock',declaredQty:qty}]},201);
       await run(q=>q.query(`UPDATE invoices SET source='wb',external_id=$2 WHERE id=$1`,[inv.id,String(externalId)]));
       await run(q=>q.query(`UPDATE invoice_items SET mp_rid=$2 WHERE invoice_id=$1`,[inv.id,'test-rid-'+externalId]));
-      if(picked) await must('POST','/api/shipping',worker.token,{invoiceItemId:inv.items[0].id,pickedQty:picked,cellBlockId:cell,isFinal:picked===qty},201);
+      // A WB order is picked only as part of a supply the manager sent to the floor.
+      if(picked) {
+        await must('POST','/api/supplies',owner.token,{invoiceIds:[inv.id]},201);
+        await must('POST','/api/shipping',worker.token,{invoiceItemId:inv.items[0].id,pickedQty:picked,cellBlockId:cell,isFinal:picked===qty},201);
+      }
       orders.push(inv);return inv;
     }
     const untouched=await order(90101);
@@ -76,15 +80,19 @@ const { loadStock } = require('../src/sellers/stock');
     ];
     const result=await run(q=>reconcile(q,warehouseId,company.id,'synthetic-token',{fetchStatuses:async()=>response}));
     check('explicit statuses close six; missing, unknown, duplicate and foreign IDs do not',()=>{
-      assert.equal(result.closed,6);assert.equal(result.missing,2);assert.equal(result.conflicts,4);
+      // Conflicts are only orders with recorded picks: nobody has to undo anything
+      // for an order that was merely listed in a supply.
+      assert.equal(result.closed,6);assert.equal(result.missing,2);assert.equal(result.conflicts,3);
     });
+    const detached=await run(q=>q.query(`SELECT count(*)::int AS n FROM invoices WHERE id=ANY($1::uuid[]) AND supply_id IS NOT NULL`,[[picked.id,fulfilled.id,partial.id,inSupply.id]]));
+    check('every order that WB closed has left its local supply in the same transaction',()=>assert.equal(detached.rows[0].n,0));
     const afterSync=await physical();
     check('sync never changes physical cell stock',()=>assert.deepEqual(afterSync.rows,before.rows));
     const unchanged=await run(q=>q.query(`SELECT id,status,mp_closed_at FROM invoices WHERE id=ANY($1::uuid[])`,[[unknown.id,missing.id,duplicate.id,foreign.id]]));
     check('unknown and other company orders stay untouched',()=>assert.ok(unchanged.rows.every(r=>!r.mp_closed_at&&r.status==='open')));
     const stock=await run(q=>loadStock(q,company.id));
     check('untouched cancellation releases demand but picked and delivered orders remain reserved',()=>{
-      assert.equal(stock[0].onHand,20);assert.equal(stock[0].ordered,14);
+      assert.equal(stock[0].onHand,20);assert.equal(stock[0].ordered,12);
     });
     const jobs=await must('GET','/api/invoices?direction=out',worker.token);
     check('closed WB orders are absent from worker task queue',()=>assert.ok(!jobs.some(r=>[untouched.id,picked.id,fulfilled.id].includes(r.id))));
@@ -94,7 +102,7 @@ const { loadStock } = require('../src/sellers/stock');
     check('server rejects ordinary shipping of a closed order',()=>assert.equal(cannotShip.status,409));
     const issues=await must('GET','/api/marketplaces/reconciliation',owner.token);
     check('only orders with local picks or a supply require physical reconciliation',()=>{
-      assert.equal(issues.rows.length,4);assert.ok(!issues.rows.some(row=>row.id===noPicks.id));
+      assert.equal(issues.rows.length,3);assert.ok(!issues.rows.some(row=>[noPicks.id,inSupply.id].includes(row.id)));
     });
     const ownerJournal=await must('GET','/api/journal',owner.token);
     const wbPending=ownerJournal.find(row=>row.invoice_id===picked.id&&row.agent==='Обмен с WB'&&row.status==='pending');
@@ -119,7 +127,7 @@ const { loadStock } = require('../src/sellers/stock');
     });
     const stockAfter=await run(q=>loadStock(q,company.id));
     check('return does not inflate on-hand while releasing canceled reservation',()=>{
-      assert.equal(stockAfter[0].onHand,20);assert.equal(stockAfter[0].ordered,12);
+      assert.equal(stockAfter[0].onHand,20);assert.equal(stockAfter[0].ordered,10);
     });
     const trace=await run(q=>q.query(`SELECT kind,qty,to_cell_block_id,details FROM stock_operations WHERE company_id=$1 AND kind='canceled_pick_return'`,[company.id]));
     check('returned picks leave exactly one immutable stock operation',()=>{
@@ -141,9 +149,8 @@ const { loadStock } = require('../src/sellers/stock');
     }
     check('WB delivery with absent/partial local picking is conservatively blocked',()=>{});
     const supplyPreview=await must('GET',`/api/marketplaces/reconciliation/${inSupply.id}`,owner.token);
-    check('untouched canceled supply order previews detachment only',()=>assert.equal(supplyPreview.action,'remove_from_supply'));
-    await must('POST',`/api/marketplaces/reconciliation/${inSupply.id}`,owner.token,{action:supplyPreview.action,version:supplyPreview.version,confirmed:true});
-    const s=await run(q=>q.query(`SELECT supply_id FROM invoices WHERE id=$1`,[inSupply.id]));
+    check('an unpicked canceled order leaves its supply by itself — nothing is left to reconcile',()=>assert.equal(supplyPreview.action,null));
+    const s=await run(q=>q.query(`SELECT i.supply_id, sp.status FROM invoices i JOIN supplies sp ON sp.id=$2 WHERE i.id=$1`,[inSupply.id,supply.id]));
     check('canceled order leaves local supply without any stock movement',()=>assert.equal(s.rows[0].supply_id,null));
     const forbidden=await api('GET','/api/marketplaces/reconciliation',worker.token);
     check('workers cannot perform owner reconciliation',()=>assert.equal(forbidden.status,403));
@@ -172,7 +179,8 @@ const { loadStock } = require('../src/sellers/stock');
     const reservedBeforeLateCancel=(await run(q=>loadStock(q,company.id)))[0].ordered;
     await run(q=>q.query(`UPDATE invoices SET mp_status_attempted_at=NULL WHERE id=ANY($1::uuid[])`,[[partial.id,noPicks.id,fulfilled.id,picked.id]]));
     await run(q=>reconcile(q,warehouseId,company.id,'synthetic-token',{fetchStatuses:async(_,ids)=>{
-      assert.ok(ids.includes('90105')&&ids.includes('90104'));
+      // A delivered order the warehouse never picked is not asked about again.
+      assert.ok(ids.includes('90105')&&!ids.includes('90104'));
       assert.ok(!ids.includes('90103')&&!ids.includes('90102'));
       return [90105,90104,90103,90102].map(id=>({id,supplierStatus:'cancel',wbStatus:'canceled'}));
     }}));

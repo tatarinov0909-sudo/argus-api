@@ -184,10 +184,11 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     // Пока ни одна коробка не снята с полки, поставка собранной не считается.
     // Без этой охраны её можно было отгрузить, не тронув склад: заказы
     // получали «отгружено», а товар продолжал числиться в ячейке.
-    const early = await api('POST', `/api/supplies/${supplyId}/ready`, { token: ownerToken });
-    check('несобранную поставку нельзя объявить собранной', () => {
-      assert.equal(early.status, 409, JSON.stringify(early.body));
-      assert.ok(String(early.body.error).includes('Ещё не собрано'), early.body.error);
+    const early = (await api('GET', '/api/supplies', { token: ownerToken })).body.find((x) => x.id === supplyId);
+    check('несобранная поставка не бывает собранной — кнопки «собрана» больше нет', () => {
+      assert.equal(early.status, 'collecting', JSON.stringify(early));
+      assert.equal(early.picked, 0);
+      assert.ok(String(skip.body.error).includes('Ещё не собрано'), skip.body.error);
     });
 
     // Собираем по-настоящему: работник снимает товар с полок.
@@ -210,6 +211,12 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
               ($1, $3, $4, 'PB-B', 7, 'defective')`,
       [far.id, near.id, warehouseId, alpha.body.id]));
 
+    // У другого продавца тот же артикул в соседней ячейке: это его товар,
+    // и лист Альфы не должен вести к нему.
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
+       VALUES ($1, $2, $3, 'PB-A', 30, 'good')`, [blocks[1].id, warehouseId, beta.body.id]));
+
     const sheet = await api('GET', `/api/supplies/${supplyId}`, { token: ownerToken });
     check('лист комплектации ведёт по складу, а не по алфавиту', () => {
       const order = sheet.body.picking.map((r) => r.sku);
@@ -218,7 +225,7 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     });
     check('в листе написано, из какой ячейки брать и сколько там есть', () => {
       const a = sheet.body.picking.find((r) => r.sku === 'PB-A');
-      assert.equal(a.cells.length, 1, JSON.stringify(a.cells));
+      assert.equal(a.cells.length, 1, 'в листе ячейка чужого продавца: ' + JSON.stringify(a.cells));
       assert.ok(a.cells[0].label, 'у ячейки нет адреса');
       assert.equal(a.available, 50);
     });
@@ -226,6 +233,18 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       const b = sheet.body.picking.find((r) => r.sku === 'PB-B');
       assert.equal(b.available, 50, 'семь бракованных попали в доступное к отбору');
       assert.equal(b.cells.length, 1, JSON.stringify(b.cells));
+    });
+
+    // Количество отбора — целое, больше нуля и не больше, чем осталось по заказу.
+    const o3Item = (await api('GET', `/api/invoices/${o3}`, { token: ownerToken })).body.items[0];
+    const badQty = [];
+    for (const pickedQty of ['NaN', 1.5, 0, 6]) {
+      badQty.push((await api('POST', '/api/shipping', {
+        token: workerToken, body: { invoiceItemId: o3Item.id, pickedQty, cellBlockId: near.id },
+      })).status);
+    }
+    check('отбор «NaN», дробью, нулём или больше заказанного не записывается', () => {
+      assert.deepEqual(badQty, [400, 400, 400, 409]);
     });
 
     for (const orderId of [o1, o2, o3]) {
@@ -239,10 +258,15 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(picked.status, 201, JSON.stringify(picked.body));
     }
 
-    const ready = await api('POST', `/api/supplies/${supplyId}/ready`, { token: ownerToken });
-    check('после сборки всех заказов — собрана, со временем', () => {
-      assert.equal(ready.status, 200, JSON.stringify(ready.body));
-      assert.ok(ready.body.ready_at);
+    const ready = (await api('GET', '/api/supplies', { token: ownerToken })).body.find((x) => x.id === supplyId);
+    check('собран последний заказ — поставка сама стала собранной, со временем', () => {
+      assert.equal(ready.status, 'ready', JSON.stringify(ready));
+      assert.ok(ready.ready_at);
+      assert.equal(ready.picked, 3);
+    });
+    const single = await api('POST', `/api/shipping/${o1}/ship`, { token: workerToken });
+    check('заказ из поставки отдельно не отгрузить — он уезжает вместе с ней', () => {
+      assert.equal(single.status, 409, JSON.stringify(single.body));
     });
 
     const shipped = await api('POST', `/api/supplies/${supplyId}/ship`, {
@@ -254,7 +278,7 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(shipped.body.destination, 'СЦ Подольск');
     });
 
-    const back = await api('POST', `/api/supplies/${supplyId}/ready`, { token: ownerToken });
+    const back = await api('POST', `/api/supplies/${supplyId}/ship`, { token: ownerToken });
     check('уехавшую назад не вернуть — машина ушла, и база не должна врать', () => {
       assert.equal(back.status, 409, JSON.stringify(back.body));
       assert.ok(String(back.body.error).includes('уехала'), back.body.error);

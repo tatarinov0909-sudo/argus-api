@@ -152,8 +152,18 @@ async function loginStaffKey({ keyCode }) {
     return {
       token, name: key.name, warehouseId: key.warehouse_id, role,
       grants: role === 'manager' ? (key.permissions || []) : [],
+      warehouseName: await warehouseLabel(key.warehouse_id),
     };
   });
+}
+
+// Название склада для экрана входа — настоящее, из базы. Отдельным запросом
+// в контексте склада: без него изоляция вернёт ноль строк, и это правильно.
+async function warehouseLabel(warehouseId) {
+  const wh = await withTenantContext({ warehouseId },
+    (c) => c.query('SELECT name, city FROM warehouses WHERE id = $1', [warehouseId]));
+  const w = wh.rows[0] || {};
+  return [w.name, w.city].filter(Boolean).join(', ') || null;
 }
 
 async function loginSellerKey({ keyCode, name }) {
@@ -179,16 +189,12 @@ async function loginSellerKey({ keyCode, name }) {
     });
     // Имя склада — чтобы кабинет продавца не подписывался выдуманным.
     // В шапке было вписано руками «Склад №1, Люберцы», и клиент читал это
-    // как настоящее название. Отдельным запросом в контексте склада: без
-    // него изоляция вернёт ноль строк, и это правильно.
-    const wh = await withTenantContext({ warehouseId: key.warehouse_id },
-      (c) => c.query('SELECT name, city FROM warehouses WHERE id = $1', [key.warehouse_id]));
-    const w = wh.rows[0] || {};
+    // как настоящее название.
     return {
       token,
       name,
       companyName: key.company_name,
-      warehouseName: [w.name, w.city].filter(Boolean).join(', ') || null,
+      warehouseName: await warehouseLabel(key.warehouse_id),
     };
   });
 }
