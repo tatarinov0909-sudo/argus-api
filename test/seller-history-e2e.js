@@ -51,8 +51,12 @@ const { withTenantContext, pool } = require('../src/db/pool');
     const shipped=after.events.find(e=>e.kind==='shipped');
     const picked=after.events.find(e=>e.kind==='picked');
     assert.ok(shipped && new Date(shipped.at)>new Date(picked.at),'departure is a later real event');
-    assert.equal(shipped.qty,3);assert.equal(shipped.fromCell.label,'HISTORY-A');
-    assert.equal(after.events.find(e=>e.kind==='received').toCell.label,'HISTORY-A');
+    assert.equal(shipped.qty,3);
+    // Cells are warehouse internals: the seller never gets them, the owner does.
+    assert.ok(after.events.every(e=>e.fromCell===undefined&&e.toCell===undefined));
+    const ownerView=await api('GET',`/api/sellers/history?sku=SharedCase&companyId=${alpha.id}`,owner);
+    assert.equal(ownerView.events.find(e=>e.kind==='shipped').fromCell.label,'HISTORY-A');
+    assert.equal(ownerView.events.find(e=>e.kind==='received').toCell.label,'HISTORY-A');
     assert.ok(after.events.every(e=>e.document!=='FOREIGN-IN'));
 
     const second=await invoice(alpha.id,'HISTORY-SUPPLY-ORDER','out',4);

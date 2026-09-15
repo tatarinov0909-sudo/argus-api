@@ -230,12 +230,11 @@ async function api(method, path, { token, body } = {}) {
     });
     const mappedStock = await api('GET', '/api/sellers/stock', { token: mappedLogin.body.token });
     check('seller sees the assigned product and the explicit zero from 1C', () => {
-      const row = mappedStock.body.find((item) => item.sku === 'SKU-U');
+      const row = mappedStock.body.rows.find((item) => item.sku === 'SKU-U');
       assert.ok(row, JSON.stringify(mappedStock.body));
-      assert.equal(row.qtyIn1c, 0);
-      // A number from 1C is the reconciliation source. Physical Argus stock
-      // remains unknown until the warehouse receives or counts the product.
-      assert.equal(row.stockKnown, false);
+      // An explicit zero from 1C is a known zero, not a missing number.
+      assert.equal(row.total, 0);
+      assert.equal(row.totalKnown, true);
     });
 
     const archived = await api('PATCH', `/api/sellers/companies/${mappedSeller.body.id}/archive`, {

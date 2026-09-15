@@ -203,11 +203,11 @@ function calculation(overrides = {}) {
         ok(await api('GET', '/api/sync/status', { token }), 403);
       }
       const stock = ok(await api('GET', '/api/sellers/stock', { token: seller.token }));
-      assert.deepEqual(stock.map(row => row.qtyIn1c).sort((a, b) => a - b), [7, 8, 9]);
-      for (const row of stock) {
+      assert.deepEqual(stock.rows.map(row => row.total).sort((a, b) => a - b), [7, 8, 9]);
+      for (const row of stock.rows) {
         assert.ok(!Object.hasOwn(row, 'stockCalculation'));
         assert.ok(!Object.hasOwn(row, 'stock_calculation'));
-        assert.equal(row.stockKnown, false);
+        assert.ok(!Object.hasOwn(row, 'qtyIn1c'));
       }
     });
   } catch (error) {

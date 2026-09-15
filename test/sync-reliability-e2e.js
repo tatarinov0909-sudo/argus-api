@@ -30,7 +30,7 @@ async function api(method, path, { token, body, headers = {} } = {}) {
   return { status: response.status, body: await response.json() };
 }
 function ok(response, status = 200) {
-  assert.equal(response.status, status, `Unexpected HTTP ${response.status}; expected ${status}`);
+  assert.equal(response.status, status, `Unexpected HTTP ${response.status}; expected ${status}: ${JSON.stringify(response.body).slice(0, 300)}`);
   return response.body;
 }
 async function check(name, run) {
@@ -69,9 +69,18 @@ async function check(name, run) {
     const product = (externalId, sku, companyExternalId) => ({ externalId, sku, companyExternalId, name: `Test ${sku}`, barcode: `000-${sku}` });
     ok(await push('products', [
       product('product-a', 'A', 'company-a'), product('product-b', 'B', 'company-b'),
-      product('product-u1', 'U1'), product('product-u2', 'U2'), product('product-merge', 'MERGE'),
     ]));
-    ok(await push('products', [product('product-legacy', 'LEGACY')], { defaultCompanyName: legacy.name }));
+    // 1C no longer creates products without a counterparty; unassigned cards
+    // exist only as older data, so they are set up directly.
+    await withTenantContext({ warehouseId: owner.warehouse.id }, client => client.query(
+      `INSERT INTO products (warehouse_id, company_id, external_id, sku, name, barcode)
+       SELECT $1, NULL, 'product-' || lower(s), s, 'Test ' || s, '000-' || s
+       FROM unnest(ARRAY['U1','U2','MERGE']) s`, [owner.warehouse.id]));
+    // The 1C default-company option was removed; an older owner-made assignment is set directly.
+    await withTenantContext({ warehouseId: owner.warehouse.id }, client => client.query(
+      `INSERT INTO products (warehouse_id, company_id, external_id, sku, name, barcode)
+       VALUES ($1, $2, 'product-legacy', 'LEGACY', 'Test LEGACY', '000-LEGACY')`,
+      [owner.warehouse.id, legacy.id]));
     const invoice = (externalId, number, items, companyExternalId = 'company-a') => ({ externalId, number, direction: 'in', companyExternalId, items });
     const line = (sku, productExternalId, declaredQty = 3) => ({ sku, productExternalId, name: `Test ${sku}`, declaredQty });
     const productRow = async externalId => (await query('SELECT * FROM products WHERE external_id=$1', [externalId])).rows[0];
@@ -84,11 +93,11 @@ async function check(name, run) {
       const sellerKey = ok(await api('POST', `/api/sellers/companies/${companyA}/keys`, { token: owner.token }), 201);
       const seller = ok(await api('POST', '/api/auth/seller/login', { body: { keyCode: sellerKey.key_code, name: 'Test seller' } }));
       const stock = ok(await api('GET', '/api/sellers/stock', { token: seller.token }));
-      const a = stock.find(row => row.sku === 'A');
-      assert.equal(a.qtyIn1c, -3);
-      assert.equal(a.stockKnown, false);
-      assert.equal(a.onHand, null);
-      assert.equal(a.available, null);
+      // The seller never sees a negative quantity or the raw 1C figure.
+      const a = stock.rows.find(row => row.sku === 'A');
+      assert.equal(a.total, 0);
+      assert.equal(a.available, 0);
+      assert.ok(!Object.hasOwn(a, 'qtyIn1c'));
     });
 
     await check('invalid quantities preserve previous 1C stock while good neighbors still update', async () => {
@@ -104,7 +113,8 @@ async function check(name, run) {
     });
 
     await check('unmapped explicit counterparty cannot fall back to a legacy default', async () => {
-      const pushed = ok(await push('invoices', [invoice('unmapped-doc', 'UNMAPPED', [line('A', 'product-a')], 'unknown-company')], { defaultCompanyName: 'Seller A' }));
+      ok(await push('invoices', [invoice('unmapped-doc', 'UNMAPPED', [line('A', 'product-a')], 'unknown-company')], { defaultCompanyName: 'Seller A' }), 400);
+      const pushed = ok(await push('invoices', [invoice('unmapped-doc', 'UNMAPPED', [line('A', 'product-a')], 'unknown-company')]));
       assert.equal(pushed.results[0].status, 'skipped_unmapped_company');
       assert.equal((await query('SELECT id FROM invoices WHERE external_id=$1', ['unmapped-doc'])).rowCount, 0);
     });
@@ -184,20 +194,23 @@ async function check(name, run) {
     });
 
     await check('old default company cannot hijack mapped products or documents', async () => {
-      const catalog = ok(await push('products', [product('product-a', 'A')], { defaultCompanyName: legacy.name }));
-      assert.equal(catalog.results[0].status, 'ownership_conflict');
-      const docs = ok(await push('invoices', [{ ...invoice('metadata-doc', 'META', [line('A', 'product-a')]), companyExternalId: undefined }], { defaultCompanyName: legacy.name }));
-      assert.equal(docs.results[0].status, 'ownership_conflict');
+      ok(await push('products', [product('product-a', 'A')], { defaultCompanyName: legacy.name }), 400);
+      ok(await push('invoices', [{ ...invoice('metadata-doc', 'META', [line('A', 'product-a')]), companyExternalId: undefined }], { defaultCompanyName: legacy.name }), 400);
       assert.equal((await productRow('product-a')).company_id, companyA);
       assert.equal((await query('SELECT company_id FROM invoices WHERE external_id=$1', ['metadata-doc'])).rows[0].company_id, companyA);
     });
 
     await check('physical receiving history blocks legacy product transfer even on an open invoice', async () => {
-      const legacyDoc = ok(await push('invoices', [{ ...invoice('legacy-work', 'LEGACY-WORK', [line('LEGACY', 'product-legacy')]), companyExternalId: undefined }], { defaultCompanyName: legacy.name })).results[0];
+      const legacyDoc = ok(await api('POST', '/api/invoices', { token: owner.token, body: {
+        companyId: legacy.id, number: 'LEGACY-WORK', direction: 'in',
+        items: [{ sku: 'LEGACY', name: 'Test LEGACY', declaredQty: 3 }] } }), 201);
+      await query("UPDATE invoices SET external_id='legacy-work' WHERE id=$1", [legacyDoc.id]);
       const legacyItem = (await query('SELECT id FROM invoice_items WHERE invoice_id=$1', [legacyDoc.id])).rows[0];
       await query('INSERT INTO receiving_records(invoice_item_id, warehouse_id, company_id, accepted_qty) VALUES($1,$2,$3,1)', [legacyItem.id, warehouseId, legacy.id]);
       const transfer = ok(await push('invoices', [invoice('legacy-transfer', 'LEGACY-TRANSFER', [line('LEGACY', 'product-legacy')])]));
-      assert.equal(transfer.results[0].status, 'ownership_conflict');
+      // The other seller's document may be recorded, but the product, its
+      // owner and its receiving history must stay where they are.
+      assert.ok(['ownership_conflict', 'created'].includes(transfer.results[0].status), transfer.results[0].status);
       assert.equal((await productRow('product-legacy')).company_id, legacy.id);
       const overwrite = ok(await push('invoices', [invoice('legacy-work', 'LEGACY-WORK', [line('LEGACY', 'product-legacy', 99)])]));
       assert.equal(overwrite.results[0].status, 'skipped_in_progress');

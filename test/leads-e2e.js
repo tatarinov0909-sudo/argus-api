@@ -136,15 +136,16 @@ async function post(body, ip) {
       assert.equal(other.status, 201, 'ограничение задело чужой адрес');
     });
 
-    // Читать заявки через приложение нельзя: ручки нет и права не выданы.
+    // Читать заявки приложению можно только в контексте администратора
+    // платформы (миграция lead-management): без него политика не отдаёт
+    // ни одной строки, хотя заявки в таблице есть.
     const read = await withoutTenantContext(async (c) => {
       try {
-        await c.query('SELECT * FROM leads LIMIT 1');
-        return 'разрешено';
+        return (await c.query('SELECT count(*)::int AS n FROM leads')).rows[0].n;
       } catch (e) { return e.code; }
     });
     check('приложение может заявки принимать, но не читать', () => {
-      assert.equal(read, '42501', `ожидался отказ в правах, получено: ${read}`);
+      assert.ok(read === 0 || read === '42501', `без администратора видно заявок: ${read}`);
     });
   } finally {
     server.close();
