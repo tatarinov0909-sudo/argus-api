@@ -13,10 +13,27 @@ const { formatBlockLabel } = require('../cells/label');
 
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
-    `SELECT p.sku, p.name, p.category, p.weight_g, p.barcode,
+    `WITH product_catalog AS (
+       SELECT p.sku, p.name, p.category, p.weight_g,
+              COALESCE(NULLIF(BTRIM(p.barcode), ''), mapped.barcode) AS barcode,
+              p.reserved_qty, p.reserved_at, p.stock_qty_1c, p.stock_at
+       FROM products p
+       LEFT JOIN LATERAL (
+         SELECT CASE WHEN COUNT(DISTINCT BTRIM(m.mp_barcode)) = 1
+                     THEN MAX(BTRIM(m.mp_barcode)) END AS barcode
+         FROM product_marketplace_skus m
+         WHERE m.warehouse_id = p.warehouse_id
+           AND m.company_id = p.company_id
+           AND m.sku = p.sku
+           AND m.marketplace = 'wb'
+           AND NULLIF(BTRIM(m.mp_barcode), '') IS NOT NULL
+       ) mapped ON true
+       WHERE p.warehouse_id = $1 AND p.active
+     )
+     SELECT p.sku, p.name, p.category, p.weight_g, p.barcode,
             p.reserved_qty, p.reserved_at, p.stock_qty_1c, p.stock_at
-     FROM products p
-     WHERE p.warehouse_id = $1 AND p.active AND (p.sku ILIKE $2 OR p.name ILIKE $2)
+     FROM product_catalog p
+     WHERE p.sku ILIKE $2 OR p.name ILIKE $2 OR p.barcode ILIKE $2
 
      UNION
 

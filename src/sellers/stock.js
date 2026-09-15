@@ -29,10 +29,32 @@ async function loadStock(client, companyId) {
              UNION ALL
              SELECT sku,created_at FROM stock_operations WHERE company_id=$1
            ) operations GROUP BY sku
+         ), accepted_snapshot AS (
+           SELECT id,observed_at,accepted_at
+           FROM seller_inventory_snapshots
+           WHERE company_id=$1 AND status='accepted'
+           ORDER BY accepted_at DESC,id DESC
+           LIMIT 1
+         ), accepted AS (
+           SELECT i.sku,i.quantity,s.id AS snapshot_id,
+                  COALESCE(s.observed_at,s.accepted_at) AS snapshot_at
+           FROM accepted_snapshot s
+           JOIN seller_inventory_snapshot_items i ON i.snapshot_id=s.id
          ), prod AS (
-           SELECT sku, name, barcode, stock_qty_1c, stock_at
-           FROM products
-           WHERE company_id = $1 AND active = true
+           SELECT p.sku, p.name,
+                  COALESCE(NULLIF(BTRIM(p.barcode), ''), mapped.barcode) AS barcode,
+                  p.stock_qty_1c, p.stock_at
+           FROM products p
+           LEFT JOIN LATERAL (
+             SELECT CASE WHEN COUNT(DISTINCT BTRIM(m.mp_barcode)) = 1
+                         THEN MAX(BTRIM(m.mp_barcode)) END AS barcode
+             FROM product_marketplace_skus m
+             WHERE m.company_id = p.company_id
+               AND m.sku = p.sku
+               AND m.marketplace = 'wb'
+               AND NULLIF(BTRIM(m.mp_barcode), '') IS NOT NULL
+           ) mapped ON true
+           WHERE p.company_id = $1 AND p.active = true
          ), ordered AS (
            -- Сколько этого товара уже обещано заказами и ещё не уехало.
            --
@@ -68,8 +90,9 @@ async function loadStock(client, companyId) {
            UNION SELECT sku FROM cells
            UNION SELECT sku FROM ordered
            UNION SELECT sku FROM observed
+           UNION SELECT sku FROM accepted
          )
-         SELECT s.sku,
+         SELECT s.sku, p.sku AS product_sku,
                 COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
                                   WHERE ii.company_id = $1 AND ii.sku = s.sku
                                   ORDER BY ii.id DESC LIMIT 1),
@@ -77,6 +100,7 @@ async function loadStock(client, companyId) {
                 c.good_qty, c.bad_qty, c.defective_qty, c.packaging_qty, c.cells,
                 c.stock_records, GREATEST(c.counted_at,obs.at) AS counted_at, obs.sku AS observed_sku,
                 p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
+                a.quantity AS accepted_qty,a.snapshot_id,a.snapshot_at,
                 o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
@@ -84,6 +108,7 @@ async function loadStock(client, companyId) {
          LEFT JOIN ordered o ON o.sku = s.sku
          LEFT JOIN staged st ON st.sku = s.sku
          LEFT JOIN observed obs ON obs.sku = s.sku
+         LEFT JOIN accepted a ON a.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
@@ -95,8 +120,20 @@ async function loadStock(client, companyId) {
       const onHand = Number(r.good_qty || 0) + staged;
       const ordered = Number(r.ordered_qty || 0);
       const stockKnown = Number(r.stock_records || 0) > 0 || r.observed_sku != null;
+      // The latest accounting balance from 1C is the seller-facing total.
+      // Accepted file snapshots remain stored for audit, but they must not
+      // freeze the cabinet after a newer automatic 1C exchange arrives.
+      const accountingTotal = r.stock_qty_1c === null || r.stock_qty_1c === undefined
+        ? null : Number(r.stock_qty_1c);
+      const total = accountingTotal === null ? null : Math.max(0, accountingTotal);
+      // "In assembly" starts only after a worker has physically taken the
+      // goods from a cell. A marketplace order by itself is demand, not a
+      // confirmed warehouse action, so it cannot reserve seller inventory.
+      const inAssembly = total === null ? 0 : Math.min(total, staged);
+      const sellerAvailable = total === null ? null : total - inAssembly;
       return {
       sku: r.sku,
+      listed: r.product_sku != null,
       name: r.name,
       barcode: r.barcode || null,
       stockKnown,
@@ -111,10 +148,17 @@ async function loadStock(client, companyId) {
       cells: Number(r.cells || 0),
       // Цифра из 1С склада и время, когда она пришла. Без времени нельзя
       // отличить «на складе ноль» от «обмен молчит вторую неделю».
-      qtyIn1c: r.stock_qty_1c === null || r.stock_qty_1c === undefined
-        ? null : Number(r.stock_qty_1c),
+      qtyIn1c: accountingTotal,
       stockAt: r.stock_at || null,
-      // Три числа, которые продавец и звонит спрашивать.
+      acceptedSnapshotId: r.snapshot_id || null,
+      acceptedSnapshotAt: r.snapshot_at || null,
+      // Stable seller contract. The public route exposes only these business
+      // quantities; it does not reveal 1C, cells, or reconciliation details.
+      total,
+      totalKnown: total !== null,
+      totalUpdatedAt: accountingTotal === null ? null : (r.stock_at || null),
+      inAssembly,
+      sellerAvailable,
       onHand: stockKnown ? onHand : null,
       ordered,
       blockedOrdered: Number(r.blocked_qty || 0),

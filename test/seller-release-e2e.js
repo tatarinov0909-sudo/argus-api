@@ -49,19 +49,54 @@ const { pool, withTenantContext } = require('../src/db/pool');
       await c.query(
       `INSERT INTO products(warehouse_id,company_id,sku,name,barcode,stock_qty_1c,stock_at)
        VALUES($1,$2,'SAME-SKU','Synthetic product','0000123456789',0,now()),
-             ($1,$2,'ONLY-1C','Not received yet',NULL,900,now())`, [warehouseId,a.id]);
+             ($1,$2,'ONLY-1C','Not received yet',NULL,900,now()),
+             ($1,$2,'AMBIGUOUS-BARCODE','Ambiguous barcode',NULL,1,now())`, [warehouseId,a.id]);
+      await c.query(
+        `INSERT INTO product_marketplace_skus
+           (warehouse_id,company_id,sku,marketplace,mp_sku,mp_barcode)
+         VALUES($1,$2,'ONLY-1C','wb','111111111','0000999000001'),
+               ($1,$2,'AMBIGUOUS-BARCODE','wb','222222221','0000999000002'),
+               ($1,$2,'AMBIGUOUS-BARCODE','wb','222222222','0000999000003')`,
+        [warehouseId,a.id]);
       await c.query(
         `INSERT INTO products(warehouse_id,company_id,sku,name,active)
          VALUES($1,$2,'INACTIVE-PILOT-FIXTURE','Inactive fixture',false)`, [warehouseId,a.id]);
+      const accepted = (await c.query(
+        `INSERT INTO seller_inventory_snapshots
+           (warehouse_id,company_id,source_kind,source_label,observed_at,accepted_at,status,item_count,total_qty,content_hash)
+         VALUES($1,$2,'file','isolated-test.json',now(),now(),'accepted',3,1901,'test-hash') RETURNING id`,
+        [warehouseId,a.id],
+      )).rows[0];
+      await c.query(
+        `INSERT INTO seller_inventory_snapshot_items(snapshot_id,warehouse_id,company_id,sku,quantity)
+         VALUES($1,$2,$3,'SAME-SKU',1000),($1,$2,$3,'ONLY-1C',900),($1,$2,$3,'AMBIGUOUS-BARCODE',1)`,
+        [accepted.id,warehouseId,a.id],
+      );
     });
-    async function stock() { return (await api('GET','/api/sellers/stock',sa)).find(r=>r.sku==='SAME-SKU'); }
+    async function stock() { return (await api('GET','/api/sellers/stock?companyId='+a.id,token)).find(r=>r.sku==='SAME-SKU'); }
     let row = await stock();
     assert.equal(row.qtyIn1c,0); assert.equal(row.barcode,'0000123456789'); assert.equal(row.onHand,100);
-    const only1c = (await api('GET','/api/sellers/stock',sa)).find(r=>r.sku==='ONLY-1C');
+    const sellerView = await api('GET','/api/sellers/stock',sa);
+    const sellerSame = sellerView.rows.find(r=>r.sku==='SAME-SKU');
+    assert.deepEqual(Object.keys(sellerSame).sort(), ['available','barcode','inAssembly','name','sku','total','totalKnown','updatedAt'].sort());
+    assert.equal(sellerSame.total,0); assert.equal(sellerSame.inAssembly,0); assert.equal(sellerSame.available,0); assert.equal(sellerSame.totalKnown,true);
+    assert.equal(JSON.stringify(sellerSame).includes('cell'),false); assert.equal(JSON.stringify(sellerSame).includes('1c'),false);
+    assert.equal(JSON.stringify(sellerView).includes('reserved'),false);
+    assert.equal(sellerView.summary.productCount,3); assert.equal(sellerView.summary.total,901);
+    assert.equal(sellerView.summary.inAssembly,0); assert.equal(sellerView.summary.available,901);
+    await withTenantContext({warehouseId},c=>c.query(
+      `UPDATE products SET stock_qty_1c=2,stock_at=now() WHERE company_id=$1 AND sku='SAME-SKU'`,[a.id]));
+    assert.equal((await api('GET','/api/sellers/stock',sa)).rows.find(r=>r.sku==='SAME-SKU').total,2);
+    await withTenantContext({warehouseId},c=>c.query(
+      `UPDATE products SET stock_qty_1c=100,stock_at=now() WHERE company_id=$1 AND sku='SAME-SKU'`,[a.id]));
+    const only1c = (await api('GET','/api/sellers/stock?companyId='+a.id,token)).find(r=>r.sku==='ONLY-1C');
     assert.equal(only1c.onHand,null); assert.equal(only1c.available,null); assert.equal(only1c.stockKnown,false); assert.equal(only1c.qtyIn1c,900);
-    assert.equal((await api('GET','/api/sellers/stock',sa)).some(r=>r.sku==='INACTIVE-PILOT-FIXTURE'),false);
+    assert.equal(only1c.barcode,'0000999000001');
+    const ambiguous = (await api('GET','/api/sellers/stock?companyId='+a.id,token)).find(r=>r.sku==='AMBIGUOUS-BARCODE');
+    assert.equal(ambiguous.barcode,null);
+    assert.equal((await api('GET','/api/sellers/stock',sa)).rows.some(r=>r.sku==='INACTIVE-PILOT-FIXTURE'),false);
     assert.equal((await api('GET','/api/sellers/catalog',sa)).products.some(r=>r.sku==='INACTIVE-PILOT-FIXTURE'),false);
-    console.log('PASS zero 1C balance and barcode preserved; 1C never overrides Argus stock');
+    console.log('PASS latest 1C quantity replaces the older file snapshot; internal fields stay hidden');
 
     const order = await invoice(a,'out',30);
     const orders = await api('GET','/api/sellers/orders',sa);
@@ -72,15 +107,33 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal((await api('GET','/api/sellers/orders?companyId='+a.id,token)).rows.length,1);
     await api('GET','/api/sellers/orders',null,undefined,401);
     console.log('PASS seller orders and company isolation, including query override');
+    await invoice(a,'out',2,'ORDER-ONLY');
+    const stockWithUnresolved = await api('GET','/api/sellers/stock',sa);
+    assert.equal(stockWithUnresolved.rows.some(r=>r.sku==='ORDER-ONLY'),false);
+    assert.equal(stockWithUnresolved.summary.total,1001);
+    assert.equal(stockWithUnresolved.summary.inAssembly,0);
+    assert.equal(stockWithUnresolved.summary.available,1001);
+    assert.equal(JSON.stringify(stockWithUnresolved).includes('reserved'),false);
+    console.log('PASS unresolved orders do not create inventory or an invented seller reserve');
     row=await stock(); assert.equal(row.available,70); assert.equal(row.ordered,30);
     await api('POST','/api/shipping',worker,{invoiceItemId:order.items[0].id,pickedQty:10,cellBlockId:cells[0].id,isFinal:false},201);
     row=await stock(); assert.equal(row.qty,90); assert.equal(row.staged,10); assert.equal(row.onHand,100); assert.equal(row.available,70);
+    let sellerDuringPick=await api('GET','/api/sellers/stock',sa);
+    assert.equal(sellerDuringPick.summary.total,1001);
+    assert.equal(sellerDuringPick.summary.inAssembly,10);
+    assert.equal(sellerDuringPick.summary.available,991);
     await api('POST','/api/shipping',worker,{invoiceItemId:order.items[0].id,pickedQty:20,cellBlockId:cells[0].id,isFinal:true},201);
     row=await stock(); assert.equal(row.qty,70); assert.equal(row.staged,30); assert.equal(row.onHand,100); assert.equal(row.available,70);
+    sellerDuringPick=await api('GET','/api/sellers/stock',sa);
+    assert.equal(sellerDuringPick.summary.inAssembly,30);
+    assert.equal(sellerDuringPick.summary.available,971);
     assert.equal((await api('GET','/api/sellers/movements',sa)).shipped.length,0);
     console.log('PASS new order, partial pick and ready order keep available=70; ready is not shipped');
     await api('POST',`/api/shipping/${order.id}/ship`,token,{});
     row=await stock(); assert.equal(row.onHand,70); assert.equal(row.staged,0); assert.equal(row.ordered,0); assert.equal(row.available,70);
+    sellerDuringPick=await api('GET','/api/sellers/stock',sa);
+    assert.equal(sellerDuringPick.summary.inAssembly,0);
+    assert.equal(sellerDuringPick.summary.available,1001);
     assert.equal((await api('GET','/api/sellers/movements',sa)).shipped.length,2);
     console.log('PASS departure decreases on-hand and releases the order exactly once');
 
@@ -91,7 +144,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(history.events.filter(r=>r.kind==='received').length,1);
     assert.ok(history.events.some(r=>r.note==='Test damaged box'));
     const foreign=await api('GET',`/api/sellers/stock?companyId=${a.id}`,sb);
-    assert.equal(foreign.length,1); assert.equal(foreign[0].onHand,55);
+    assert.equal(foreign.rows.length,0);
     const foreignHistory=await api('GET',`/api/sellers/history?sku=SAME-SKU&companyId=${a.id}`,sb);
     assert.equal(foreignHistory.events.length,1); assert.equal(foreignHistory.events[0].qty,55);
     await api('GET',`/api/invoices/${order.id}`,sb,undefined,404);
@@ -103,21 +156,32 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const docs=await api('GET','/api/sellers/documents?companyId='+a.id,sb);
     assert.equal(docs.rows.length,1); assert.equal(docs.rows[0].direction,'in');
     assert.equal(Number(docs.rows[0].declared_qty),55);
-    const blocked=await api('GET','/api/sellers/export/1c?download=1',sa,undefined,422);
-    assert.ok(blocked.issues.some(i=>i.sku==='ONLY-1C'&&i.code==='unknown_stock'));
+    await api('GET','/api/sellers/export/1c?download=1',sa,undefined,403);
+    const blocked=await api('GET','/api/sellers/export/1c?download=1&companyId='+a.id,token,undefined,422);
+    assert.ok(blocked.issues.some(i=>i.sku==='AMBIGUOUS-BARCODE'&&i.code==='missing_barcode'));
     await withTenantContext({warehouseId},c=>c.query(
-      `INSERT INTO products(warehouse_id,company_id,sku,name,barcode) VALUES($1,$2,'SAME-SKU','Synthetic B','0000000000555')`,[warehouseId,b.id]));
-    const snapshot=await api('GET','/api/sellers/export/1c?download=1&companyId='+a.id,sb);
+      `INSERT INTO products(warehouse_id,company_id,sku,name,barcode,stock_qty_1c,stock_at) VALUES($1,$2,'SAME-SKU','Synthetic B','0000000000555',55,now())`,[warehouseId,b.id]));
+    const snapshot=await api('GET','/api/sellers/export/1c?download=1&companyId='+b.id,token);
     assert.equal(snapshot.seller.id,b.id); assert.equal(snapshot.items.length,1);
     assert.equal(snapshot.items[0].barcode,'0000000000555'); assert.equal(snapshot.items[0].available,55);
     const outB=await invoice(b,'out',55);
     await api('POST','/api/shipping',worker,{invoiceItemId:outB.items[0].id,pickedQty:55,cellBlockId:cells[1].id,isFinal:true},201);
-    let emptyCell=(await api('GET','/api/sellers/stock',sb))[0];
+    let emptyCell=(await api('GET','/api/sellers/stock?companyId='+b.id,token)).find(r=>r.sku==='SAME-SKU');
     assert.equal(emptyCell.onHand,55); assert.equal(emptyCell.stockKnown,true); assert.equal(emptyCell.available,0);
     await api('POST',`/api/shipping/${outB.id}/ship`,token,{});
-    emptyCell=(await api('GET','/api/sellers/stock',sb))[0];
+    emptyCell=(await api('GET','/api/sellers/stock?companyId='+b.id,token)).find(r=>r.sku==='SAME-SKU');
     assert.equal(emptyCell.onHand,0); assert.equal(emptyCell.stockKnown,true); assert.equal(emptyCell.available,0);
-    assert.equal((await api('GET','/api/sellers/export/1c?download=1',sb)).items[0].onHand,0);
+    let sellerAfterArgusShip=await api('GET','/api/sellers/stock',sb);
+    assert.equal(sellerAfterArgusShip.rows[0].total,55);
+    assert.equal(sellerAfterArgusShip.rows[0].inAssembly,0);
+    assert.equal(sellerAfterArgusShip.rows[0].available,55);
+    await withTenantContext({warehouseId},c=>c.query(
+      `UPDATE products SET stock_qty_1c=0,stock_at=now() WHERE company_id=$1 AND sku='SAME-SKU'`,[b.id]));
+    sellerAfterArgusShip=await api('GET','/api/sellers/stock',sb);
+    assert.equal(sellerAfterArgusShip.rows[0].total,0);
+    assert.equal(sellerAfterArgusShip.rows[0].available,0);
+    assert.equal((await api('GET','/api/sellers/export/1c?download=1&companyId='+b.id,token)).items[0].onHand,0);
+    console.log('PASS shipment becomes final in seller quantities after the following 1C stock update');
     console.log('PASS profile, documents and export isolation; unknown blocked; leading zeros preserved; depleted stock stays known zero');
     await withTenantContext({warehouseId},c=>c.query(
       `INSERT INTO product_marketplace_skus(warehouse_id,company_id,sku,marketplace,mp_sku,mp_article)

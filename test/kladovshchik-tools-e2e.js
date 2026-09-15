@@ -185,6 +185,43 @@ function warehouseIdOf(token) {
       assert.equal(foundByName[0].name, 'Лимонад Лайм');
     });
 
+    await run(async (c) => {
+      await c.query(
+        `INSERT INTO products (warehouse_id, company_id, sku, name, barcode)
+         VALUES ($1, $2, 'BARCODE-1C', 'Товар со штрихкодом 1С', '2052933484295')`,
+        [warehouseId, companyId],
+      );
+      await c.query(
+        `INSERT INTO products (warehouse_id, company_id, sku, name)
+         VALUES ($1, $2, 'BARCODE-WB', 'Товар со штрихкодом WB')`,
+        [warehouseId, companyId],
+      );
+      await c.query(
+        `INSERT INTO product_marketplace_skus
+           (warehouse_id, company_id, sku, marketplace, mp_barcode)
+         VALUES ($1, $2, 'BARCODE-WB', 'wb', '2052933484296')`,
+        [warehouseId, companyId],
+      );
+    });
+
+    const foundBy1cBarcode = await run((c) => (
+      kladovshchik.findProducts(c, warehouseId, '2052933484295')
+    ));
+    check('находит товар по штрихкоду из карточки 1С', () => {
+      assert.equal(foundBy1cBarcode.length, 1, JSON.stringify(foundBy1cBarcode));
+      assert.equal(foundBy1cBarcode[0].sku, 'BARCODE-1C');
+      assert.equal(foundBy1cBarcode[0].barcode, '2052933484295');
+    });
+
+    const foundByWbBarcode = await run((c) => (
+      kladovshchik.findProducts(c, warehouseId, '2052933484296')
+    ));
+    check('находит товар по однозначно сопоставленному штрихкоду WB', () => {
+      assert.equal(foundByWbBarcode.length, 1, JSON.stringify(foundByWbBarcode));
+      assert.equal(foundByWbBarcode[0].sku, 'BARCODE-WB');
+      assert.equal(foundByWbBarcode[0].barcode, '2052933484296');
+    });
+
     check('годное и брак в поиске разделены, а не свалены в одну цифру', () => {
       // 8 принятых + 3 годных из возврата = 11 к отгрузке; 2 брака лежат
       // на той же полке, но клиенту не уедут — и в ответе это видно.

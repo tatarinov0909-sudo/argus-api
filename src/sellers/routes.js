@@ -12,6 +12,48 @@ const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
 const router = express.Router();
 
+// A seller receives only the quantities needed to run the shop. Accounting
+// source, cells and other warehouse internals stay in owner/manager APIs.
+function sellerStockView(row) {
+  return {
+    sku: row.sku,
+    name: row.name,
+    barcode: row.barcode,
+    total: row.total,
+    totalKnown: row.totalKnown,
+    // Only a recorded warehouse pick confirms physical assembly. Marketplace
+    // demand alone stays on the orders page and does not change these figures.
+    inAssembly: row.inAssembly,
+    available: row.sellerAvailable,
+    updatedAt: row.totalUpdatedAt,
+  };
+}
+
+function sellerStockResponse(rows) {
+  // Only products with a current accounting quantity belong in the seller's
+  // inventory. Order-only lines stay visible on the orders page and cannot
+  // invent a product or a stock quantity.
+  const inventoryRows = rows.filter(row => row.listed && row.qtyIn1c !== null);
+  const unknownRows = inventoryRows.filter(row => !row.totalKnown);
+  const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
+  const updatedAt = inventoryRows
+    .map(row => row.totalUpdatedAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1) || null;
+
+  return {
+    rows: inventoryRows.map(sellerStockView),
+    summary: {
+      productCount: inventoryRows.length,
+      total: unknownRows.length ? null : sum(inventoryRows, 'total'),
+      inAssembly: sum(inventoryRows, 'inAssembly'),
+      available: unknownRows.length ? null : sum(inventoryRows, 'sellerAvailable'),
+      updatedAt,
+    },
+  };
+}
+
 async function requireActiveCompany(client, companyId) {
   const company = (await client.query(
     'SELECT id FROM companies WHERE id=$1 AND archived_at IS NULL',
@@ -74,7 +116,7 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
   } catch (err) { next(err); }
 });
 
-router.get('/export/1c', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+router.get('/export/1c', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400,'Укажите продавца');
@@ -82,7 +124,7 @@ router.get('/export/1c', requireAuth, requireRole('seller', 'owner', 'manager'),
       // All quantities come from one loadStock SQL statement (one MVCC snapshot).
       const company = (await c.query('SELECT id,name,warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL',[companyId])).rows[0];
       if (!company) throw new HttpError(404,'Компания не найдена');
-      return prepareInventoryExport(await loadStock(c,companyId), {
+      return prepareInventoryExport((await loadStock(c,companyId)).filter(row => row.listed || row.stockKnown), {
         seller: { id:company.id,name:company.name }, warehouse: { id:company.warehouse_id },
       });
     });
@@ -246,7 +288,12 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
       await requireActiveCompany(client, companyId);
       return loadStock(client, companyId);
     });
-    res.set('Cache-Control', 'no-store').json(rows);
+    // Keep real warehouse-only products visible, but do not create inventory
+    // rows from unresolved order lines that have neither a product nor stock.
+    const visibleRows = rows.filter(row => row.listed || row.stockKnown);
+    res.set('Cache-Control', 'no-store').json(
+      req.auth.role === 'seller' ? sellerStockResponse(rows) : visibleRows,
+    );
   } catch (err) { next(err); }
 });
 
@@ -332,6 +379,9 @@ router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), a
       await requireActiveCompany(client, companyId);
       return loadHistory(client, companyId, sku, page);
     });
+    if (req.auth.role === 'seller') {
+      result.events = result.events.map(({ fromCell, toCell, ...event }) => event);
+    }
     res.set('Cache-Control', 'no-store').json(result);
   } catch (err) { next(err); }
 });
