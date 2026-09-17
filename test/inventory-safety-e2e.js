@@ -45,7 +45,8 @@ const service = require('../src/inventory/service');
     await product('FOREIGN', foreign, accountB.token);
     const staff = must(await api('POST', '/api/staff', owner, { name: 'Test counter' }), 201);
     const worker = must(await api('POST', '/api/auth/staff/login', null, { keyCode: staff.key_code })).token;
-    const managerKey = must(await api('POST', '/api/staff', owner, { name: 'Test manager', kind: 'manager' }), 201);
+    // Пересчёт — работа по складу: менеджеру её открывает право «склад».
+    const managerKey = must(await api('POST', '/api/staff', owner, { name: 'Test manager', kind: 'manager', permissions: ['warehouse'] }), 201);
     const manager = must(await api('POST', '/api/auth/staff/login', null, { keyCode: managerKey.key_code })).token;
     must(await api('POST', '/api/cells/rows', owner, { configs: [{ rackCount: 8, tierCount: 2 }] }), 201);
     const cells = must(await api('GET', '/api/cells/rows', owner)).flatMap((r) => r.blocks).map((b) => b.id);

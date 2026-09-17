@@ -79,17 +79,19 @@ async function api(method, path, { token, body } = {}) {
     check('менеджер видит накопившиеся заказы — это его работа', () => {
       assert.equal(pending.status, 200, JSON.stringify(pending.body));
     });
+    // Склад и пересчёт менеджеру по умолчанию закрыты: решение владельца
+    // от 17.09.2026 — его работа заказы и поставки, а не остатки по ячейкам.
     const map = await api('GET', '/api/cells/rows', { token: mgrToken });
-    check('и карту склада видит', () => {
-      assert.equal(map.status, 200, JSON.stringify(map.body));
+    const zones = await api('GET', '/api/dropzones', { token: mgrToken });
+    const advice = await api('GET', '/api/inventory/advice', { token: mgrToken });
+    check('склад, зоны и пересчёт закрыты, пока владелец не открыл право «склад»', () => {
+      assert.equal(map.status, 403, JSON.stringify(map.body));
+      assert.equal(zones.status, 403, JSON.stringify(zones.body));
+      assert.equal(advice.status, 403, JSON.stringify(advice.body));
     });
     const mps = await api('GET', '/api/marketplaces', { token: mgrToken });
     check('список площадок менеджеру виден — по нему он забирает заказы', () => {
       assert.equal(mps.status, 200, JSON.stringify(mps.body));
-    });
-    const advice = await api('GET', '/api/inventory/advice', { token: mgrToken });
-    check('и совет по частоте пересчёта — он же его и назначает', () => {
-      assert.equal(advice.status, 200, JSON.stringify(advice.body));
     });
     const journal = await api('GET', '/api/journal', { token: mgrToken });
     check('и журнал действий', () => {
@@ -130,6 +132,20 @@ async function api(method, path, { token, body } = {}) {
     const stillClosed = await api('POST', '/api/sync/keys', { token: petrToken, body: { label: 'x' } });
     check('но открытое право не тянет за собой остальные', () => {
       assert.equal(stillClosed.status, 403, JSON.stringify(stillClosed.body));
+    });
+
+    const withWarehouse = await api('POST', '/api/staff', {
+      token: ownerToken, body: { name: 'Менеджер Склада', kind: 'manager', permissions: ['warehouse'] },
+    });
+    const whToken = (await api('POST', '/api/auth/staff/login',
+      { body: { keyCode: withWarehouse.body.key_code } })).body.token;
+    const openedMap = await api('GET', '/api/cells/rows', { token: whToken });
+    const openedZones = await api('GET', '/api/dropzones', { token: whToken });
+    const openedAdvice = await api('GET', '/api/inventory/advice', { token: whToken });
+    check('с правом «склад» менеджер видит карту, зоны и пересчёт', () => {
+      assert.equal(openedMap.status, 200, JSON.stringify(openedMap.body));
+      assert.equal(openedZones.status, 200, JSON.stringify(openedZones.body));
+      assert.equal(openedAdvice.status, 200, JSON.stringify(openedAdvice.body));
     });
 
     // ---------- Себе подобного не завести ни при каких правах ----------

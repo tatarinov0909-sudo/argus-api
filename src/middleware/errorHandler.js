@@ -12,6 +12,12 @@ function errorHandler(err, req, res, _next) {
   if (err.code === '23503') {
     return res.status(400).json({ error: 'Ссылка на несуществующую запись' });
   }
+  // Postgres invalid_text_representation: чаще всего это чужой или обрезанный
+  // идентификатор в адресе. Раньше такой запрос давал «внутреннюю ошибку»
+  // и строчку в логе ошибок на каждый неверный адрес.
+  if (err.code === '22P02') {
+    return res.status(400).json({ error: 'Некорректный идентификатор в запросе' });
+  }
 
   return res.status(500).json({ error: 'Внутренняя ошибка сервера' });
 }

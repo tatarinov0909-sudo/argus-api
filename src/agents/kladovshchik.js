@@ -460,6 +460,12 @@ async function pickList(client, warehouseId) {
 // просто не выполняется. Транзакцию открывает вызывающий (см. routes.js) —
 // здесь только раздача, чтобы одно и то же поведение проверялось тестами и
 // работало на проде.
+const DIRECTIONS = new Set(['in', 'out', 'return']);
+const STATUSES = new Set(['open', 'in_progress', 'completed', 'ready', 'shipped']);
+// Значения приходят от языковой модели. Чужое слово в поле-перечислении
+// роняло запрос пятисоткой — проверяем по списку и просто игнорируем лишнее.
+const oneOf = (set, value) => (set.has(value) ? value : undefined);
+
 function runTool(client, warehouseId, name, args = {}) {
   switch (name) {
     case 'find_products':
@@ -467,7 +473,9 @@ function runTool(client, warehouseId, name, args = {}) {
     case 'suggest_cell':
       return suggestCells(client, warehouseId, String(args.sku || ''));
     case 'list_invoices':
-      return listInvoices(client, warehouseId, { direction: args.direction, status: args.status });
+      return listInvoices(client, warehouseId, {
+        direction: oneOf(DIRECTIONS, args.direction), status: oneOf(STATUSES, args.status),
+      });
     case 'invoice_details':
       return invoiceDetails(client, warehouseId, String(args.number || ''));
     case 'warehouse_summary':

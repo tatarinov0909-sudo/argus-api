@@ -124,7 +124,7 @@ async function loginOwner({ email, password }) {
 }
 
 async function loginStaffKey({ keyCode }) {
-  if (!keyCode) throw new HttpError(400, 'Введите ключ доступа');
+  if (!keyCode || typeof keyCode !== 'string') throw new HttpError(400, 'Введите ключ доступа');
   const normalized = keyCode.trim().toUpperCase();
 
   return withoutTenantContext(async (client) => {
@@ -167,8 +167,11 @@ async function warehouseLabel(warehouseId) {
 }
 
 async function loginSellerKey({ keyCode, name }) {
-  if (!keyCode) throw new HttpError(400, 'Введите ключ доступа');
-  if (!name) throw new HttpError(400, 'Введите имя');
+  if (!keyCode || typeof keyCode !== 'string') throw new HttpError(400, 'Введите ключ доступа');
+  if (!name || typeof name !== 'string') throw new HttpError(400, 'Введите имя');
+  // Имя пишет сам продавец, и оно уезжает в токен и на экран: без предела
+  // в токен можно уложить хоть страницу текста.
+  const sellerName = name.trim().slice(0, 60);
   const normalized = keyCode.trim().toUpperCase();
 
   return withoutTenantContext(async (client) => {
@@ -185,14 +188,14 @@ async function loginSellerKey({ keyCode, name }) {
       companyId: key.company_id,
       warehouseId: key.warehouse_id,
       sellerKeyId: key.id,
-      name,
+      name: sellerName,
     });
     // Имя склада — чтобы кабинет продавца не подписывался выдуманным.
     // В шапке было вписано руками «Склад №1, Люберцы», и клиент читал это
     // как настоящее название.
     return {
       token,
-      name,
+      name: sellerName,
       companyName: key.company_name,
       warehouseName: await warehouseLabel(key.warehouse_id),
     };

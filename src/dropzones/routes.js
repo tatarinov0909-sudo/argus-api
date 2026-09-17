@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, allowWarehouseView } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { normalizeName } = require('../warehouses/naming');
@@ -10,7 +10,7 @@ const router = express.Router();
 // вставке — потолок нужен только чтобы поймать опечатку.
 const MAX_ZONES = 60;
 
-router.get('/', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
+router.get('/', requireAuth, allowWarehouseView, async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const zones = await withTenantContext({ warehouseId }, async (client) => {

@@ -1,5 +1,7 @@
 const express = require('express');
-const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
+const {
+  requireAuth, requireRole, requireGrant, allowWarehouseView,
+} = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
@@ -10,7 +12,7 @@ const router = express.Router();
 
 // Full layout: rows -> blocks -> stock, everything the frontend needs to
 // render the floorplan and rack grids in one round trip.
-router.get('/rows', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
+router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {

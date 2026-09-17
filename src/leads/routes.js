@@ -1,6 +1,7 @@
 const express = require('express');
 const { withoutTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { rateLimit } = require('../middleware/rateLimit');
 
 const router = express.Router();
 router.use('/manage', require('./manage'));
@@ -13,38 +14,20 @@ router.use('/manage', require('./manage'));
 
 const LIMITS = { name: 200, contact: 200, message: 4000, field: 500, fields: 20 };
 
-// Простое ограничение частоты: с одного адреса не больше пяти заявок в час.
-// В памяти процесса, а не в базе: перезапуск сбрасывает счётчик, и это
-// приемлемо — задача не остановить злоумышленника, а не дать случайному
-// скрипту залить таблицу за ночь.
-const RATE_WINDOW_MS = 60 * 60 * 1000;
-const RATE_MAX = 5;
-const seen = new Map();
-
-function rateLimited(ip) {
-  const now = Date.now();
-  const hits = (seen.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
-  if (hits.length >= RATE_MAX) return true;
-  hits.push(now);
-  seen.set(ip, hits);
-  // Карта не должна расти бесконечно: раз в сотню заявок чистим остывшее.
-  if (seen.size > 500) {
-    for (const [key, times] of seen) {
-      if (times.every((t) => now - t >= RATE_WINDOW_MS)) seen.delete(key);
-    }
-  }
-  return false;
-}
+// Не больше пяти заявок в час с одного адреса — тем же счётчиком, что и
+// у входов (middleware/rateLimit.js). Своя копия этого счётчика жила здесь
+// и делала ровно то же самое.
+const leadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  key: (req) => req.ip || req.socket?.remoteAddress || null,
+  message: 'Слишком много заявок подряд — попробуйте позже',
+});
 
 const trim = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : null);
 
-router.post('/', async (req, res, next) => {
+router.post('/', leadLimiter, async (req, res, next) => {
   try {
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    if (rateLimited(ip)) {
-      throw new HttpError(429, 'Слишком много заявок подряд — попробуйте позже');
-    }
-
     const body = req.body || {};
     const name = trim(body.name, LIMITS.name);
     const contact = trim(body.contact ?? body.phone ?? body.email, LIMITS.contact);

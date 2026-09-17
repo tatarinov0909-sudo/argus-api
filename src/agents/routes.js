@@ -5,11 +5,10 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const kladovshchik = require('./kladovshchik');
 const chatHistory = require('./chatHistory');
-// ЖИВАЯ модель — сейчас DeepSeek. Если возвращаетесь на orchestrator.js
-// (Claude), первый аргумент ask() ниже — уже не строка ключа, а клиент
-// Anthropic SDK. Обе версии называют функцию одинаково (ask), поэтому
-// смена require здесь без правки вызова ниже пройдёт все проверки типов
-// и упадёт только при реальном запросе.
+// Живая модель — DeepSeek. Версия под Claude (Anthropic SDK) лежала рядом
+// неиспользуемой и удалена 17.09.2026: она отличается только первым
+// аргументом ask() — вместо строки ключа клиент SDK. Понадобится — берётся
+// из истории git вместе с зависимостью `@anthropic-ai/sdk`.
 const orchestrator = require('./orchestratorDeepseek');
 
 const router = express.Router();

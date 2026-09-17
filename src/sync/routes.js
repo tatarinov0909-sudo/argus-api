@@ -155,7 +155,7 @@ router.get('/status', requireAuth, requireRole('owner'), async (req, res, next) 
 router.post('/auth', keyLoginLimiter, async (req, res, next) => {
   try {
     const { keyCode } = req.body || {};
-    if (!keyCode) throw new HttpError(400, 'Введите ключ интеграции');
+    if (!keyCode || typeof keyCode !== 'string') throw new HttpError(400, 'Введите ключ интеграции');
     const normalized = keyCode.trim().toUpperCase();
 
     const result = await withoutTenantContext(async (client) => {
@@ -189,19 +189,38 @@ router.post('/auth', keyLoginLimiter, async (req, res, next) => {
 
 /* ===================== 1C module: push ===================== */
 
-function pushHandler(upsertFn) {
+// Отозванный ключ перестаёт работать на первом же запросе.
+//
+// Токен обмена живёт два часа, и всё это время отозванный ключ продолжал
+// присылать данные: проверки активности для роли `integration` не было
+// вовсе. Отметка «ключ выходил на связь» и есть эта проверка: ничего не
+// обновилось — значит ключ отозван, и вся транзакция обмена откатывается.
+async function touchIntegrationKey(client, integrationKeyId) {
+  const r = await client.query(
+    'UPDATE integration_keys SET last_seen_at = now() WHERE id = $1 AND active RETURNING id',
+    [integrationKeyId],
+  );
+  if (!r.rows[0]) throw new HttpError(401, 'Ключ интеграции отозван. Получите новый ключ у владельца склада.');
+}
+
+// Одна дорога для всех push-ручек. `mappedCompany` — для номенклатуры и
+// документов: они обязаны нести сопоставленного контрагента 1С или стабильный
+// идентификатор товара, уже назначенного продавцу. Общий «контрагент по
+// умолчанию» однажды увёл весь справочник выдуманному владельцу и здесь
+// отвергается нарочно.
+function pushHandler(upsertFn, { mappedCompany = false } = {}) {
   return async (req, res, next) => {
     try {
       const { warehouseId, integrationKeyId } = req.auth;
       const records = requireBatch(req.body);
+      if (mappedCompany && req.body.defaultCompanyName != null) {
+        throw new HttpError(400, 'defaultCompanyName больше не поддерживается; передайте companyExternalId в каждой записи');
+      }
 
       const results = await withTenantContext({ warehouseId }, async (client) => {
+        await touchIntegrationKey(client, integrationKeyId);
         const out = await upsertFn(client, warehouseId, records);
         await recordBatch(client, req, records, out);
-        await client.query(
-          `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
-          [integrationKeyId],
-        );
         return out;
       });
 
@@ -218,67 +237,39 @@ function pushHandler(upsertFn) {
   };
 }
 
-router.post('/push/companies', requireAuth, requireRole('integration'), pushHandler(service.upsertCompanies));
-router.post('/push/counterparties', requireAuth, requireRole('integration'), pushHandler(service.upsertCounterparties));
+const push = (fn, opts) => [requireAuth, requireRole('integration'), pushHandler(fn, opts)];
+const mapped = { mappedCompany: true };
 
-// Products and documents must carry a mapped 1C counterparty or resolve by a
-// stable product identifier already assigned to a seller. A package-wide
-// company fallback once routed the whole catalogue into a made-up owner and
-// is intentionally rejected here.
-function mappedPushHandler(upsertFn) {
-  return async (req, res, next) => {
-    try {
-      const { warehouseId, integrationKeyId } = req.auth;
-      const records = requireBatch(req.body);
-      if (req.body.defaultCompanyName != null) {
-        throw new HttpError(400, 'defaultCompanyName больше не поддерживается; передайте companyExternalId в каждой записи');
-      }
-
-      const results = await withTenantContext({ warehouseId }, async (client) => {
-        const out = await upsertFn(client, warehouseId, records);
-        await recordBatch(client, req, records, out);
-        await client.query(
-          `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`,
-          [integrationKeyId],
-        );
-        return out;
-      });
-
-      const summary = results.reduce((acc, r) => {
-        acc[r.status] = (acc[r.status] || 0) + 1;
-        return acc;
-      }, {});
-      res.json({ summary, results });
-    } catch (err) {
-      next(err);
-    }
-  };
-}
-
-router.post('/push/products', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertProducts));
-router.post('/push/invoices', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertInvoices));
+router.post('/push/companies', ...push(service.upsertCompanies));
+router.post('/push/counterparties', ...push(service.upsertCounterparties));
+router.post('/push/products', ...push(service.upsertProducts, mapped));
+router.post('/push/invoices', ...push(service.upsertInvoices, mapped));
 // Остатки: то, чего в обмене не было вовсе, из-за чего Аргус ничего не знал о
 // складе по-настоящему.
-router.post('/push/stock', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertStock));
-router.post('/push/cells', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertCells1c));
-router.post('/push/cell-catalog', requireAuth, requireRole('integration'), mappedPushHandler(service.upsertCellCatalog));
+router.post('/push/stock', ...push(service.upsertStock, mapped));
+router.post('/push/cells', ...push(service.upsertCells1c, mapped));
+router.post('/push/cell-catalog', ...push(service.upsertCellCatalog, mapped));
 
 /* ===================== 1C module: pull + acknowledge ===================== */
 
 router.get('/changes', requireAuth, requireRole('integration'), async (req, res, next) => {
   try {
     const { warehouseId, integrationKeyId } = req.auth;
-    const since = Number(req.query.since || 0);
-    const limit = Math.min(Number(req.query.limit || 100), MAX_BATCH);
-    if (!Number.isFinite(since) || since < 0) {
-      throw new HttpError(400, 'Параметр since должен быть неотрицательным числом');
+    const since = Number(req.query.since ?? 0);
+    const asked = Number(req.query.limit ?? 100);
+    if (!Number.isSafeInteger(since) || since < 0) {
+      throw new HttpError(400, 'Параметр since должен быть неотрицательным целым числом');
     }
+    // Нечисловой или отрицательный limit раньше уезжал в SQL как NaN и ронял
+    // запрос пятисоткой вместо понятного отказа.
+    if (!Number.isSafeInteger(asked) || asked <= 0) {
+      throw new HttpError(400, `Параметр limit должен быть целым числом от 1 до ${MAX_BATCH}`);
+    }
+    const limit = Math.min(asked, MAX_BATCH);
 
     const payload = await withTenantContext({ warehouseId }, async (client) => {
+      await touchIntegrationKey(client, integrationKeyId);
       const events = await outbox.listSince(client, warehouseId, { since, limit });
-      await client.query(
-        `UPDATE integration_keys SET last_seen_at = now() WHERE id = $1`, [integrationKeyId],
-      );
       return {
         events,
         // The id to acknowledge and to pass as `since` next time. Null on an
@@ -300,9 +291,10 @@ router.post('/changes/ack', requireAuth, requireRole('integration'), async (req,
     if (!Number.isFinite(upToId) || upToId <= 0) {
       throw new HttpError(400, 'Укажите upToId — идентификатор последнего обработанного события');
     }
-    const acknowledged = await withTenantContext({ warehouseId }, async (client) => (
-      outbox.markDelivered(client, warehouseId, upToId)
-    ));
+    const acknowledged = await withTenantContext({ warehouseId }, async (client) => {
+      await touchIntegrationKey(client, req.auth.integrationKeyId);
+      return outbox.markDelivered(client, warehouseId, upToId);
+    });
     res.json({ acknowledged });
   } catch (err) {
     next(err);

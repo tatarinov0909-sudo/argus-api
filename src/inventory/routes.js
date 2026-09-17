@@ -1,5 +1,7 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const {
+  requireAuth, requireRole, requireGrant, allowWarehouseView,
+} = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const service = require('./service');
@@ -49,7 +51,7 @@ router.patch('/settings', requireAuth, requireRole('owner'), async (req, res, ne
 
 // Что Аргус советует поставить в этих трёх полях — и почему.
 // Ничего не сохраняет: владелец решает сам, кнопкой «Применить».
-router.get('/advice', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+router.get('/advice', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => service.advice(c, warehouseId));
@@ -59,7 +61,7 @@ router.get('/advice', requireAuth, requireRole('owner', 'manager'), async (req, 
 
 // Что правило предложило бы сейчас — без создания заданий. Владелец видит,
 // что именно уйдёт в работу, до того как отправит туда человека.
-router.get('/preview', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+router.get('/preview', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const out = await withTenantContext({ warehouseId }, async (c) => {
@@ -75,7 +77,7 @@ router.get('/preview', requireAuth, requireRole('owner', 'manager'), async (req,
 
 // Назначить пересчёт. Единственная точка, где задания появляются: работник
 // сам инвентаризацию не начинает.
-router.post('/runs', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+router.post('/runs', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId, ownerId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => (
@@ -86,7 +88,7 @@ router.post('/runs', requireAuth, requireRole('owner', 'manager'), async (req, r
 });
 
 // Что считать. Работнику видны только назначенные задания.
-router.get('/tasks', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
+router.get('/tasks', requireAuth, allowWarehouseView, async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const statuses = req.query.status
@@ -133,7 +135,7 @@ router.post('/tasks/:id/count', requireAuth, requireRole('owner', 'worker'), asy
 });
 
 // Решение по расхождению. Только владелец и только здесь остаток меняется.
-router.post('/tasks/:id/resolve', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+router.post('/tasks/:id/resolve', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
   try {
     const { warehouseId, ownerId } = req.auth;
     const out = await withTenantContext({ warehouseId }, (c) => (

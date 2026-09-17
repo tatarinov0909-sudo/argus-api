@@ -38,7 +38,8 @@ async function requireAuth(req, res, next) {
 
   let payload;
   try {
-    payload = jwt.verify(token, process.env.JWT_SECRET);
+    // Алгоритм закреплён: проверять «чем подписано» по самому токену нельзя.
+    payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
   } catch (err) {
     return res.status(401).json({ error: 'Недействительный или истёкший токен' });
   }
@@ -113,4 +114,21 @@ function requireGrant(grant) {
   };
 }
 
-module.exports = { requireAuth, requireRole, requireGrant, GRANTS };
+// Смотреть склад: ячейки, зоны приёмки, пересчёт.
+//
+// Владелец и работник — всегда: одному это его склад, другому рабочее место.
+// Менеджер — только если владелец открыл ему право «склад». Решение
+// владельца от 17.09.2026: работа менеджера — заказы и поставки, а щёлкать
+// остатки по ячейкам ему по умолчанию не нужно.
+function allowWarehouseView(req, res, next) {
+  if (!req.auth) return res.status(401).json({ error: 'Нужен вход' });
+  if (req.auth.role === 'owner' || req.auth.role === 'worker') return next();
+  if (req.auth.role === 'manager' && (req.auth.grants || []).includes('warehouse')) return next();
+  return res.status(403).json({
+    error: 'Склад и ячейки открывает владелец склада — попросите открыть вам право «склад».',
+  });
+}
+
+module.exports = {
+  requireAuth, requireRole, requireGrant, allowWarehouseView, GRANTS,
+};
