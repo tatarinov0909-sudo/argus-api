@@ -112,7 +112,7 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
 // ?invoiceIds=a,b,c — конкретные заказы; без параметра берутся все, что ждут
 // отбора. Кладовщик здесь именно сводит, а не решает: количество и маршрут —
 // арифметика (см. pickList.js).
-router.get('/pick-list', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+router.get('/pick-list', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const invoiceIds = parseInvoiceIds(req.query.invoiceIds);

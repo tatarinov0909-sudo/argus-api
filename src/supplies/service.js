@@ -88,7 +88,8 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   }
 
   const orders = await client.query(
-    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id, c.name AS company_name,
+    `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
+            i.source, i.external_id, c.name AS company_name,
             ${WB_CONFIRMED_SQL} AS wb_confirmed,
             (NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
              OR EXISTS (SELECT 1 FROM invoice_items ii
@@ -156,7 +157,18 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
     actorId: actor?.id || null,
   });
 
-  return { ...supply, orders: orders.rows.length, companyName: orders.rows[0].company_name };
+  return {
+    ...supply,
+    companyId: companies[0],
+    orders: orders.rows.length,
+    companyName: orders.rows[0].company_name,
+    // Что именно подтверждать на площадке: её номер заказа и наш документ.
+    // Площадочные заказы отличаются от накладных 1С: у последних внешнего
+    // номера нет и подтверждать там нечего.
+    marketplaceOrders: orders.rows
+      .filter((o) => o.source !== '1c' && o.external_id)
+      .map((o) => ({ invoiceId: o.id, number: o.number, externalId: o.external_id })),
+  };
 }
 
 // Состав поставки в том виде, в котором из него печатаются документы.
@@ -264,6 +276,18 @@ async function contents(client, warehouseId, supplyId) {
       || a.name.localeCompare(b.name, 'ru');
   });
 
+  // Этикетки заказов и QR поставки: их печатают перед отправкой, без них
+  // посылки не принимают. Получены при передаче поставки на площадку.
+  const stickers = await client.query(
+    `SELECT i.number AS order_number, ii.mp_rid, st.part_a, st.part_b, st.barcode, st.file
+       FROM invoices i
+       JOIN marketplace_order_stickers st ON st.invoice_id = i.id
+       LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE i.warehouse_id = $1 AND i.supply_id = $2
+      ORDER BY i.number`,
+    [warehouseId, supplyId],
+  );
+
   return {
     supply: {
       id: head.rows[0].id,
@@ -272,6 +296,10 @@ async function contents(client, warehouseId, supplyId) {
       statusName: STATUS_NAMES[head.rows[0].status],
       marketplace: head.rows[0].marketplace,
       mpSupplyId: head.rows[0].mp_supply_id,
+      mpHandedAt: head.rows[0].mp_handed_at,
+      mpDeliveredAt: head.rows[0].mp_delivered_at,
+      mpBarcode: head.rows[0].mp_barcode,
+      mpBarcodeFile: head.rows[0].mp_barcode_file,
       destination: head.rows[0].destination,
       companyName: head.rows[0].company_name,
       createdAt: head.rows[0].created_at,
@@ -287,6 +315,15 @@ async function contents(client, warehouseId, supplyId) {
     picking,
     // Что положить в коробки: строка на каждое отправление.
     packing,
+    // Этикетки площадки на каждый заказ — печатаются с упаковочным листом.
+    stickers: stickers.rows.map((s) => ({
+      orderNumber: s.order_number,
+      rid: s.mp_rid,
+      partA: s.part_a,
+      partB: s.part_b,
+      barcode: s.barcode,
+      file: s.file,
+    })),
   };
 }
 
@@ -298,7 +335,8 @@ async function contents(client, warehouseId, supplyId) {
 // и продолжал числиться в остатке.
 async function ship(client, warehouseId, supplyId, { destination = null, actor }) {
   const cur = await client.query(
-    `SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
+    `SELECT id, number, status, company_id, mp_supply_id
+       FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
   );
   if (!cur.rows[0]) throw new HttpError(404, 'Поставка не найдена');
@@ -345,7 +383,12 @@ async function ship(client, warehouseId, supplyId, { destination = null, actor }
     actorId: actor?.id || null,
   });
 
-  return { ...updated.rows[0], statusName: STATUS_NAMES[updated.rows[0].status] };
+  return {
+    ...updated.rows[0],
+    statusName: STATUS_NAMES[updated.rows[0].status],
+    companyId: cur.rows[0].company_id,
+    mp_supply_id: cur.rows[0].mp_supply_id,
+  };
 }
 
 async function list(client, warehouseId, { status = null } = {}) {
@@ -358,6 +401,7 @@ async function list(client, warehouseId, { status = null } = {}) {
   }
   const r = await client.query(
     `SELECT s.id, s.number, s.status, s.destination, s.marketplace, s.mp_supply_id,
+            s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             count(i.id)::int AS orders,
             count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked

@@ -1,0 +1,170 @@
+const wbWrite = require('../marketplaces/wbWrite');
+const credentials = require('../marketplaces/credentials');
+const journal = require('../journal/repository');
+
+// Передача поставки на Wildberries и обратно.
+//
+// Смысл всей затеи: пока Аргус только читал, поставку на стороне WB делали
+// руками в её кабинете. Без этой поставки собранный товар не примут на
+// воротах, а один и тот же заказ мог попасть и в поставку WB, и в поставку
+// Аргуса — и его собирали дважды.
+//
+// Порядок такой и другим быть не может:
+//   1) местная поставка уже создана и записана в базу;
+//   2) обращения к площадке идут БЕЗ открытой транзакции — соединение с базой
+//      не должно ждать чужую сеть (см. db/pool.js);
+//   3) результат записывается отдельной короткой транзакцией.
+//
+// Запись включает владелец флагом `write_enabled` у ключа продавца. Пока он
+// выключен, здесь ничего не происходит вовсе: `skipped: 'write_disabled'`.
+
+// Заказ, который площадка не приняла в поставку, из местной поставки убираем.
+// Иначе склад собирал бы то, что на WB в этой поставке не значится.
+async function detachRejected(client, warehouseId, supply, rejected) {
+  for (const row of rejected) {
+    await client.query(
+      'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND id = $2',
+      [warehouseId, row.invoiceId],
+    );
+    await journal.createEntry(client, {
+      warehouseId,
+      agent: 'Обмен с WB',
+      actorType: 'system',
+      entityType: 'invoice',
+      entityId: row.invoiceId,
+      invoiceId: row.invoiceId,
+      status: 'pending',
+      actionText: `Заказ «${row.number}» не принят в поставку WB: ${row.error}.`
+        + ` Убран из поставки «${supply.number}» — собирать его по этой поставке нельзя.`,
+    });
+  }
+}
+
+// Создать поставку на площадке и подтвердить в ней заказы.
+//
+// `api` и `withTx` подменяются в тестах: сети и базы в проверках нет.
+async function handOver({
+  warehouseId, companyId, supply, orders, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
+}) {
+  const token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
+  if (!token) return { skipped: 'write_disabled' };
+
+  const mpSupplyId = await api.createSupply(token, supply.number);
+  const confirmed = [];
+  const rejected = [];
+  for (const order of orders) {
+    try {
+      await api.addOrder(token, mpSupplyId, order.externalId);
+      confirmed.push(order);
+    } catch (err) {
+      rejected.push({ ...order, error: err.message });
+    }
+  }
+
+  // Ни одного заказа площадка не приняла — поставке на её стороне взяться
+  // неоткуда, и пустую мы убираем за собой.
+  if (confirmed.length === 0) {
+    try { await api.deleteSupply(token, mpSupplyId); } catch { /* пустая поставка не помеха */ }
+    await withTx(async (client) => {
+      await detachRejected(client, warehouseId, supply, rejected);
+    });
+    return { mpSupplyId: null, confirmed: [], rejected };
+  }
+
+  // QR поставки и этикетки заказов — то, что печатают перед отправкой.
+  let barcode = null;
+  try { barcode = await api.supplyBarcode(token, mpSupplyId); } catch { barcode = null; }
+  let stickers = [];
+  try {
+    stickers = await api.orderStickers(token, confirmed.map((o) => o.externalId));
+  } catch { stickers = []; }
+
+  await withTx(async (client) => {
+    await client.query(
+      `UPDATE supplies SET mp_supply_id = $3, mp_handed_at = now(),
+              mp_barcode = $4, mp_barcode_file = $5
+        WHERE warehouse_id = $1 AND id = $2`,
+      [warehouseId, supply.id, mpSupplyId, barcode?.barcode || null, barcode?.file || null],
+    );
+    await client.query(
+      `UPDATE invoices SET mp_confirmed_at = now(), mp_supplier_status = 'confirm'
+        WHERE warehouse_id = $1 AND id = ANY($2::uuid[])`,
+      [warehouseId, confirmed.map((o) => o.invoiceId)],
+    );
+    for (const sticker of stickers) {
+      const order = confirmed.find((o) => String(o.externalId) === String(sticker.orderId));
+      if (!order) continue;
+      await client.query(
+        `INSERT INTO marketplace_order_stickers
+           (invoice_id, warehouse_id, company_id, part_a, part_b, barcode, file, kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'svg')
+         ON CONFLICT (invoice_id) DO UPDATE SET part_a = EXCLUDED.part_a,
+           part_b = EXCLUDED.part_b, barcode = EXCLUDED.barcode, file = EXCLUDED.file,
+           created_at = now()`,
+        [order.invoiceId, warehouseId, companyId, sticker.partA, sticker.partB,
+          sticker.barcode, sticker.file],
+      );
+    }
+    await detachRejected(client, warehouseId, supply, rejected);
+    await journal.createEntry(client, {
+      warehouseId,
+      agent: 'Обмен с WB',
+      actorType: 'system',
+      entityType: 'supply',
+      entityId: supply.id,
+      status: 'auto',
+      actionText: `Поставка «${supply.number}» создана на WB (${mpSupplyId}): `
+        + `${confirmed.length} ${confirmed.length === 1 ? 'заказ' : 'заказов'} на сборке`
+        + `${rejected.length ? `, не принято ${rejected.length}` : ''}`
+        + `${stickers.length ? `, этикеток ${stickers.length}` : ', этикетки не получены'}.`,
+    });
+  });
+
+  return { mpSupplyId, confirmed, rejected, barcode, stickers: stickers.length };
+}
+
+// Передать поставку в доставку: для площадки это «уехало».
+async function deliver({
+  warehouseId, companyId, supply, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
+}) {
+  if (!supply.mp_supply_id) return { skipped: 'no_mp_supply' };
+  const token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
+  if (!token) return { skipped: 'write_disabled' };
+
+  try {
+    await api.deliverSupply(token, supply.mp_supply_id);
+  } catch (err) {
+    // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
+    // что на площадке поставка осталась несданной, и оставляем след.
+    await withTx((client) => journal.createEntry(client, {
+      warehouseId,
+      agent: 'Обмен с WB',
+      actorType: 'system',
+      entityType: 'supply',
+      entityId: supply.id,
+      status: 'pending',
+      actionText: `Поставку «${supply.number}» не удалось передать в доставку на WB: `
+        + `${err.message}. Сделайте это в кабинете WB или повторите из Аргуса.`,
+    }));
+    return { error: err.message };
+  }
+
+  await withTx(async (client) => {
+    await client.query(
+      'UPDATE supplies SET mp_delivered_at = now() WHERE warehouse_id = $1 AND id = $2',
+      [warehouseId, supply.id],
+    );
+    await journal.createEntry(client, {
+      warehouseId,
+      agent: 'Обмен с WB',
+      actorType: 'system',
+      entityType: 'supply',
+      entityId: supply.id,
+      status: 'auto',
+      actionText: `Поставка «${supply.number}» передана в доставку на WB (${supply.mp_supply_id}).`,
+    });
+  });
+  return { delivered: true };
+}
+
+module.exports = { handOver, deliver };

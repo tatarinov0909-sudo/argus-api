@@ -46,6 +46,33 @@ async function tokenFor(client, warehouseId, companyId, marketplace) {
   return parsed.token;
 }
 
+// Ключ для ЗАПИСИ на площадку. Отдаётся только если владелец включил запись
+// у этого ключа: по умолчанию Аргус ничего в кабинете продавца не меняет, и
+// это согласие берётся у продавца отдельно. Нет флага — нет и токена, а
+// значит и записи: вызывающий код просто ничего не делает.
+async function writeTokenFor(client, warehouseId, companyId, marketplace) {
+  const r = await client.query(
+    `SELECT write_enabled FROM marketplace_credentials
+      WHERE warehouse_id = $1 AND company_id = $2 AND marketplace = $3`,
+    [warehouseId, companyId, marketplace],
+  );
+  if (!r.rows[0] || !r.rows[0].write_enabled) return null;
+  return tokenFor(client, warehouseId, companyId, marketplace);
+}
+
+// Включить или выключить запись. Меняет то, что Аргус делает в чужом
+// кабинете, поэтому право на это — отдельное (см. routes.js).
+async function setWriteEnabled(client, warehouseId, companyId, marketplace, enabled) {
+  const r = await client.query(
+    `UPDATE marketplace_credentials SET write_enabled = $4, updated_at = now()
+      WHERE warehouse_id = $1 AND company_id = $2 AND marketplace = $3
+      RETURNING company_id, marketplace, write_enabled`,
+    [warehouseId, companyId, marketplace, Boolean(enabled)],
+  );
+  if (!r.rows[0]) throw new HttpError(404, 'Ключ для этой площадки не подключён');
+  return { companyId: r.rows[0].company_id, marketplace: r.rows[0].marketplace, writeEnabled: r.rows[0].write_enabled };
+}
+
 // Все подключённые пары «продавец + площадка» склада — для списка в кабинете и
 // для обхода при синхронизации.
 async function list(client, warehouseId) {
@@ -87,4 +114,6 @@ async function remove(client, warehouseId, companyId, marketplace) {
   return { removed: true };
 }
 
-module.exports = { save, tokenFor, list, markUsed, remove };
+module.exports = {
+  save, tokenFor, writeTokenFor, setWriteEnabled, list, markUsed, remove,
+};

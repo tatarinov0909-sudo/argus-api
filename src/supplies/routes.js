@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const service = require('./service');
+const wbHandoff = require('./wbHandoff');
 
 const router = express.Router();
 
@@ -20,7 +21,21 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
     const supply = await withTenantContext({ warehouseId }, (client) => service.create(
       client, warehouseId, { invoiceIds, marketplace, destination, actor: actorOf(req.auth) },
     ));
-    res.status(201).json(supply);
+
+    // Передача на площадку — отдельным шагом и вне транзакции: чужая сеть не
+    // должна держать открытым соединение с базой. Пока владелец не включил
+    // запись, шаг ничего не делает и поставка остаётся только местной.
+    let marketplaceResult = null;
+    if (supply.marketplaceOrders.length > 0) {
+      marketplaceResult = await wbHandoff.handOver({
+        warehouseId,
+        companyId: supply.companyId,
+        supply,
+        orders: supply.marketplaceOrders,
+        withTx: (fn) => withTenantContext({ warehouseId }, fn),
+      }).catch((err) => ({ error: err.message }));
+    }
+    res.status(201).json({ ...supply, marketplace: marketplaceResult });
   } catch (err) { next(err); }
 });
 
@@ -80,7 +95,16 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'manager', 'worker'),
       client, warehouseId, req.params.id,
       { destination: (req.body || {}).destination || null, actor: actorOf(req.auth) },
     ));
-    res.json(out);
+
+    // Машина ушла — на площадке поставку надо передать в доставку. Неудача
+    // здесь не отменяет отгрузку: она уже случилась в физическом мире.
+    const marketplaceResult = await wbHandoff.deliver({
+      warehouseId,
+      companyId: out.companyId,
+      supply: out,
+      withTx: (fn) => withTenantContext({ warehouseId }, fn),
+    }).catch((err) => ({ error: err.message }));
+    res.json({ ...out, marketplace: marketplaceResult });
   } catch (err) { next(err); }
 });
 

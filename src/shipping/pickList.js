@@ -25,7 +25,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // в поставке: вся очередь WB на листе грузчика означала бы, что решает
   // не менеджер, а тот, кто первым взял лист.
   const invoices = await client.query(
-    `SELECT i.id, i.number, i.company_id, c.name AS company_name
+    `SELECT i.id, i.number, i.company_id, i.source, c.name AS company_name
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
        AND i.status IN ('open', 'in_progress')
@@ -44,17 +44,23 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // Закрытые строки (is_final) в лист не попадают — по ним ходить незачем.
   const items = await client.query(
     `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty,
+            ii.mp_article, COALESCE(NULLIF(BTRIM(ii.mp_barcode), ''), p.barcode) AS barcode,
             COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
                       WHERE sr.invoice_item_id = ii.id), 0) AS picked,
             EXISTS (SELECT 1 FROM shipping_records sr2
                     WHERE sr2.invoice_item_id = ii.id AND sr2.is_final) AS closed
      FROM invoice_items ii
+     LEFT JOIN products p ON p.warehouse_id = ii.warehouse_id
+                         AND p.company_id = ii.company_id AND p.sku = ii.sku
      WHERE ii.invoice_id = ANY($1::uuid[])
      ORDER BY ii.name`,
     [ids],
   );
 
   const byNumber = new Map(invoices.rows.map((r) => [r.id, r.number]));
+  // Площадка заказа — для цветной пометки на листе: по ней видно, чьи
+  // правила приёмки действуют, а всё остальное печатается чёрным.
+  const bySource = new Map(invoices.rows.map((r) => [r.id, r.source === '1c' ? '1c' : r.source]));
 
   // Складываем одинаковый товар одной компании: у разных компаний товар лежит
   // в своих ячейках и смешивать его нельзя даже в листе.
@@ -66,15 +72,28 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
     if (!lines.has(key)) {
       lines.set(key, {
         sku: it.sku, name: it.name, companyId: it.company_id, needQty: 0, perOrder: [],
+        // Артикул площадки и штрихкод: по ним сборщик и ищет товар на полке,
+        // а не по внутреннему коду.
+        article: it.mp_article || null,
+        barcode: it.barcode || null,
+        marketplaces: new Set(),
       });
     }
     const line = lines.get(key);
     line.needQty += need;
-    line.perOrder.push({ invoiceNumber: byNumber.get(it.invoice_id), qty: need, invoiceItemId: it.id });
+    if (!line.article && it.mp_article) line.article = it.mp_article;
+    if (!line.barcode && it.barcode) line.barcode = it.barcode;
+    line.marketplaces.add(bySource.get(it.invoice_id) || '1c');
+    line.perOrder.push({
+      invoiceNumber: byNumber.get(it.invoice_id), qty: need, invoiceItemId: it.id,
+      marketplace: bySource.get(it.invoice_id) || '1c',
+    });
   }
   if (lines.size === 0) {
     return {
-      orders: invoices.rows.map((r) => ({ number: r.number, company: r.company_name })),
+      orders: invoices.rows.map((r) => ({
+        number: r.number, company: r.company_name, marketplace: r.source === '1c' ? '1c' : r.source,
+      })),
       lines: [], totalUnits: 0, cellsToVisit: 0,
     };
   }
@@ -124,6 +143,9 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
       sku: line.sku,
       name: line.name,
       companyId: line.companyId,
+      article: line.article,
+      barcode: line.barcode,
+      marketplaces: [...line.marketplaces],
       needQty: line.needQty,
       cells,
       // Нехватку показываем здесь же: узнать о ней до похода, а не у полки.
@@ -160,7 +182,9 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   });
 
   return {
-    orders: invoices.rows.map((r) => ({ number: r.number, company: r.company_name })),
+    orders: invoices.rows.map((r) => ({
+      number: r.number, company: r.company_name, marketplace: r.source === '1c' ? '1c' : r.source,
+    })),
     lines: result,
     totalUnits: result.reduce((sum, l) => sum + l.needQty, 0),
     cellsToVisit: visited.size,

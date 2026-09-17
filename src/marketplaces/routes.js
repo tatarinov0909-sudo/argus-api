@@ -126,6 +126,25 @@ router.post('/credentials', requireGrant('marketplaces'), async (req, res, next)
   } catch (err) { next(err); }
 });
 
+// Разрешить Аргусу менять статусы в кабинете продавца.
+//
+// Отдельное действие и отдельное право: до этого щелчка Аргус на площадке
+// ничего не меняет. Согласие продавца на это берёт владелец склада — код
+// проверить его не может, поэтому решение остаётся явным и записывается.
+router.patch('/:companyId/:marketplace/write', requireGrant('marketplaces'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { companyId, marketplace } = req.params;
+    if (typeof req.body?.enabled !== 'boolean') {
+      throw new HttpError(400, 'Передайте enabled: true или false');
+    }
+    const out = await withTenantContext({ warehouseId }, (c) => (
+      credentials.setWriteEnabled(c, warehouseId, companyId, marketplace, req.body.enabled)
+    ));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 router.delete('/:companyId/:marketplace', requireGrant('marketplaces'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
