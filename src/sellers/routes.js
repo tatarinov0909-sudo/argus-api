@@ -21,10 +21,14 @@ function sellerStockView(row) {
     barcode: row.barcode,
     total: row.total,
     totalKnown: row.totalKnown,
-    // Only a recorded warehouse pick confirms physical assembly. Marketplace
-    // demand alone stays on the orders page and does not change these figures.
+    // «Заказано» — купленное на площадке, чего ещё нет в поставке;
+    // «в сборке» — то, что склад уже взял в работу поставкой. Оба числа
+    // уменьшают доступное: этот товар обещан покупателям.
+    ordered: row.orderedNotInSupply,
     inAssembly: row.inAssembly,
     available: row.sellerAvailable,
+    orderedOrders: row.queuedOrders,
+    assemblyOrders: row.assemblyOrders,
     updatedAt: row.totalUpdatedAt,
   };
 }
@@ -47,6 +51,7 @@ function sellerStockResponse(rows) {
     summary: {
       productCount: inventoryRows.length,
       total: unknownRows.length ? null : sum(inventoryRows, 'total'),
+      ordered: sum(inventoryRows, 'orderedNotInSupply'),
       inAssembly: sum(inventoryRows, 'inAssembly'),
       available: unknownRows.length ? null : sum(inventoryRows, 'sellerAvailable'),
       updatedAt,

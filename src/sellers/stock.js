@@ -55,26 +55,40 @@ async function loadStock(client, companyId) {
                AND NULLIF(BTRIM(m.mp_barcode), '') IS NOT NULL
            ) mapped ON true
            WHERE p.company_id = $1 AND p.active = true
-         ), ordered AS (
-           -- Сколько этого товара уже обещано заказами и ещё не уехало.
-           --
-           -- Считаем ВСЕ неотгруженные заказы, а не только несобранные.
-           -- Собранный, но не уехавший заказ лежит в коробке у ворот: из
-           -- ячейки он уже списан, а из учёта 1С — ещё нет, потому что
-           -- реализация проводится при отгрузке. Не вычти его — и продавцу
-           -- обещано то, что физически уже уезжает.
-           SELECT ii.sku, SUM(ii.declared_qty) AS qty,
-                  SUM(ii.declared_qty) FILTER (WHERE i.mp_closed_at IS NOT NULL) AS blocked_qty,
-                  count(DISTINCT i.id) AS orders,
-                  count(DISTINCT i.id) FILTER (WHERE i.status = 'ready') AS picked_orders
+         ), demand_rows AS (
+           -- Обещанный покупателям товар, который ещё не уехал, с разделением
+           -- на две судьбы (решение владельца 17.09.2026):
+           --   «заказано»  — купили на площадке, поставки ещё нет;
+           --   «в сборке»  — заказ уже в поставке, переданной на склад,
+           --                 или по нему уже отбирали товар.
+           -- Считаем и собранные, но не уехавшие заказы: из ячейки товар
+           -- списан, а из учёта 1С ещё нет — реализация проводится при
+           -- отгрузке. Не вычти их, и продавцу обещано то, что уже уезжает.
+           SELECT ii.sku, ii.declared_qty, i.id AS invoice_id, i.status,
+                  (i.supply_id IS NOT NULL OR EXISTS (
+                     SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
+                      WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
+                   )) AS in_assembly,
+                  (i.mp_closed_at IS NOT NULL) AS closed
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
-           WHERE i.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
+           WHERE i.company_id = $1 AND ii.company_id = $1
+             AND i.direction = 'out' AND i.status <> 'shipped'
              AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND (i.supply_id IS NOT NULL OR EXISTS (
                SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
                WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
              ))))
-           GROUP BY ii.sku
+         ), ordered AS (
+           SELECT sku,
+                  SUM(declared_qty) AS qty,
+                  SUM(declared_qty) FILTER (WHERE in_assembly) AS assembly_qty,
+                  SUM(declared_qty) FILTER (WHERE NOT in_assembly) AS queued_qty,
+                  SUM(declared_qty) FILTER (WHERE closed) AS blocked_qty,
+                  count(DISTINCT invoice_id) AS orders,
+                  count(DISTINCT invoice_id) FILTER (WHERE NOT in_assembly) AS queued_orders,
+                  count(DISTINCT invoice_id) FILTER (WHERE in_assembly) AS assembly_orders,
+                  count(DISTINCT invoice_id) FILTER (WHERE status = 'ready') AS picked_orders
+           FROM demand_rows GROUP BY sku
          ), staged AS (
            -- Picks have left their cells, but remain on site until shipment.
            -- Include partial picks as well as fully assembled orders.
@@ -101,7 +115,8 @@ async function loadStock(client, companyId) {
                 c.stock_records, GREATEST(c.counted_at,obs.at) AS counted_at, obs.sku AS observed_sku,
                 p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
                 a.quantity AS accepted_qty,a.snapshot_id,a.snapshot_at,
-                o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders
+                o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders,
+                o.assembly_qty, o.queued_qty, o.queued_orders, o.assembly_orders
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
@@ -126,11 +141,17 @@ async function loadStock(client, companyId) {
       const accountingTotal = r.stock_qty_1c === null || r.stock_qty_1c === undefined
         ? null : Number(r.stock_qty_1c);
       const total = accountingTotal === null ? null : Math.max(0, accountingTotal);
-      // "In assembly" starts only after a worker has physically taken the
-      // goods from a cell. A marketplace order by itself is demand, not a
-      // confirmed warehouse action, so it cannot reserve seller inventory.
-      const inAssembly = total === null ? 0 : Math.min(total, staged);
-      const sellerAvailable = total === null ? null : total - inAssembly;
+      // Четыре числа продавца (решение владельца 17.09.2026):
+      // «в сборке» — заказы, переданные складу поставкой (или уже
+      // отобранные), «заказано» — купленное на площадке, чего в поставке
+      // ещё нет. Оба уменьшают доступное: товар обещан покупателю.
+      // Больше, чем есть на складе, обещать нельзя — поэтому обрезаем по
+      // остатку, сначала сборкой: она ближе к отгрузке.
+      const assemblyDemand = Number(r.assembly_qty || 0);
+      const queuedDemand = Number(r.queued_qty || 0);
+      const inAssembly = total === null ? 0 : Math.min(total, assemblyDemand);
+      const orderedNotInSupply = total === null ? 0 : Math.min(total - inAssembly, queuedDemand);
+      const sellerAvailable = total === null ? null : total - inAssembly - orderedNotInSupply;
       return {
       sku: r.sku,
       listed: r.product_sku != null,
@@ -158,7 +179,11 @@ async function loadStock(client, companyId) {
       totalKnown: total !== null,
       totalUpdatedAt: accountingTotal === null ? null : (r.stock_at || null),
       inAssembly,
+      orderedNotInSupply,
       sellerAvailable,
+      // Сколько заказов стоит за каждым числом — для подписей в кабинете.
+      queuedOrders: Number(r.queued_orders || 0),
+      assemblyOrders: Number(r.assembly_orders || 0),
       onHand: stockKnown ? onHand : null,
       ordered,
       blockedOrdered: Number(r.blocked_qty || 0),

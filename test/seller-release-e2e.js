@@ -78,12 +78,16 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(row.qtyIn1c,0); assert.equal(row.barcode,'0000123456789'); assert.equal(row.onHand,100);
     const sellerView = await api('GET','/api/sellers/stock',sa);
     const sellerSame = sellerView.rows.find(r=>r.sku==='SAME-SKU');
-    assert.deepEqual(Object.keys(sellerSame).sort(), ['available','barcode','inAssembly','name','sku','total','totalKnown','updatedAt'].sort());
-    assert.equal(sellerSame.total,0); assert.equal(sellerSame.inAssembly,0); assert.equal(sellerSame.available,0); assert.equal(sellerSame.totalKnown,true);
+    // Договор с кабинетом продавца: четыре количества и сколько заказов за
+    // каждым из обещанных чисел. Ничего про ячейки, 1С и сверку.
+    assert.deepEqual(Object.keys(sellerSame).sort(), ['assemblyOrders','available','barcode','inAssembly','name','ordered','orderedOrders','sku','total','totalKnown','updatedAt'].sort());
+    assert.equal(sellerSame.total,0); assert.equal(sellerSame.ordered,0); assert.equal(sellerSame.inAssembly,0);
+    assert.equal(sellerSame.available,0); assert.equal(sellerSame.totalKnown,true);
     assert.equal(JSON.stringify(sellerSame).includes('cell'),false); assert.equal(JSON.stringify(sellerSame).includes('1c'),false);
     assert.equal(JSON.stringify(sellerView).includes('reserved'),false);
     assert.equal(sellerView.summary.productCount,3); assert.equal(sellerView.summary.total,901);
-    assert.equal(sellerView.summary.inAssembly,0); assert.equal(sellerView.summary.available,901);
+    assert.equal(sellerView.summary.inAssembly,0); assert.equal(sellerView.summary.ordered,0);
+    assert.equal(sellerView.summary.available,901);
     await withTenantContext({warehouseId},c=>c.query(
       `UPDATE products SET stock_qty_1c=2,stock_at=now() WHERE company_id=$1 AND sku='SAME-SKU'`,[a.id]));
     assert.equal((await api('GET','/api/sellers/stock',sa)).rows.find(r=>r.sku==='SAME-SKU').total,2);
@@ -112,7 +116,10 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(stockWithUnresolved.rows.some(r=>r.sku==='ORDER-ONLY'),false);
     assert.equal(stockWithUnresolved.summary.total,1001);
     assert.equal(stockWithUnresolved.summary.inAssembly,0);
-    assert.equal(stockWithUnresolved.summary.available,1001);
+    // Заказ на 30 штук уже куплен на площадке: он «заказан» и уменьшает
+    // доступное, хотя склад его ещё не получал (решение владельца 17.09.2026).
+    assert.equal(stockWithUnresolved.summary.ordered,30);
+    assert.equal(stockWithUnresolved.summary.available,971);
     assert.equal(JSON.stringify(stockWithUnresolved).includes('reserved'),false);
     console.log('PASS unresolved orders do not create inventory or an invented seller reserve');
     row=await stock(); assert.equal(row.available,70); assert.equal(row.ordered,30);
@@ -120,8 +127,11 @@ const { pool, withTenantContext } = require('../src/db/pool');
     row=await stock(); assert.equal(row.qty,90); assert.equal(row.staged,10); assert.equal(row.onHand,100); assert.equal(row.available,70);
     let sellerDuringPick=await api('GET','/api/sellers/stock',sa);
     assert.equal(sellerDuringPick.summary.total,1001);
-    assert.equal(sellerDuringPick.summary.inAssembly,10);
-    assert.equal(sellerDuringPick.summary.available,991);
+    // Начали отбирать — весь заказ перешёл из «заказано» в «в сборке»,
+    // и доступное от этого не изменилось: обещание то же самое.
+    assert.equal(sellerDuringPick.summary.inAssembly,30);
+    assert.equal(sellerDuringPick.summary.ordered,0);
+    assert.equal(sellerDuringPick.summary.available,971);
     await api('POST','/api/shipping',worker,{invoiceItemId:order.items[0].id,pickedQty:20,cellBlockId:cells[0].id,isFinal:true},201);
     row=await stock(); assert.equal(row.qty,70); assert.equal(row.staged,30); assert.equal(row.onHand,100); assert.equal(row.available,70);
     sellerDuringPick=await api('GET','/api/sellers/stock',sa);

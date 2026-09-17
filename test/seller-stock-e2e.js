@@ -1,20 +1,18 @@
-// Настоящий остаток в кабинете продавца.
+// Четыре числа в кабинете продавца и арифметика между ними.
 //
-// Главное, что здесь проверяется, — не «показывается ли цифра», а две вещи,
-// на которых легко потерять доверие клиента и его товар:
-//   1. остаток уменьшается после отгрузки (раньше он только рос, потому что
-//      считался нарастающим итогом по приёмкам);
-//   2. продавец видит СВОЙ товар и ничей больше — и это решает Postgres,
-//      а не фильтр в коде.
+// Проверяется не «показывается ли цифра», а то, на чём теряют доверие и товар:
+//   1. «Заказано» и «В сборке» уменьшают доступное к продаже, и ровно один раз:
+//      пока заказ не в поставке — он «заказан», попал в поставку — «в сборке»;
+//   2. после отгрузки и следующего обмена с 1С числа сходятся;
+//   3. продавец видит СВОЙ товар и ничей больше — и это решает Postgres,
+//      а не фильтр в коде;
+//   4. внутренности склада (ячейки, брак, цифра 1С) продавцу не уезжают.
 //
 //   DATABASE_URL=postgres://argus_app:...@127.0.0.1:5433/argus_test \
 //   JWT_SECRET=test node test/seller-stock-e2e.js
 
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
-
-const PORT = 3983;
-const BASE = `http://127.0.0.1:${PORT}`;
 
 let passed = 0;
 const failures = [];
@@ -30,341 +28,251 @@ function check(name, fn) {
   }
 }
 
-async function api(method, path, { token, body } = {}) {
-  const res = await fetch(BASE + path, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
-  return { status: res.status, body: json };
-}
-
 (async () => {
-  const server = createApp().listen(PORT);
+  const server = createApp().listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
+  const BASE = `http://127.0.0.1:${server.address().port}`;
+
+  async function api(method, path, { token, body } = {}) {
+    const res = await fetch(BASE + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+    return { status: res.status, body: json };
+  }
+  const must = async (...args) => {
+    const r = await api(...args);
+    assert.ok(r.status < 300, `${args[1]} -> ${r.status} ${JSON.stringify(r.body)}`);
+    return r.body;
+  };
 
   try {
     const stamp = Date.now();
-    const reg = await api('POST', '/api/auth/owner/register', {
+    const reg = await must('POST', '/api/auth/owner/register', {
       body: {
         name: 'Stock Owner', email: `stock${stamp}@test.local`, password: 'secret123',
         warehouseName: 'Stock WH', city: 'Moscow',
       },
     });
-    assert.equal(reg.status, 201, JSON.stringify(reg.body));
-    const ownerToken = reg.body.token;
+    const ownerToken = reg.token;
 
-    const alpha = await api('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Альфа' } });
-    const beta = await api('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Бета' } });
+    const alpha = await must('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Альфа' } });
+    const beta = await must('POST', '/api/sellers/companies', { token: ownerToken, body: { name: 'Бета' } });
+    const alphaKey = await must('POST', `/api/sellers/companies/${alpha.id}/keys`, { token: ownerToken });
+    // Продавец входит по ключу И называет себя: журнал должен знать, кто именно.
+    const alphaToken = (await must('POST', '/api/auth/seller/login',
+      { body: { keyCode: alphaKey.key_code, name: 'Пётр' } })).token;
+    const staff = await must('POST', '/api/staff', { token: ownerToken, body: { name: 'Работник' } });
+    const workerToken = (await must('POST', '/api/auth/staff/login',
+      { body: { keyCode: staff.key_code } })).token;
 
-    const alphaKey = await api('POST', `/api/sellers/companies/${alpha.body.id}/keys`, { token: ownerToken });
-    // Продавец входит по ключу И называет себя: журнал должен знать, кто
-    // именно из компании смотрел.
-    const alphaLogin = await api('POST', '/api/auth/seller/login', {
-      body: { keyCode: alphaKey.body.key_code, name: 'Пётр' },
-    });
-    assert.equal(alphaLogin.status, 200, JSON.stringify(alphaLogin.body));
-    const alphaToken = alphaLogin.body.token;
-
-    const staff = await api('POST', '/api/staff', { token: ownerToken, body: { name: 'Работник' } });
-    const workerToken = (await api('POST', '/api/auth/staff/login', {
-      body: { keyCode: staff.body.key_code },
-    })).body.token;
-
-    await api('POST', '/api/cells/rows', {
-      token: ownerToken, body: { configs: [{ rackCount: 3, tierCount: 2 }] },
-    });
-    const blocks = (await api('GET', '/api/cells/rows', { token: ownerToken }))
-      .body.flatMap((r) => r.blocks);
+    await must('POST', '/api/cells/rows', { token: ownerToken, body: { configs: [{ rackCount: 3, tierCount: 2 }] } });
+    const blocks = (await must('GET', '/api/cells/rows', { token: ownerToken })).flatMap((r) => r.blocks);
 
     async function receive(companyId, sku, name, qty, cellId, num) {
-      const inv = await api('POST', '/api/invoices', {
+      const inv = await must('POST', '/api/invoices', {
         token: ownerToken,
         body: { companyId, number: num, direction: 'in', items: [{ name, sku, declaredQty: qty }] },
       });
-      const res = await api('POST', '/api/receiving', {
+      await must('POST', '/api/receiving', {
         token: workerToken,
-        body: { invoiceItemId: inv.body.items[0].id, acceptedQty: qty, cellBlockId: cellId },
+        body: { invoiceItemId: inv.items[0].id, acceptedQty: qty, cellBlockId: cellId },
       });
-      assert.equal(res.status, 201, JSON.stringify(res.body));
     }
+    await receive(alpha.id, 'PB-A', 'Печенье овсяное', 100, blocks[0].id, `ПРХ-A-${stamp}`);
+    await receive(beta.id, 'PB-B', 'Чужой товар', 55, blocks[1].id, `ПРХ-B-${stamp}`);
 
-    await receive(alpha.body.id, 'PB-A', 'Печенье овсяное', 100, blocks[0].id, `ПРХ-A-${stamp}`);
-    await receive(beta.body.id, 'PB-B', 'Чужой товар', 55, blocks[1].id, `ПРХ-B-${stamp}`);
-
-    const afterReceive = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    check('продавец видит свой остаток', () => {
-      assert.equal(afterReceive.status, 200, JSON.stringify(afterReceive.body));
-      assert.equal(afterReceive.body.length, 1, JSON.stringify(afterReceive.body));
-      assert.equal(afterReceive.body[0].sku, 'PB-A');
-      assert.equal(afterReceive.body[0].qty, 100);
-    });
-    check('и чужого не видит', () => {
-      assert.ok(!afterReceive.body.some((r) => r.sku === 'PB-B'),
-        'в остатке продавца оказался чужой товар');
-    });
-    check('видно, в скольких ячейках товар лежит', () => {
-      assert.equal(afterReceive.body[0].cells, 1);
-    });
-
-    // ---------- Товар, который числится в 1С, но у нас ещё не принят ----------
-    // Ради этого случая запрос и переписан: пока он строился от ячеек, такой
-    // товар не показывался вовсе — а на живом складе это ВСЕ 1 353 позиции,
-    // потому что приёмки через Аргус ещё не было ни одной.
-    const syncKey = await api('POST', '/api/sync/keys', {
-      token: ownerToken, body: { label: 'Тест остатков' },
-    });
-    const syncToken = (await api('POST', '/api/sync/auth', {
-      body: { keyCode: syncKey.body.key_code },
-    })).body.token;
-    await api('POST', '/api/sync/push/companies', {
+    // «Всего» продавцу даёт учёт 1С: это его товар в учёте склада.
+    const syncKey = await must('POST', '/api/sync/keys', { token: ownerToken, body: { label: 'Тест остатков' } });
+    const syncToken = (await must('POST', '/api/sync/auth', { body: { keyCode: syncKey.key_code } })).token;
+    await must('POST', '/api/sync/push/companies', {
       token: syncToken, body: { records: [{ externalId: 'company-alpha', name: 'Альфа' }] },
     });
-    const pushAs = (path, records) => api('POST', path, {
+    const pushStock = (records) => must('POST', '/api/sync/push/stock', {
       token: syncToken,
-      body: { records: records.map((record) => ({ ...record, companyExternalId: 'company-alpha' })) },
+      body: { records: records.map((r) => ({ ...r, companyExternalId: 'company-alpha' })) },
     });
-    await pushAs('/api/sync/push/products', [
-      { externalId: 'p-only1c', sku: 'PB-ONLY-1C', name: 'Только в 1С' },
-    ]);
-    await pushAs('/api/sync/push/stock', [{ sku: 'PB-ONLY-1C', qty: 700 }]);
+    await must('POST', '/api/sync/push/products', {
+      token: syncToken,
+      body: {
+        records: [
+          { externalId: 'p-a', sku: 'PB-A', name: 'Печенье овсяное', companyExternalId: 'company-alpha' },
+          { externalId: 'p-only1c', sku: 'PB-ONLY-1C', name: 'Только в 1С', companyExternalId: 'company-alpha' },
+        ],
+      },
+    });
+    await pushStock([{ sku: 'PB-A', qty: 100 }, { sku: 'PB-ONLY-1C', qty: 700 }]);
 
-    const withSync = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    check('товар из 1С виден, даже если по ячейкам его у нас нет', () => {
-      const row = withSync.body.find((r) => r.sku === 'PB-ONLY-1C');
-      assert.ok(row, 'товар с остатком 1С не показан: ' + JSON.stringify(withSync.body));
-      assert.equal(row.qtyIn1c, 700);
-      assert.equal(row.qty, 0, 'остаток 1С молча записали в ячейки');
-      assert.equal(row.cells, 0);
+    const sellerStock = () => must('GET', '/api/sellers/stock', { token: alphaToken });
+    const rowOf = (payload, sku) => payload.rows.find((r) => r.sku === sku);
+
+    const start = await sellerStock();
+    check('продавец видит свои товары четырьмя числами', () => {
+      const a = rowOf(start, 'PB-A');
+      assert.ok(a, JSON.stringify(start));
+      assert.equal(a.total, 100);
+      assert.equal(a.ordered, 0);
+      assert.equal(a.inAssembly, 0);
+      assert.equal(a.available, 100);
+      assert.equal(rowOf(start, 'PB-ONLY-1C').total, 700, 'товар из 1С без ячеек не показан');
     });
-    check('и видно, когда 1С это сказала', () => {
-      const row = withSync.body.find((r) => r.sku === 'PB-ONLY-1C');
-      assert.ok(row.stockAt, 'без отметки времени «ноль» не отличить от «обмен молчит»');
+    check('и чужого не видит', () => {
+      assert.ok(!rowOf(start, 'PB-B'), 'в остатке продавца оказался чужой товар');
     });
-    check('у принятого товара обе цифры рядом, а не вместо друг друга', () => {
-      const row = withSync.body.find((r) => r.sku === 'PB-A');
-      assert.equal(row.qty, 100, 'ячейки потерялись');
-      assert.equal(row.qtyIn1c, null, 'взялась цифра 1С, которой не было');
+    check('внутренности склада продавцу не уезжают', () => {
+      const a = rowOf(start, 'PB-A');
+      for (const field of ['qtyIn1c', 'cells', 'onHand', 'notForSale', 'stockAt', 'short']) {
+        assert.ok(!Object.hasOwn(a, field), `продавцу ушло поле склада: ${field}`);
+      }
+    });
+    check('сводка складывает те же числа', () => {
+      assert.equal(start.summary.total, 800);
+      assert.equal(start.summary.available, 800);
+      assert.equal(start.summary.productCount, 2);
     });
 
-    // ---------- Главное: отгрузка уменьшает остаток ----------
-    const order = await api('POST', '/api/invoices', {
+    // ---------- Купили на площадке: «заказано» ----------
+    const order = await must('POST', '/api/invoices', {
       token: ownerToken,
       body: {
-        companyId: alpha.body.id, number: `ЗАК-${stamp}`, direction: 'out',
+        companyId: alpha.id, number: `WB-${stamp}`, direction: 'out',
         items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 30 }],
       },
     });
-    const shipped = await api('POST', '/api/shipping', {
+    const queued = await sellerStock();
+    check('новый заказ становится «заказано» и уменьшает доступное', () => {
+      const a = rowOf(queued, 'PB-A');
+      assert.equal(a.total, 100, '«всего» от заказа меняться не должно');
+      assert.equal(a.ordered, 30, JSON.stringify(a));
+      assert.equal(a.inAssembly, 0, 'склад его ещё не получал');
+      assert.equal(a.available, 70);
+      assert.ok(a.orderedOrders >= 1, 'не сказано, сколькими заказами это обещано');
+    });
+
+    // ---------- Менеджер отдал поставку складу: «в сборке» ----------
+    const supply = await must('POST', '/api/supplies', { token: ownerToken, body: { invoiceIds: [order.id] } });
+    const inSupply = await sellerStock();
+    check('поставка передана на склад — то же количество стало «в сборке»', () => {
+      const a = rowOf(inSupply, 'PB-A');
+      assert.equal(a.ordered, 0, 'заказ остался и в «заказано», и в «в сборке» — двойной вычет');
+      assert.equal(a.inAssembly, 30, JSON.stringify(a));
+      assert.equal(a.available, 70, 'доступное должно уменьшиться ровно один раз');
+      assert.ok(a.assemblyOrders >= 1);
+    });
+
+    // ---------- Отбор с полки ничего не обещает заново ----------
+    await must('POST', '/api/shipping', {
       token: workerToken,
-      body: { invoiceItemId: order.body.items[0].id, pickedQty: 30, cellBlockId: blocks[0].id },
+      body: { invoiceItemId: order.items[0].id, pickedQty: 30, cellBlockId: blocks[0].id },
     });
-    assert.equal(shipped.status, 201, JSON.stringify(shipped.body));
-    // Picking alone is not departure. Finish the real shipment before checking movements.
-    const departure = await api('POST', `/api/shipping/${order.body.id}/ship`, { token: ownerToken });
-    assert.equal(departure.status, 200);
-
-    const afterShip = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    check('после отгрузки остаток УМЕНЬШИЛСЯ', () => {
-      assert.equal(afterShip.body[0].qty, 70,
-        'остаток не вычитает отгрузки — та самая ошибка, ради которой всё делалось');
+    const afterPick = await sellerStock();
+    check('отбор с полки не меняет обещанного покупателям', () => {
+      const a = rowOf(afterPick, 'PB-A');
+      assert.equal(a.inAssembly, 30, JSON.stringify(a));
+      assert.equal(a.available, 70);
     });
 
-    // ---------- Брак виден отдельно ----------
-    const ret = await api('POST', '/api/invoices', {
+    // ---------- Уехало: числа сходятся после следующего обмена с 1С ----------
+    await must('POST', `/api/supplies/${supply.id}/ship`, { token: ownerToken, body: { destination: 'СЦ' } });
+    await pushStock([{ sku: 'PB-A', qty: 70 }]);
+    const afterShip = await sellerStock();
+    check('после отгрузки и обмена с 1С остаток уменьшился, обещаний больше нет', () => {
+      const a = rowOf(afterShip, 'PB-A');
+      assert.equal(a.total, 70, JSON.stringify(a));
+      assert.equal(a.ordered, 0);
+      assert.equal(a.inAssembly, 0);
+      assert.equal(a.available, 70);
+    });
+
+    // ---------- Брак: продавцу видно в движении, а не в остатке ----------
+    const ret = await must('POST', '/api/invoices', {
       token: ownerToken,
       body: {
-        companyId: alpha.body.id, number: `ВЗВ-${stamp}`, direction: 'return',
+        companyId: alpha.id, number: `ВЗВ-${stamp}`, direction: 'return',
         items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 9 }],
       },
     });
-    await api('POST', '/api/returns', {
+    await must('POST', '/api/returns', {
       token: workerToken,
+      body: { invoiceItemId: ret.items[0].id, qty: 9, qualityBucket: 'defective', cellBlockId: blocks[2].id },
+    });
+    const ownerView = await must('GET', `/api/sellers/stock?companyId=${alpha.id}`, { token: ownerToken });
+    check('владелец видит склад целиком: ячейки, брак и цифру 1С', () => {
+      const a = ownerView.find((r) => r.sku === 'PB-A');
+      assert.equal(a.qty, 70, 'годное в ячейках');
+      assert.equal(a.notForSale, 9, 'брак показан отдельно');
+      assert.equal(a.qtyIn1c, 70);
+      assert.ok(a.cells >= 1);
+    });
+    const moves = await must('GET', '/api/sellers/movements', { token: alphaToken });
+    check('продавец видит свою отгрузку и свой возврат с его качеством', () => {
+      assert.equal(moves.shipped.length, 1, JSON.stringify(moves.shipped));
+      assert.equal(moves.shipped[0].qty, 30);
+      assert.equal(moves.returned.length, 1, JSON.stringify(moves.returned));
+      assert.equal(moves.returned[0].bucket, 'defective');
+    });
+
+    // ---------- Товар, которого нет в учёте, продавцу не придумывается ----------
+    await must('POST', '/api/invoices', {
+      token: ownerToken,
       body: {
-        invoiceItemId: ret.body.items[0].id, qty: 9,
-        qualityBucket: 'defective', cellBlockId: blocks[2].id,
+        companyId: alpha.id, number: `WB-GHOST-${stamp}`, direction: 'out',
+        items: [{ name: 'Товар только в заказе', sku: 'PB-ONLY-ORDER', declaredQty: 7 }],
       },
     });
-    const withDefect = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    check('брак не подмешивается к тому, что можно продать', () => {
-      const row = withDefect.body.find((r) => r.sku === 'PB-A');
-      assert.equal(row.qty, 70, 'брак посчитали как годное');
-      assert.equal(row.notForSale, 9, 'брак не показан отдельно');
+    const withGhost = await sellerStock();
+    check('заказ на неизвестный складу товар не создаёт остаток из воздуха', () => {
+      assert.ok(!rowOf(withGhost, 'PB-ONLY-ORDER'), JSON.stringify(withGhost.rows));
+      const orders = withGhost.rows.map((r) => r.sku);
+      assert.ok(orders.includes('PB-A'), 'настоящие товары остались на месте');
     });
 
-    // ---------- Владелец смотрит глазами продавца ----------
-    const asOwner = await api('GET', `/api/sellers/stock?companyId=${alpha.body.id}`, { token: ownerToken });
-    check('владелец может посмотреть, что видит его клиент', () => {
-      assert.equal(asOwner.status, 200, JSON.stringify(asOwner.body));
-      assert.equal(asOwner.body.find((r) => r.sku === 'PB-A').qty, 70);
-    });
-    const ownerNoCompany = await api('GET', '/api/sellers/stock', { token: ownerToken });
-    check('но обязан назвать, чьими глазами', () => {
-      assert.equal(ownerNoCompany.status, 400, JSON.stringify(ownerNoCompany.body));
-    });
-
-    // ---------- Продавец не может подсмотреть чужой остаток ----------
-    const peek = await api('GET', `/api/sellers/stock?companyId=${beta.body.id}`, { token: alphaToken });
+    // ---------- Изоляция ----------
+    const peek = await api('GET', `/api/sellers/stock?companyId=${beta.id}`, { token: alphaToken });
     check('подставить чужую компанию в запрос бесполезно', () => {
       assert.equal(peek.status, 200, JSON.stringify(peek.body));
-      assert.ok(!peek.body.some((r) => r.sku === 'PB-B'),
+      assert.ok(!peek.body.rows.some((r) => r.sku === 'PB-B'),
         'параметр запроса пересилил изоляцию — это утечка между продавцами');
     });
-
+    const ownerNoCompany = await api('GET', '/api/sellers/stock', { token: ownerToken });
+    check('владелец обязан назвать, чьими глазами смотрит', () => {
+      assert.equal(ownerNoCompany.status, 400, JSON.stringify(ownerNoCompany.body));
+    });
     const worker = await api('GET', '/api/sellers/stock', { token: workerToken });
     check('работнику остаток продавца не показывают', () => {
       assert.equal(worker.status, 403, JSON.stringify(worker.body));
     });
-
-    // Список актов приёмки должен быть списком приёмок. Без фильтра по
-    // направлению туда попадали заказы на отгрузку и возвраты — и продавец
-    // видел их как «акты приёмки» с пустой колонкой «принято».
-    const acts = await api('GET', '/api/invoices?direction=in', { token: alphaToken });
-    check('в актах приёмки только приёмки', () => {
-      assert.equal(acts.status, 200, JSON.stringify(acts.body));
-      assert.ok(acts.body.length >= 1);
-      assert.ok(acts.body.every((i) => i.direction === 'in'),
-        'в акты приёмки попало другое направление: '
-          + JSON.stringify(acts.body.map((i) => i.direction)));
-    });
-    const allDirections = await api('GET', '/api/invoices', { token: alphaToken });
-    check('и без фильтра их действительно больше — фильтр не декоративный', () => {
-      assert.ok(allDirections.body.length > acts.body.length,
-        'у продавца нет ни отгрузок, ни возвратов — проверка ничего не значит');
-    });
-
-    // ---------- Движение: что отгрузили и что вернулось ----------
-    const moves = await api('GET', '/api/sellers/movements', { token: alphaToken });
-    check('продавец видит свою отгрузку', () => {
-      assert.equal(moves.status, 200, JSON.stringify(moves.body));
-      assert.equal(moves.body.shipped.length, 1, JSON.stringify(moves.body.shipped));
-      assert.equal(moves.body.shipped[0].qty, 30);
-      assert.equal(moves.body.shipped[0].sku, 'PB-A');
-      assert.ok(moves.body.shipped[0].order, 'не сказано, по какому заказу');
-    });
-    check('и свой возврат — с тем, чем его признали', () => {
-      assert.equal(moves.body.returned.length, 1, JSON.stringify(moves.body.returned));
-      assert.equal(moves.body.returned[0].qty, 9);
-      assert.equal(moves.body.returned[0].bucket, 'defective',
-        'продавцу не сказано, что товар признан браком');
-    });
-
-    const betaKey = await api('POST', `/api/sellers/companies/${beta.body.id}/keys`, { token: ownerToken });
-    const betaToken = (await api('POST', '/api/auth/seller/login', {
-      body: { keyCode: betaKey.body.key_code, name: 'Иван' },
-    })).body.token;
-    const betaMoves = await api('GET', '/api/sellers/movements', { token: betaToken });
+    const betaKey = await must('POST', `/api/sellers/companies/${beta.id}/keys`, { token: ownerToken });
+    const betaToken = (await must('POST', '/api/auth/seller/login',
+      { body: { keyCode: betaKey.key_code, name: 'Иван' } })).token;
+    const betaMoves = await must('GET', '/api/sellers/movements', { token: betaToken });
     check('чужое движение продавцу не видно', () => {
-      assert.equal(betaMoves.body.shipped.length, 0, JSON.stringify(betaMoves.body.shipped));
-      assert.equal(betaMoves.body.returned.length, 0, JSON.stringify(betaMoves.body.returned));
+      assert.equal(betaMoves.shipped.length, 0, JSON.stringify(betaMoves.shipped));
+      assert.equal(betaMoves.returned.length, 0, JSON.stringify(betaMoves.returned));
     });
 
-    // ---------- Три колонки: на складе, в заказах, доступно ----------
-    //
-    // Ради этих трёх чисел продавец и звонит на склад. Проверяется не то,
-    // что они «есть», а арифметика между ними: доступное — это разность,
-    // и если она посчитана не по всем обещанным заказам, склад пообещает
-    // клиенту товар, который уже уезжает.
-    const trio = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    const rowA = trio.body.find((r) => r.sku === 'PB-A');
-    check('три числа приходят по каждому товару', () => {
-      assert.ok(rowA, JSON.stringify(trio.body));
-      assert.equal(typeof rowA.onHand, 'number');
-      assert.equal(typeof rowA.ordered, 'number');
-      assert.equal(typeof rowA.available, 'number');
-    });
-    check('доступно к продаже — это на складе минус обещанное', () => {
-      assert.equal(rowA.available, Math.max(0, rowA.onHand - rowA.ordered),
-        JSON.stringify(rowA));
-    });
-
-    // Новый заказ на 30 штук — ещё не собран.
-    const fresh = await api('POST', '/api/invoices', {
-      token: ownerToken,
-      body: { companyId: alpha.body.id, number: `WB-NEW-${stamp}`, direction: 'out',
-              items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 30 }] },
-    });
-    const afterOrder = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    const withOrder = afterOrder.body.find((r) => r.sku === 'PB-A');
-    check('новый заказ уменьшил доступное, не тронув «на складе»', () => {
-      assert.equal(withOrder.onHand, rowA.onHand, 'на складе не должно было измениться');
-      assert.equal(withOrder.ordered, rowA.ordered + 30, JSON.stringify(withOrder));
-      assert.equal(withOrder.available, withOrder.onHand - withOrder.ordered);
-    });
-    check('и сказано, сколькими заказами это обещано', () => {
-      assert.ok(withOrder.orderedOrders >= 1, JSON.stringify(withOrder));
-    });
-
-    // Собрали заказ: товар снят с полки, но машина ещё не ушла.
-    const freshItem = fresh.body.items[0];
-    await api('POST', '/api/shipping', {
-      token: workerToken,
-      body: { invoiceItemId: freshItem.id, pickedQty: 30, cellBlockId: blocks[0].id },
-    });
-    const afterPick = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    const picked = afterPick.body.find((r) => r.sku === 'PB-A');
-    check('собранный, но не уехавший заказ ОСТАЁТСЯ в обещанном', () => {
-      // Из ячейки он уже списан, а из учёта 1С — ещё нет: реализация
-      // проводится при отгрузке. Выкинь его из обещанного — и продавцу
-      // пообещают то, что стоит в коробке у ворот.
-      assert.equal(picked.ordered, withOrder.ordered, JSON.stringify(picked));
-      // Их два: этот и заказ, собранный выше в этом же тесте. Проверяем
-      // сам признак, а не число — иначе тест начнёт падать от любого
-      // заказа, добавленного в сценарий выше.
-      assert.ok(picked.orderedPicked >= 1, 'не отмечено, что заказ уже собран: '
-        + JSON.stringify(picked));
-    });
-
-    // Товар, которого нет ни в 1С, ни в ячейках — только в заказе.
-    await api('POST', '/api/invoices', {
-      token: ownerToken,
-      body: { companyId: alpha.body.id, number: `WB-GHOST-${stamp}`, direction: 'out',
-              items: [{ name: 'Товар только в заказе', sku: 'PB-ONLY-ORDER', declaredQty: 7 }] },
-    });
-    const withGhost = await api('GET', '/api/sellers/stock', { token: alphaToken });
-    const ghost = withGhost.body.find((r) => r.sku === 'PB-ONLY-ORDER');
-    check('заказ на товар, которого на складе нет, продавец всё равно видит', () => {
-      assert.ok(ghost, 'строка пропала: раньше остаток строился только по 1С и ячейкам');
-      assert.equal(ghost.onHand, null);
-      assert.equal(ghost.ordered, 7);
-    });
-    check('неизвестный остаток не превращается в ноль или ложную нехватку', () => {
-      assert.equal(ghost.available, null, JSON.stringify(ghost));
-      assert.equal(ghost.short, null);
-    });
-    const foreign = withGhost.body.find((r) => r.sku === 'PB-B');
-    check('чужие заказы в это не попадают', () => {
-      assert.equal(foreign, undefined, 'виден товар другой компании');
-    });
     // ---------- Отзыв ключа действует сразу ----------
     // Раньше отзыв закрывал только вход, а выданный токен жил до конца срока —
     // до 45 минут. Отзывают ключ обычно тогда, когда этих минут и нет.
-    await api('PATCH', `/api/sellers/keys/${alphaKey.body.id}/toggle`, { token: ownerToken });
+    await must('PATCH', `/api/sellers/keys/${alphaKey.id}/toggle`, { token: ownerToken });
     await new Promise((r) => setTimeout(r, 2100)); // короткий кэш проверки ключа
-
     const afterRevoke = await api('GET', '/api/sellers/stock', { token: alphaToken });
     check('после отзыва ключа старый токен перестаёт работать', () => {
       assert.equal(afterRevoke.status, 401, JSON.stringify(afterRevoke.body));
     });
-    const relogin = await api('POST', '/api/auth/seller/login', {
-      body: { keyCode: alphaKey.body.key_code, name: 'Пётр' },
-    });
+    const relogin = await api('POST', '/api/auth/seller/login',
+      { body: { keyCode: alphaKey.key_code, name: 'Пётр' } });
     check('и войти заново по нему нельзя', () => {
       assert.equal(relogin.status, 403, JSON.stringify(relogin.body));
     });
-
-    // Владельца отзыв чужого ключа не касается.
-    const ownerStillWorks = await api('GET', `/api/sellers/stock?companyId=${alpha.body.id}`, { token: ownerToken });
-    check('владельца это не задевает', () => {
+    const ownerStillWorks = await api('GET', `/api/sellers/stock?companyId=${alpha.id}`, { token: ownerToken });
+    check('владельца отзыв чужого ключа не задевает', () => {
       assert.equal(ownerStillWorks.status, 200, JSON.stringify(ownerStillWorks.body));
     });
-
   } finally {
     server.close();
   }
