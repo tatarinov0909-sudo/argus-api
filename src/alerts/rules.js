@@ -12,6 +12,8 @@
 // «проблем нет», иначе владелец перестанет читать.
 
 // Пороги. Начинаем осторожно: лучше пропустить, чем приучить нажимать «скрыть».
+const { plural } = require('../journal/plural');
+
 const THRESHOLDS = {
   discrepancyHours: 12, // расхождение ждёт решения владельца
   returnUnsortedHours: 24, // возврат приехал и лежит неразобранным
@@ -22,13 +24,6 @@ const THRESHOLDS = {
   defectWaitingDays: 7, // брак ждёт решения продавца
 };
 
-function plural(n, one, few, many) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return one;
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
-  return many;
-}
 
 function hoursAgo(ts) {
   return Math.floor((Date.now() - new Date(ts).getTime()) / 3600000);

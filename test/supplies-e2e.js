@@ -132,10 +132,21 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(wrongDir.status, 400, JSON.stringify(wrongDir.body));
     });
 
+    const badPlace = await api('POST', '/api/supplies', {
+      token: ownerToken, body: { invoiceIds: [o1], destination: { city: 'Подольск' } },
+    });
+    const longPlace = await api('POST', '/api/supplies', {
+      token: ownerToken, body: { invoiceIds: [o1], destination: 'x'.repeat(121) },
+    });
+    check('точка доставки — короткий текст, а не что попало', () => {
+      assert.equal(badPlace.status, 400, JSON.stringify(badPlace.body));
+      assert.equal(longPlace.status, 400, JSON.stringify(longPlace.body));
+    });
+
     // ---------- Собрали ----------
     const created = await api('POST', '/api/supplies', {
       token: ownerToken,
-      body: { invoiceIds: [o1, o2, o3], marketplace: 'wb', destination: 'СЦ Подольск' },
+      body: { invoiceIds: [o1, o2, o3], marketplace: 'wb', destination: '  СЦ Подольск  ' },
     });
     check('поставка собирается из заказов одного продавца', () => {
       assert.equal(created.status, 201, JSON.stringify(created.body));

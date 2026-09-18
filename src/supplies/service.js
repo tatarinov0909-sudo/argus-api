@@ -1,4 +1,5 @@
 const { HttpError } = require('../middleware/errorHandler');
+const { plural } = require('../journal/plural');
 const { formatBlockLabel } = require('../cells/label');
 const journal = require('../journal/repository');
 
@@ -82,10 +83,21 @@ const WB_CONFIRMED_SQL = `(i.source <> '1c' AND i.mp_supplier_status IS NOT NULL
 //
 // Заказы обязаны быть одной компании: поставка уезжает по документам одного
 // продавца, и смешать двух — значит отдать чужой товар под чужой накладной.
-async function create(client, warehouseId, { invoiceIds, marketplace = null, destination = null, actor }) {
+// Точка доставки — свободный текст менеджера («СЦ Коледино», «Казань»).
+// Пустое — «не указана»; не строка или роман вместо адреса — ошибка ввода.
+function cleanDestination(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') throw new HttpError(400, 'Точка доставки должна быть текстом');
+  const text = value.trim();
+  if (text.length > 120) throw new HttpError(400, 'Точка доставки длиннее 120 знаков');
+  return text || null;
+}
+
+async function create(client, warehouseId, { invoiceIds, marketplace = null, destination: rawDestination = null, actor }) {
   if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
     throw new HttpError(400, 'Не указано ни одного заказа');
   }
+  const destination = cleanDestination(rawDestination);
 
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
@@ -149,8 +161,10 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
-    actionText: `Собрана поставка «${number}» — ${orders.rows.length} `
-      + `${orders.rows.length === 1 ? 'заказ' : 'заказов'}, продавец «${orders.rows[0].company_name}».`,
+    // «Собрана» в Аргусе значит «грузчики всё собрали», поэтому здесь
+    // «составлена»: пока это только решение менеджера, что уезжает.
+    actionText: `Составлена поставка «${number}» — ${orders.rows.length} `
+      + `${plural(orders.rows.length, 'заказ', 'заказа', 'заказов')}, продавец «${orders.rows[0].company_name}».`,
     entityType: 'supply',
     entityId: supply.id,
     actorType: actor?.type || 'owner',
@@ -333,7 +347,8 @@ async function contents(client, warehouseId, supplyId) {
 // отдельной кнопки для неё нет. Уехать может только собранная поставка:
 // иначе заказы получили бы «отгружено», а товар остался бы на полке
 // и продолжал числиться в остатке.
-async function ship(client, warehouseId, supplyId, { destination = null, actor }) {
+async function ship(client, warehouseId, supplyId, { destination: rawDestination = null, actor }) {
+  const destination = cleanDestination(rawDestination);
   const cur = await client.query(
     `SELECT id, number, status, company_id, mp_supply_id
        FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
