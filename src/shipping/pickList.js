@@ -18,6 +18,17 @@ function cellLabel(r) {
   return `${r.row_num}.${rack}.${tier}`;
 }
 
+// Точка доставки приходит от поставки: по ней собранное раскладывают по
+// машинам, и по ней же грузчик сортирует лист.
+function orderView(r) {
+  return {
+    number: r.number,
+    company: r.company_name,
+    marketplace: r.source === '1c' ? '1c' : r.source,
+    destination: r.destination || null,
+  };
+}
+
 async function buildPickList(client, warehouseId, invoiceIds = []) {
   // Без списка берём всё, что реально ждёт отбора: открытые и начатые
   // отгрузки. Именно этот случай и есть «утро, заказов много». Заказы
@@ -25,8 +36,10 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // в поставке: вся очередь WB на листе грузчика означала бы, что решает
   // не менеджер, а тот, кто первым взял лист.
   const invoices = await client.query(
-    `SELECT i.id, i.number, i.company_id, i.source, c.name AS company_name
+    `SELECT i.id, i.number, i.company_id, i.source, c.name AS company_name,
+            s.destination
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+     LEFT JOIN supplies s ON s.id = i.supply_id
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
        AND i.status IN ('open', 'in_progress')
        AND i.mp_closed_at IS NULL
@@ -91,9 +104,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   }
   if (lines.size === 0) {
     return {
-      orders: invoices.rows.map((r) => ({
-        number: r.number, company: r.company_name, marketplace: r.source === '1c' ? '1c' : r.source,
-      })),
+      orders: invoices.rows.map(orderView),
       lines: [], totalUnits: 0, cellsToVisit: 0,
     };
   }
@@ -182,9 +193,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   });
 
   return {
-    orders: invoices.rows.map((r) => ({
-      number: r.number, company: r.company_name, marketplace: r.source === '1c' ? '1c' : r.source,
-    })),
+    orders: invoices.rows.map(orderView),
     lines: result,
     totalUnits: result.reduce((sum, l) => sum + l.needQty, 0),
     cellsToVisit: visited.size,

@@ -144,6 +144,16 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     });
     const supplyId = created.body.id;
 
+    const pickSheet = await api('GET', '/api/shipping/pick-list', { token: ownerToken });
+    check('лист грузчика знает точку доставки заказа — по ней его сортируют', () => {
+      assert.equal(pickSheet.status, 200, JSON.stringify(pickSheet.body));
+      const inSupply = pickSheet.body.orders.filter((o) => o.company === 'Альфа');
+      const outside = pickSheet.body.orders.filter((o) => o.company !== 'Альфа');
+      assert.equal(inSupply.length, 3, JSON.stringify(pickSheet.body.orders));
+      assert.ok(inSupply.every((o) => o.destination === 'СЦ Подольск'), JSON.stringify(inSupply));
+      assert.ok(outside.every((o) => o.destination === null), 'у заказа без поставки точки нет');
+    });
+
     const twice = await api('POST', '/api/supplies', {
       token: ownerToken, body: { invoiceIds: [o1] },
     });
