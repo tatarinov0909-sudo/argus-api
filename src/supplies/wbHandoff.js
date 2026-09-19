@@ -19,6 +19,10 @@ const { plural } = require('../journal/plural');
 // Запись включает владелец флагом `write_enabled` у ключа продавца. Пока он
 // выключен, здесь ничего не происходит вовсе: `skipped: 'write_disabled'`.
 
+// Пауза между запросами к WB: его лимит — не чаще раза в 200 мс.
+const PACE_MS = 250;
+const pause = (ms) => (ms > 0 ? new Promise((resolve) => { setTimeout(resolve, ms); }) : Promise.resolve());
+
 // Заказ, который площадка не приняла в поставку, из местной поставки убираем.
 // Иначе склад собирал бы то, что на WB в этой поставке не значится.
 async function detachRejected(client, warehouseId, supply, rejected) {
@@ -53,24 +57,38 @@ async function handOver({
   const mpSupplyId = await api.createSupply(token, supply.number);
   let confirmed = [];
   let rejected = [];
-  // Пачками по 100. Не прошла пачка — пробуем её заказы по одному, чтобы
-  // один чужой заказ не утянул за собой остальные.
-  for (let i = 0; i < orders.length; i += 100) {
-    const chunk = orders.slice(i, i + 100);
-    try {
-      await api.addOrders(token, mpSupplyId, chunk.map((o) => o.externalId));
-      confirmed.push(...chunk);
-    } catch (err) {
-      for (const order of chunk) {
-        try {
-          if (chunk.length === 1) throw err;
-          await api.addOrders(token, mpSupplyId, [order.externalId]);
-          confirmed.push(order);
-        } catch (one) {
-          rejected.push({ ...order, error: one.message });
-        }
+  // WB пускает не чаще раза в 200 мс, всплеском до 20 запросов, а каждая
+  // ошибка 4xx считается за десять. Поэтому не прошедшую пачку не разбираем
+  // по одному заказу (90 запросов подряд — и WB начнёт отказывать уже по
+  // частоте, а мы выкинем из поставки исправные заказы), а делим пополам,
+  // пока не останется виноватый: на один плохой заказ из ста — около дюжины
+  // запросов. «Слишком часто» (429) — подождать и повторить.
+  const add = async (ids) => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await api.addOrders(token, mpSupplyId, ids);
+      } catch (err) {
+        if (err.status !== 429 || attempt >= 3) throw err;
+        await pause(1000 * (attempt + 1));
       }
     }
+  };
+  const place = async (part) => {
+    try {
+      await add(part.map((o) => o.externalId));
+      confirmed.push(...part);
+    } catch (err) {
+      if (part.length === 1) { rejected.push({ ...part[0], error: err.message }); return; }
+      const half = Math.ceil(part.length / 2);
+      await pause(PACE_MS);
+      await place(part.slice(0, half));
+      await pause(PACE_MS);
+      await place(part.slice(half));
+    }
+  };
+  for (let i = 0; i < orders.length; i += 100) {
+    if (i > 0) await pause(PACE_MS);
+    await place(orders.slice(i, i + 100));
   }
   // Если что-то не прошло, решает не наш подсчёт, а состав поставки на WB:
   // пачка могла закрепиться частично.
