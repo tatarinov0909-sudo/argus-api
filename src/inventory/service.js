@@ -168,7 +168,7 @@ async function createRun(client, warehouseId, ownerId) {
   );
   if (open.rows[0].n > 0) {
     throw new HttpError(409,
-      `С прошлого раза не посчитано ${open.rows[0].n} ячеек — сначала они`);
+      `С прошлого раза остались непосчитанными ячейки: ${open.rows[0].n} — сначала они`);
   }
 
   const cells = await pickCells(client, warehouseId, {
@@ -635,7 +635,7 @@ async function advice(client, warehouseId) {
   }
   if (wanted > cellsPerRun) {
     reasons.push(`Чтобы уложиться в ${days} ${plural(days, 'день', 'дня', 'дней')},`
-      + ` пришлось бы отдавать по ${wanted} ячеек за заход — это полсмены.`
+      + ` пришлось бы отдавать по ${wanted} ${plural(wanted, 'ячейке', 'ячейки', 'ячеек')} за заход — это полсмены.`
       + ' Аргус предлагает 40 и круг подольше: реже, зато выполнимо.');
   }
   if (Number(d.never_counted) > 0) {

@@ -4,6 +4,7 @@ const {
 } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
+const { plural } = require('../journal/plural');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
 const { moveStock } = require('./move');
 const journal = require('../journal/repository');
@@ -134,7 +135,7 @@ router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, ne
       const { stock_positions: stockPositions, linked_positions: linkedPositions } = existing.rows[0];
       if (stockPositions > 0 || linkedPositions > 0) {
         throw new HttpError(409,
-          `Схема уже используется: физический товар — ${stockPositions} позиций, адреса из 1С — ${linkedPositions}. Изменяйте ряды и ячейки без полной перестройки.`);
+          `Схема уже используется: физический товар — ${stockPositions} ${plural(stockPositions, 'позиция', 'позиции', 'позиций')}, адреса из 1С — ${linkedPositions}. Изменяйте ряды и ячейки без полной перестройки.`);
       }
       await client.query(
         `DELETE FROM warehouse_rows WHERE warehouse_id = $1`, // cascades to cell_blocks/cell_stock
@@ -281,7 +282,7 @@ router.delete('/rows', requireAuth, requireGrant('warehouse'), async (req, res, 
       const { positions, units } = stock.rows[0];
 
       if (positions > 0 && !confirmed) {
-        throw new HttpError(409, `В ячейках и зонах числится товар: ${positions} позиций, ${units} шт. Удаление схемы сотрёт эти записи.`);
+        throw new HttpError(409, `В ячейках и зонах числится товар: ${positions} ${plural(positions, 'позиция', 'позиции', 'позиций')}, ${units} шт. Удаление схемы сотрёт эти записи.`);
       }
 
       const deleted = await client.query(

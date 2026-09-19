@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { HttpError } = require('../middleware/errorHandler');
+const { plural } = require('../journal/plural');
 
 const trimmed = (value) => typeof value === 'string' ? value.trim() : '';
 
@@ -632,7 +633,7 @@ async function upsertInvoices(client, warehouseId, records) {
       results.push({
         externalId, id: found.id,
         status: conflicts.length ? 'ownership_conflict' : (existing.rows[0] ? 'updated' : 'adopted'),
-        ...(conflicts.length ? { error: `${conflicts.length} позиций с конфликтом принадлежности; документ не изменён` } : {}),
+        ...(conflicts.length ? { error: `${conflicts.length} ${plural(conflicts.length, 'позиция', 'позиции', 'позиций')} с конфликтом принадлежности; документ не изменён` } : {}),
       });
       continue;
     }
@@ -651,7 +652,7 @@ async function upsertInvoices(client, warehouseId, records) {
     results.push({
       externalId, ...(conflicts.length ? {} : { id: inserted.rows[0].id }),
       status: conflicts.length ? 'ownership_conflict' : 'created',
-      ...(conflicts.length ? { error: `${conflicts.length} позиций с конфликтом принадлежности; документ не создан` } : {}),
+      ...(conflicts.length ? { error: `${conflicts.length} ${plural(conflicts.length, 'позиция', 'позиции', 'позиций')} с конфликтом принадлежности; документ не создан` } : {}),
     });
     } catch (err) {
       await client.query('ROLLBACK TO SAVEPOINT sp_sync_invoice');

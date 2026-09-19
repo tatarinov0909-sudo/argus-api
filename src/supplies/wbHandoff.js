@@ -1,6 +1,7 @@
 const wbWrite = require('../marketplaces/wbWrite');
 const credentials = require('../marketplaces/credentials');
 const journal = require('../journal/repository');
+const { plural } = require('../journal/plural');
 
 // Передача поставки на Wildberries и обратно.
 //
@@ -114,7 +115,7 @@ async function handOver({
       entityId: supply.id,
       status: 'auto',
       actionText: `Поставка «${supply.number}» создана на WB (${mpSupplyId}): `
-        + `${confirmed.length} ${confirmed.length === 1 ? 'заказ' : 'заказов'} на сборке`
+        + `${confirmed.length} ${plural(confirmed.length, 'заказ', 'заказа', 'заказов')} на сборке`
         + `${rejected.length ? `, не принято ${rejected.length}` : ''}`
         + `${stickers.length ? `, этикеток ${stickers.length}` : ', этикетки не получены'}.`,
     });

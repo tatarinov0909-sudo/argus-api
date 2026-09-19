@@ -142,7 +142,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
   const unpickable = orders.rows.filter((o) => o.has_unpickable);
   if (unpickable.length > 0) {
     throw new HttpError(409,
-      `${unpickable.length} ${unpickable.length === 1 ? 'заказ' : 'заказов'} нельзя собрать: `
+      `${unpickable.length} ${plural(unpickable.length, 'заказ', 'заказа', 'заказов')} нельзя собрать: `
       + 'товар не сопоставлен с номенклатурой склада или нет номера отправления. '
       + `Например «${unpickable[0].number}». Такие заказы остаются в очереди.`);
   }
@@ -564,7 +564,7 @@ async function disband(client, warehouseId, supplyId, { actor }) {
     warehouseId,
     agent: 'Кладовщик',
     actionText: `Поставка «${supply.number}» разобрана — ${freed.rowCount} `
-      + `${freed.rowCount === 1 ? 'заказ' : 'заказов'} вернулись в очередь.`,
+      + `${plural(freed.rowCount, 'заказ', 'заказа', 'заказов')} ${freed.rowCount === 1 ? 'вернулся' : 'вернулись'} в очередь.`,
     entityType: 'supply',
     entityId: supplyId,
     actorType: actor?.type || 'owner',
