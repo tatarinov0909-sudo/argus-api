@@ -4,6 +4,8 @@ const { withTenantContext } = require('../db/pool');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const service = require('./service');
 const wbHandoff = require('./wbHandoff');
+const wb = require('../marketplaces/wb');
+const credentials = require('../marketplaces/credentials');
 
 const router = express.Router();
 
@@ -17,10 +19,12 @@ const actorOf = (auth) => ({
 router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { invoiceIds, marketplace, destination } = req.body || {};
-    const supply = await withTenantContext({ warehouseId }, (client) => service.create(
-      client, warehouseId, { invoiceIds, marketplace, destination, actor: actorOf(req.auth) },
-    ));
+    const {
+      invoiceIds, marketplace, destination, shipDate, shippingPointId,
+    } = req.body || {};
+    const supply = await withTenantContext({ warehouseId }, (client) => service.create(client, warehouseId, {
+      invoiceIds, marketplace, destination, shipDate, shippingPointId, actor: actorOf(req.auth),
+    }));
 
     // Передача на площадку — отдельным шагом и вне транзакции: чужая сеть не
     // должна держать открытым соединение с базой. Пока владелец не включил
@@ -36,6 +40,18 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
       }).catch((err) => ({ error: err.message }));
     }
     res.status(201).json({ ...supply, marketplace: marketplaceResult });
+  } catch (err) { next(err); }
+});
+
+// Пункты приёма WB, куда можно везти поставку этого продавца. Только чтение
+// ключом продавца. Город и габарит — Москва и обычный товар (решение
+// владельца 19.09.2026); станут настройкой склада, когда появится второй.
+router.get('/shipping-points/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const token = await withTenantContext({ warehouseId },
+      (client) => credentials.tokenFor(client, warehouseId, req.params.companyId, 'wb'));
+    res.json(await wb.shippingPoints(token, { city: 'Москва', cargoType: 1 }));
   } catch (err) { next(err); }
 });
 

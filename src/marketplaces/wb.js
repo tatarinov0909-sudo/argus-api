@@ -130,6 +130,17 @@ async function orderStatuses(token, orderIds) {
 // `call` отдаётся модулю записи: хост, таймаут, разбор ошибок и то, что в
 // сообщение об ошибке не попадает ни токен, ни тело ответа площадки, должны
 // быть одни и те же для чтения и записи.
+// Пункты приёма поставок WB в городе — из них менеджер выбирает, куда везёт
+// поставку. Без пункта WB не принимает «передать в доставку».
+// cargoType: 1 — обычный товар (МГТ), 2 — СГТ, 3 — КГТ+.
+async function shippingPoints(token, { city = 'Москва', cargoType = 1 } = {}) {
+  const q = new URLSearchParams({ city: String(city), cargoType: String(cargoType) });
+  const r = await call(token, 'marketplace', `/api/marketplace/v3/fbs/shipping-points?${q}`);
+  return (r?.shippingPoints || []).map((p) => ({
+    id: p.id, name: p.name, address: p.address, city: p.city, fulfillment: !!p.fulfillment,
+  }));
+}
+
 module.exports = {
-  sellerInfo, warehouses, newOrders, productCards, orderStatuses, call, HOSTS,
+  sellerInfo, warehouses, newOrders, productCards, orderStatuses, shippingPoints, call, HOSTS,
 };

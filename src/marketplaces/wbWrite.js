@@ -108,6 +108,26 @@ async function orderStickers(token, orders, { type = 'svg', width = 58, height =
   }));
 }
 
+// Параметры отгрузки: сами везём, в такой-то день, на такой-то пункт. Без
+// них «передать в доставку» у продавцов РФ получает 409. Менять можно, пока
+// поставку не отсканировали в пункте. Ответ приходит по каждой поставке
+// отдельно, и 200 ещё не значит «принято» — смотрим success.
+async function setShipping(token, supply, { pointId, date }) {
+  const point = Number(pointId);
+  if (!Number.isSafeInteger(point) || point <= 0) throw new HttpError(400, 'Не выбран пункт отгрузки WB');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) throw new HttpError(400, 'Дата отгрузки — в виде ГГГГ-ММ-ДД');
+  const r = await call(token, 'marketplace', '/api/marketplace/v3/fbs/supplies/shipping-method', {
+    method: 'PATCH',
+    body: { data: [{ supplyId: supplyId(supply), shippingType: 'selfShipping', shippingDt: String(date), shippingPointId: point }] },
+  });
+  const res = r?.results?.[0];
+  if (!res || !res.success) {
+    const e = res?.error || {};
+    throw new HttpError(409, `WB не принял параметры отгрузки${e.code ? ` (${e.code})` : ''}${e.detail ? `: ${String(e.detail).slice(0, 200)}` : ''}`);
+  }
+  return true;
+}
+
 // Пустую поставку можно удалить — этим откатывается неудачная попытка,
 // когда WB не принял ни одного заказа.
 async function deleteSupply(token, supply) {
@@ -116,5 +136,5 @@ async function deleteSupply(token, supply) {
 }
 
 module.exports = {
-  createSupply, addOrders, supplyOrderIds, deliverSupply, supplyBarcode, orderStickers, deleteSupply,
+  createSupply, addOrders, supplyOrderIds, setShipping, deliverSupply, supplyBarcode, orderStickers, deleteSupply,
 };

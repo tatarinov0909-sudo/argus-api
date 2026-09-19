@@ -75,3 +75,25 @@ test('WB пакетный метод: до 100 заказов, в адрес —
   await assert.rejects(() => wbWrite.addOrders('synthetic-test-token', 'WB-GI-1', ['1; DROP']));
   assert.equal(seen.length, 1);
 });
+
+test('параметры отгрузки: сами везём, пункт и дата; отказ WB по поставке — ошибка', async (t) => {
+  const previous = global.fetch; t.after(() => { global.fetch = previous; });
+  const seen = [];
+  let answer = { results: [{ supplyId: 'WB-GI-1', success: true }] };
+  global.fetch = async (url, options) => {
+    seen.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify(answer) };
+  };
+  await wbWrite.setShipping('synthetic-test-token', 'WB-GI-1', { pointId: '100', date: '2099-01-02' });
+  assert.equal(seen[0].url, 'https://marketplace-api.wildberries.ru/api/marketplace/v3/fbs/supplies/shipping-method');
+  assert.equal(seen[0].options.method, 'PATCH');
+  assert.deepEqual(JSON.parse(seen[0].options.body), {
+    data: [{ supplyId: 'WB-GI-1', shippingType: 'selfShipping', shippingDt: '2099-01-02', shippingPointId: 100 }],
+  });
+  answer = { results: [{ supplyId: 'WB-GI-1', success: false, error: { code: 'InvalidShippingDt', detail: 'дата' } }] };
+  await assert.rejects(() => wbWrite.setShipping('synthetic-test-token', 'WB-GI-1', { pointId: 100, date: '2099-01-02' }),
+    /InvalidShippingDt/);
+  await assert.rejects(() => wbWrite.setShipping('synthetic-test-token', 'WB-GI-1', { pointId: 0, date: '2099-01-02' }));
+  await assert.rejects(() => wbWrite.setShipping('synthetic-test-token', 'WB-GI-1', { pointId: 1, date: '02.01.2099' }));
+  assert.equal(seen.length, 2);
+});

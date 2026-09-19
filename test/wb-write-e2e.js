@@ -100,6 +100,7 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
         calls.push(['orderStickers', ids.join(',')]);
         return ids.map((id) => ({ orderId: String(id), partA: '100', partB: '2000' + String(id).slice(-2), barcode: 'ST' + id, file: 'c3ZnLXN0aWNrZXI=' }));
       },
+      setShipping: async (token, supply, p) => { calls.push(['setShipping', supply, String(p.pointId), p.date]); return true; },
       deliverSupply: async (token, supply) => { calls.push(['deliverSupply', supply]); return true; },
       deleteSupply: async (token, supply) => { calls.push(['deleteSupply', supply]); return true; },
     };
@@ -125,10 +126,24 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     const badBody = await api('PATCH', `/api/marketplaces/${company.id}/wb/write`, owner.token, { enabled: 'да' });
     check('разрешение нельзя включить невнятным значением', () => assert.equal(badBody.status, 400));
 
+    // ---------- Дата отгрузки проверяется сразу ----------
+    const pastDate = await run((c) => service.create(c, warehouseId, {
+      invoiceIds: [good1.id], marketplace: 'wb', shipDate: '2020-01-01', shippingPointId: 100, actor: { type: 'owner' },
+    }).then(() => null, (err) => err));
+    check('прошедшую дату отгрузки поставка не принимает', () => {
+      assert.equal(pastDate && pastDate.status, 400);
+    });
+    const badDate = await run((c) => service.create(c, warehouseId, {
+      invoiceIds: [good1.id], marketplace: 'wb', shipDate: '2026-02-30', actor: { type: 'owner' },
+    }).then(() => null, (err) => err));
+    check('несуществующую дату — тоже', () => assert.equal(badDate && badDate.status, 400));
+
     // ---------- Поставка уходит на площадку ----------
+    const planned = '2099-12-31';
     const supply = await run((c) => service.create(c, warehouseId, {
-      invoiceIds: [good1.id, good2.id, refused.id], marketplace: 'wb', actor: { type: 'owner' },
-    }).catch((err) => { throw err; }));
+      invoiceIds: [good1.id, good2.id, refused.id], marketplace: 'wb',
+      shipDate: planned, shippingPointId: 100, destination: 'Пункт стенда', actor: { type: 'owner' },
+    }));
     assert.equal(supply.marketplaceOrders.length, 3, JSON.stringify(supply));
     const result = await handOver(supply, supply.marketplaceOrders);
     const state = await run((c) => c.query(
@@ -144,6 +159,11 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       assert.ok(state.rows[0].mp_handed_at);
       assert.equal(Number(state.rows[0].confirmed), 2);
       assert.equal(Number(state.rows[0].stickers), 2);
+    });
+    check('WB сразу получает пункт и плановую дату отгрузки, способ — везём сами', () => {
+      assert.ok(calls.some((c) => c[0] === 'setShipping' && c[1] === 'WB-GI-777' && c[2] === '100' && c[3] === planned),
+        JSON.stringify(calls));
+      assert.equal(result.shippingError, null);
     });
     check('заказы уходят на WB пачкой, а не по одному', () => {
       const first = calls.find((c) => c[0] === 'addOrders');
@@ -183,10 +203,37 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       // проверяем отдельно тем же кодом с заглушкой ниже.
       assert.equal(shipped.status, 'shipped');
     });
-    const delivered = await wbHandoff.deliver({
+    const shippedRow = (await run((c) => c.query(
+      `SELECT id, number, mp_supply_id, mp_shipping_point_id, mp_shipping_set_at FROM supplies WHERE id=$1`,
+      [supply.id]))).rows[0];
+    check('поставка помнит пункт, дату и что WB их принял', () => {
+      assert.equal(String(shippedRow.mp_shipping_point_id), '100');
+      assert.ok(shippedRow.mp_shipping_set_at);
+      assert.equal(shipped.ship_date, planned);
+    });
+
+    // Без пункта WB ответит 409 — Аргус и не пробует, а говорит человеку.
+    const before = calls.length;
+    const noPoint = await wbHandoff.deliver({
       warehouseId, companyId: company.id, api: fakeWb,
-      supply: { id: supply.id, number: supply.number, mp_supply_id: 'WB-GI-777' },
+      supply: { ...shippedRow, mp_shipping_point_id: null },
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
+    });
+    check('без пункта отгрузки в доставку не передаём, а оставляем задачу человеку', () => {
+      assert.ok(noPoint.error && /пункт/.test(noPoint.error), JSON.stringify(noPoint));
+      assert.equal(calls.length, before, 'был вызов WB');
+    });
+
+    const delivered = await wbHandoff.deliver({
+      warehouseId, companyId: company.id, api: fakeWb, supply: shippedRow,
+      withTx: (fn) => withTenantContext({ warehouseId }, fn),
+    });
+    check('перед передачей в доставку дата отгрузки — сегодняшняя, и только потом deliver', () => {
+      const after = calls.slice(before);
+      const set = after.findIndex((c) => c[0] === 'setShipping');
+      const dlv = after.findIndex((c) => c[0] === 'deliverSupply');
+      assert.ok(set >= 0 && dlv > set, JSON.stringify(after));
+      assert.equal(after[set][3], service.moscowToday());
     });
     const afterDeliver = await run((c) => c.query('SELECT mp_delivered_at, mp_barcode FROM supplies WHERE id=$1', [supply.id]));
     check('поставка отмечена переданной в доставку, и теперь у неё есть QR для ворот', () => {
@@ -199,8 +246,7 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     // ---------- Площадка не ответила ----------
     const broken = { ...fakeWb, deliverSupply: async () => { throw new Error('WB ответил с ошибкой 500'); } };
     const failed = await wbHandoff.deliver({
-      warehouseId, companyId: company.id, api: broken,
-      supply: { id: supply.id, number: supply.number, mp_supply_id: 'WB-GI-777' },
+      warehouseId, companyId: company.id, api: broken, supply: shippedRow,
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
     });
     const complaint = await run((c) => c.query(

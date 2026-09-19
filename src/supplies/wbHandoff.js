@@ -2,6 +2,7 @@ const wbWrite = require('../marketplaces/wbWrite');
 const credentials = require('../marketplaces/credentials');
 const journal = require('../journal/repository');
 const { plural } = require('../journal/plural');
+const { moscowToday } = require('./service');
 
 // Передача поставки на Wildberries и обратно.
 //
@@ -112,6 +113,17 @@ async function handOver({
     return { mpSupplyId: null, confirmed: [], rejected };
   }
 
+  // Пункт и плановую дату отгрузки — сразу: WB покажет их в кабинете, а
+  // отказ (прошедшая дата, пункт не тот) узнаем сейчас, а не у ворот.
+  let shippingError = null;
+  if (supply.mp_shipping_point_id && supply.ship_date) {
+    try {
+      await api.setShipping(token, mpSupplyId, { pointId: supply.mp_shipping_point_id, date: supply.ship_date });
+    } catch (err) { shippingError = err.message; }
+  } else {
+    shippingError = 'не выбраны пункт и дата отгрузки';
+  }
+
   // Этикетки заказов печатают сразу. QR поставки WB отдаёт только после
   // передачи в доставку — его забираем в deliver().
   let stickers = [];
@@ -121,9 +133,10 @@ async function handOver({
 
   await withTx(async (client) => {
     await client.query(
-      `UPDATE supplies SET mp_supply_id = $3, mp_handed_at = now()
+      `UPDATE supplies SET mp_supply_id = $3, mp_handed_at = now(),
+              mp_shipping_set_at = CASE WHEN $4 THEN now() END
         WHERE warehouse_id = $1 AND id = $2`,
-      [warehouseId, supply.id, mpSupplyId],
+      [warehouseId, supply.id, mpSupplyId, !shippingError],
     );
     await client.query(
       `UPDATE invoices SET mp_confirmed_at = now(), mp_supplier_status = 'confirm'
@@ -157,9 +170,23 @@ async function handOver({
         + `${rejected.length ? `, не принято ${rejected.length}` : ''}`
         + `${stickers.length ? `, этикеток ${stickers.length}` : ', этикетки не получены'}.`,
     });
+    if (shippingError) {
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Обмен с WB',
+        actorType: 'system',
+        entityType: 'supply',
+        entityId: supply.id,
+        status: 'pending',
+        actionText: `Поставке «${supply.number}» на WB не заданы параметры отгрузки: ${shippingError}.`
+          + ' Без них WB не примет её в доставку — задайте пункт и дату в кабинете WB.',
+      });
+    }
   });
 
-  return { mpSupplyId, confirmed, rejected, stickers: stickers.length };
+  return {
+    mpSupplyId, confirmed, rejected, stickers: stickers.length, shippingError,
+  };
 }
 
 // Передать поставку в доставку: для площадки это «уехало».
@@ -170,11 +197,9 @@ async function deliver({
   const token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
   if (!token) return { skipped: 'write_disabled' };
 
-  try {
-    await api.deliverSupply(token, supply.mp_supply_id);
-  } catch (err) {
-    // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
-    // что на площадке поставка осталась несданной, и оставляем след.
+  // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
+  // что на площадке поставка осталась несданной, и оставляем след.
+  const complain = async (reason) => {
     await withTx((client) => journal.createEntry(client, {
       warehouseId,
       agent: 'Обмен с WB',
@@ -183,9 +208,25 @@ async function deliver({
       entityId: supply.id,
       status: 'pending',
       actionText: `Поставку «${supply.number}» не удалось передать в доставку на WB: `
-        + `${err.message}. Сделайте это в кабинете WB или повторите из Аргуса.`,
+        + `${reason}. Сделайте это в кабинете WB или повторите из Аргуса.`,
     }));
-    return { error: err.message };
+    return { error: reason };
+  };
+
+  // Без пункта отгрузки WB ответит 409 — и не спрашиваем.
+  if (!supply.mp_shipping_point_id) return complain('не выбран пункт отгрузки');
+  // Дата — сегодняшняя: машина уехала сейчас, что бы ни планировали. Не
+  // принял, но прежние параметры у поставки уже есть — пробуем сдать с ними.
+  try {
+    await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: moscowToday() });
+  } catch (err) {
+    if (!supply.mp_shipping_set_at) return complain(err.message);
+  }
+
+  try {
+    await api.deliverSupply(token, supply.mp_supply_id);
+  } catch (err) {
+    return complain(err.message);
   }
 
   // QR поставки для ворот: теперь WB его отдаёт. Нет ответа — не беда,

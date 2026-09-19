@@ -37,15 +37,19 @@ async function nextNumber(client, warehouseId) {
 
 const UNIQUE_VIOLATION = '23505';
 
-async function insertWithNumber(client, warehouseId, { companyId, marketplace, destination }) {
+async function insertWithNumber(client, warehouseId, {
+  companyId, marketplace, destination, shipDate, shippingPointId,
+}) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const number = await nextNumber(client, warehouseId);
     try {
       const r = await client.query(
-        `INSERT INTO supplies (warehouse_id, company_id, number, marketplace, destination)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, number, status, destination, created_at`,
-        [warehouseId, companyId, number, marketplace, destination],
+        `INSERT INTO supplies (warehouse_id, company_id, number, marketplace, destination,
+                               ship_date, mp_shipping_point_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, number, status, destination, to_char(ship_date, 'YYYY-MM-DD') AS ship_date,
+                   mp_shipping_point_id, created_at`,
+        [warehouseId, companyId, number, marketplace, destination, shipDate, shippingPointId],
       );
       return r.rows[0];
     } catch (err) {
@@ -93,11 +97,39 @@ function cleanDestination(value) {
   return text || null;
 }
 
-async function create(client, warehouseId, { invoiceIds, marketplace = null, destination: rawDestination = null, actor }) {
+// Сегодня по Москве, ГГГГ-ММ-ДД: WB считает даты отгрузки по ней.
+const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
+
+// Плановая дата отгрузки. Прошедшую WB не примет — отказываем сразу, а не
+// когда машина уже у ворот.
+function cleanShipDate(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const text = String(value);
+  const d = new Date(`${text}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== text) {
+    throw new HttpError(400, 'Дата отгрузки — в виде ГГГГ-ММ-ДД');
+  }
+  if (text < moscowToday()) throw new HttpError(400, 'Дата отгрузки уже прошла');
+  return text;
+}
+
+function cleanShippingPoint(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new HttpError(400, 'Некорректный пункт отгрузки');
+  return id;
+}
+
+async function create(client, warehouseId, {
+  invoiceIds, marketplace = null, destination: rawDestination = null,
+  shipDate: rawShipDate = null, shippingPointId: rawPoint = null, actor,
+}) {
   if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
     throw new HttpError(400, 'Не указано ни одного заказа');
   }
   const destination = cleanDestination(rawDestination);
+  const shipDate = cleanShipDate(rawShipDate);
+  const shippingPointId = cleanShippingPoint(rawPoint);
 
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
@@ -149,7 +181,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
 
   await client.query('SAVEPOINT supply_number');
   const supply = await insertWithNumber(client, warehouseId, {
-    companyId: companies[0], marketplace, destination,
+    companyId: companies[0], marketplace, destination, shipDate, shippingPointId,
   });
   const number = supply.number;
 
@@ -193,7 +225,7 @@ async function create(client, warehouseId, { invoiceIds, marketplace = null, des
 // раз, а не столько раз, сколько заказов.
 async function contents(client, warehouseId, supplyId) {
   const head = await client.query(
-    `SELECT s.*, c.name AS company_name FROM supplies s
+    `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
       WHERE s.warehouse_id = $1 AND s.id = $2`,
     [warehouseId, supplyId],
@@ -315,6 +347,7 @@ async function contents(client, warehouseId, supplyId) {
       mpBarcode: head.rows[0].mp_barcode,
       mpBarcodeFile: head.rows[0].mp_barcode_file,
       destination: head.rows[0].destination,
+      shipDate: head.rows[0].ship_day,
       companyName: head.rows[0].company_name,
       createdAt: head.rows[0].created_at,
       readyAt: head.rows[0].ready_at,
@@ -350,7 +383,8 @@ async function contents(client, warehouseId, supplyId) {
 async function ship(client, warehouseId, supplyId, { destination: rawDestination = null, actor }) {
   const destination = cleanDestination(rawDestination);
   const cur = await client.query(
-    `SELECT id, number, status, company_id, mp_supply_id
+    `SELECT id, number, status, company_id, mp_supply_id, to_char(ship_date, 'YYYY-MM-DD') AS ship_date,
+            mp_shipping_point_id, mp_shipping_set_at
        FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
   );
@@ -403,6 +437,9 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
     statusName: STATUS_NAMES[updated.rows[0].status],
     companyId: cur.rows[0].company_id,
     mp_supply_id: cur.rows[0].mp_supply_id,
+    ship_date: cur.rows[0].ship_date,
+    mp_shipping_point_id: cur.rows[0].mp_shipping_point_id,
+    mp_shipping_set_at: cur.rows[0].mp_shipping_set_at,
   };
 }
 
@@ -415,7 +452,8 @@ async function list(client, warehouseId, { status = null } = {}) {
       `Статус может быть только: ${Object.keys(STATUS_NAMES).join(', ')}`);
   }
   const r = await client.query(
-    `SELECT s.id, s.number, s.status, s.destination, s.marketplace, s.mp_supply_id,
+    `SELECT s.id, s.number, s.status, s.destination, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_date,
+            s.marketplace, s.mp_supply_id,
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             count(i.id)::int AS orders,
@@ -574,5 +612,5 @@ async function disband(client, warehouseId, supplyId, { actor }) {
 }
 
 module.exports = {
-  create, contents, ship, list, pendingByCompany, pendingOrders, disband, STATUS_NAMES,
+  create, contents, ship, list, pendingByCompany, pendingOrders, disband, moscowToday, STATUS_NAMES,
 };
