@@ -4,6 +4,13 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+// Простаивающее соединение оборвала база (перезапуск, обрыв сети). Без этого
+// обработчика pg бросает ошибку наружу и роняет весь API; пул сам откроет
+// новое соединение при следующем запросе.
+pool.on('error', (err) => {
+  console.error('БД: оборвано простаивающее соединение —', err.message);
+});
+
 // Runs `fn` inside a transaction with the tenant session vars set via
 // SET LOCAL, so every query inside `fn` is subject to the RLS policies
 // defined in the migrations. This is the only sanctioned way to touch
