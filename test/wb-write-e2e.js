@@ -197,11 +197,14 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       await must('POST', '/api/shipping', worker.token,
         { invoiceItemId: full.items[0].id, pickedQty: 1, cellBlockId: cell }, 201);
     }
+    // Маршрут «Уехала» зовёт настоящий WB — на время вызова запись выключаем,
+    // чтобы тест не стучался в живую площадку даже с поддельным ключом.
+    await must('PATCH', `/api/marketplaces/${company.id}/wb/write`, owner.token, { enabled: false });
     const shipped = await must('POST', `/api/supplies/${supply.id}/ship`, owner.token, { destination: 'СЦ' });
-    check('отгрузка поставки доходит до площадки', () => {
-      // Настоящий маршрут ходит в живой WB, поэтому здесь он не вызывается:
-      // проверяем отдельно тем же кодом с заглушкой ниже.
+    await must('PATCH', `/api/marketplaces/${company.id}/wb/write`, owner.token, { enabled: true });
+    check('«Уехала» при выключенной записи отгружает, не трогая площадку', () => {
       assert.equal(shipped.status, 'shipped');
+      assert.equal(shipped.marketplace && shipped.marketplace.skipped, 'write_disabled');
     });
     const shippedRow = (await run((c) => c.query(
       `SELECT id, number, mp_supply_id, mp_shipping_point_id, mp_shipping_set_at FROM supplies WHERE id=$1`,
