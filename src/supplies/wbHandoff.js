@@ -51,15 +51,37 @@ async function handOver({
   if (!token) return { skipped: 'write_disabled' };
 
   const mpSupplyId = await api.createSupply(token, supply.number);
-  const confirmed = [];
-  const rejected = [];
-  for (const order of orders) {
+  let confirmed = [];
+  let rejected = [];
+  // Пачками по 100. Не прошла пачка — пробуем её заказы по одному, чтобы
+  // один чужой заказ не утянул за собой остальные.
+  for (let i = 0; i < orders.length; i += 100) {
+    const chunk = orders.slice(i, i + 100);
     try {
-      await api.addOrder(token, mpSupplyId, order.externalId);
-      confirmed.push(order);
+      await api.addOrders(token, mpSupplyId, chunk.map((o) => o.externalId));
+      confirmed.push(...chunk);
     } catch (err) {
-      rejected.push({ ...order, error: err.message });
+      for (const order of chunk) {
+        try {
+          if (chunk.length === 1) throw err;
+          await api.addOrders(token, mpSupplyId, [order.externalId]);
+          confirmed.push(order);
+        } catch (one) {
+          rejected.push({ ...order, error: one.message });
+        }
+      }
     }
+  }
+  // Если что-то не прошло, решает не наш подсчёт, а состав поставки на WB:
+  // пачка могла закрепиться частично.
+  if (rejected.length > 0) {
+    try {
+      const onWb = new Set(await api.supplyOrderIds(token, mpSupplyId));
+      const all = [...confirmed, ...rejected];
+      confirmed = all.filter((o) => onWb.has(String(o.externalId)));
+      rejected = all.filter((o) => !onWb.has(String(o.externalId)))
+        .map((o) => ({ ...o, error: o.error || 'не закреплён за поставкой на WB' }));
+    } catch { /* нет ответа — остаётся наш подсчёт */ }
   }
 
   // Ни одного заказа площадка не приняла — поставке на её стороне взяться
@@ -72,9 +94,8 @@ async function handOver({
     return { mpSupplyId: null, confirmed: [], rejected };
   }
 
-  // QR поставки и этикетки заказов — то, что печатают перед отправкой.
-  let barcode = null;
-  try { barcode = await api.supplyBarcode(token, mpSupplyId); } catch { barcode = null; }
+  // Этикетки заказов печатают сразу. QR поставки WB отдаёт только после
+  // передачи в доставку — его забираем в deliver().
   let stickers = [];
   try {
     stickers = await api.orderStickers(token, confirmed.map((o) => o.externalId));
@@ -82,10 +103,9 @@ async function handOver({
 
   await withTx(async (client) => {
     await client.query(
-      `UPDATE supplies SET mp_supply_id = $3, mp_handed_at = now(),
-              mp_barcode = $4, mp_barcode_file = $5
+      `UPDATE supplies SET mp_supply_id = $3, mp_handed_at = now()
         WHERE warehouse_id = $1 AND id = $2`,
-      [warehouseId, supply.id, mpSupplyId, barcode?.barcode || null, barcode?.file || null],
+      [warehouseId, supply.id, mpSupplyId],
     );
     await client.query(
       `UPDATE invoices SET mp_confirmed_at = now(), mp_supplier_status = 'confirm'
@@ -121,7 +141,7 @@ async function handOver({
     });
   });
 
-  return { mpSupplyId, confirmed, rejected, barcode, stickers: stickers.length };
+  return { mpSupplyId, confirmed, rejected, stickers: stickers.length };
 }
 
 // Передать поставку в доставку: для площадки это «уехало».
@@ -150,10 +170,17 @@ async function deliver({
     return { error: err.message };
   }
 
+  // QR поставки для ворот: теперь WB его отдаёт. Нет ответа — не беда,
+  // поставка уже сдана, QR можно взять в кабинете WB.
+  let barcode = null;
+  try { barcode = await api.supplyBarcode(token, supply.mp_supply_id); } catch { barcode = null; }
+
   await withTx(async (client) => {
     await client.query(
-      'UPDATE supplies SET mp_delivered_at = now() WHERE warehouse_id = $1 AND id = $2',
-      [warehouseId, supply.id],
+      `UPDATE supplies SET mp_delivered_at = now(),
+              mp_barcode = COALESCE($3, mp_barcode), mp_barcode_file = COALESCE($4, mp_barcode_file)
+        WHERE warehouse_id = $1 AND id = $2`,
+      [warehouseId, supply.id, barcode?.barcode || null, barcode?.file || null],
     );
     await journal.createEntry(client, {
       warehouseId,

@@ -83,13 +83,18 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     }));
 
     const calls = [];
+    // Как у WB: пачка с одним чужим заказом не проходит целиком, по одному —
+    // проходят все, кроме него; состав поставки WB отдаёт отдельным методом.
+    const attached = new Set();
     const fakeWb = {
       createSupply: async (token, name) => { calls.push(['createSupply', name]); return 'WB-GI-777'; },
-      addOrder: async (token, supply, orderId) => {
-        calls.push(['addOrder', supply, String(orderId)]);
-        if (String(orderId) === '80003') throw new Error('Заказ уже в другой поставке');
+      addOrders: async (token, supply, ids) => {
+        calls.push(['addOrders', supply, ids.map(String).join(',')]);
+        if (ids.map(String).includes('80003')) throw new Error('Заказ уже в другой поставке');
+        ids.forEach((id) => attached.add(String(id)));
         return true;
       },
+      supplyOrderIds: async () => { calls.push(['supplyOrderIds']); return [...attached]; },
       supplyBarcode: async () => { calls.push(['supplyBarcode']); return { barcode: 'WB-BARCODE-777', file: 'c3ZnLWZha2U=', type: 'svg' }; },
       orderStickers: async (token, ids) => {
         calls.push(['orderStickers', ids.join(',')]);
@@ -132,14 +137,21 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
               (SELECT count(*) FROM invoices i WHERE i.supply_id=s.id AND i.mp_confirmed_at IS NOT NULL) AS confirmed,
               (SELECT count(*) FROM marketplace_order_stickers st WHERE st.company_id=$2) AS stickers
          FROM supplies s WHERE s.id=$1`, [supply.id, company.id]));
-    check('поставка создана на площадке, заказы подтверждены, этикетки и QR сохранены', () => {
+    check('поставка создана на площадке, заказы подтверждены, этикетки сохранены', () => {
       assert.equal(result.mpSupplyId, 'WB-GI-777');
       assert.equal(result.confirmed.length, 2);
       assert.equal(state.rows[0].mp_supply_id, 'WB-GI-777');
       assert.ok(state.rows[0].mp_handed_at);
-      assert.equal(state.rows[0].mp_barcode, 'WB-BARCODE-777');
       assert.equal(Number(state.rows[0].confirmed), 2);
       assert.equal(Number(state.rows[0].stickers), 2);
+    });
+    check('заказы уходят на WB пачкой, а не по одному', () => {
+      const first = calls.find((c) => c[0] === 'addOrders');
+      assert.equal(first[2].split(',').length, 3, JSON.stringify(calls));
+    });
+    check('QR поставки до передачи в доставку не запрашивается — WB его ещё не отдаёт', () => {
+      assert.ok(!calls.some((c) => c[0] === 'supplyBarcode'), JSON.stringify(calls));
+      assert.equal(state.rows[0].mp_barcode, null);
     });
     check('заказ, который площадка не приняла, ушёл из местной поставки', () => {
       assert.equal(result.rejected.length, 1);
@@ -153,9 +165,8 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       assert.equal(pending.rows[0].n, 1);
     });
     const contents = await must('GET', `/api/supplies/${supply.id}`, owner.token);
-    check('в составе поставки для печати есть QR площадки и этикетки заказов', () => {
+    check('в составе поставки для печати есть этикетки заказов', () => {
       assert.equal(contents.supply.mpSupplyId, 'WB-GI-777');
-      assert.equal(contents.supply.mpBarcode, 'WB-BARCODE-777');
       assert.equal(contents.stickers.length, 2, JSON.stringify(contents.stickers));
       assert.ok(contents.stickers[0].partA && contents.stickers[0].barcode);
     });
@@ -177,11 +188,12 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       supply: { id: supply.id, number: supply.number, mp_supply_id: 'WB-GI-777' },
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
     });
-    const afterDeliver = await run((c) => c.query('SELECT mp_delivered_at FROM supplies WHERE id=$1', [supply.id]));
-    check('поставка отмечена переданной в доставку', () => {
+    const afterDeliver = await run((c) => c.query('SELECT mp_delivered_at, mp_barcode FROM supplies WHERE id=$1', [supply.id]));
+    check('поставка отмечена переданной в доставку, и теперь у неё есть QR для ворот', () => {
       assert.equal(delivered.delivered, true);
       assert.ok(afterDeliver.rows[0].mp_delivered_at);
       assert.ok(calls.some((c) => c[0] === 'deliverSupply' && c[1] === 'WB-GI-777'));
+      assert.equal(afterDeliver.rows[0].mp_barcode, 'WB-BARCODE-777');
     });
 
     // ---------- Площадка не ответила ----------

@@ -45,12 +45,27 @@ async function createSupply(token, name) {
   return String(r.id);
 }
 
-// Заказ в поставку. Для WB это и есть «на сборке»: заказ уходит из очереди
-// новых и получает статус confirm.
-async function addOrder(token, supply, order) {
-  await call(token, 'marketplace', `/api/v3/supplies/${supplyId(supply)}/orders/${orderId(order)}`,
-    { method: 'PATCH' });
+// Заказы в поставку — пачкой до 100. Для WB это и есть «на сборке»: заказы
+// уходят из очереди новых и получают статус confirm.
+//
+// Сверено с документацией WB 19.09.2026: прежний метод по одному заказу
+// (/api/v3/supplies/{id}/orders/{orderId}) из неё убран, остался пакетный.
+async function addOrders(token, supply, orders) {
+  const ids = (Array.isArray(orders) ? orders : []).map(orderId);
+  if (ids.length < 1 || ids.length > 100) {
+    throw new HttpError(400, 'В поставку WB добавляется от 1 до 100 заказов за раз');
+  }
+  await call(token, 'marketplace', `/api/marketplace/v3/supplies/${supplyId(supply)}/orders`,
+    { method: 'PATCH', body: { orders: ids } });
   return true;
+}
+
+// Какие заказы действительно закреплены за поставкой на стороне WB. После
+// неудачной пачки это единственный честный ответ, что прошло, а что нет.
+async function supplyOrderIds(token, supply) {
+  const r = await call(token, 'marketplace', `/api/marketplace/v3/supplies/${supplyId(supply)}/order-ids`);
+  if (!r || !Array.isArray(r.orderIds)) throw new HttpError(502, 'Wildberries не вернул состав поставки');
+  return r.orderIds.map(String);
 }
 
 // Передать поставку в доставку: статус заказов становится complete, и с этого
@@ -63,6 +78,7 @@ async function deliverSupply(token, supply) {
 
 // QR поставки — его показывают на воротах. Отдаём как есть: base64-картинку
 // и текст штрихкода, чтобы лист можно было напечатать и без картинки.
+// WB выдаёт его только после передачи поставки в доставку.
 async function supplyBarcode(token, supply, type = 'svg') {
   if (type !== 'svg' && type !== 'png') throw new HttpError(400, 'Тип QR поставки: svg или png');
   const r = await call(token, 'marketplace',
@@ -100,5 +116,5 @@ async function deleteSupply(token, supply) {
 }
 
 module.exports = {
-  createSupply, addOrder, deliverSupply, supplyBarcode, orderStickers, deleteSupply,
+  createSupply, addOrders, supplyOrderIds, deliverSupply, supplyBarcode, orderStickers, deleteSupply,
 };
