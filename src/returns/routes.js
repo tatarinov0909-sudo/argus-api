@@ -5,6 +5,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
+const { requireQty } = require('../middleware/qty');
 
 const router = express.Router();
 
@@ -31,9 +32,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     if (!BUCKET_LABEL[qualityBucket]) {
       throw new HttpError(400, 'Категория качества может быть good, defective или packaging_defect');
     }
-    if (Number(qty) <= 0) {
-      throw new HttpError(400, 'Количество должно быть больше нуля');
-    }
+    // Целое и больше нуля: `cell_stock.qty` — NUMERIC, и «1.5» спокойно ложилось
+    // на полку дробью, а потом складывалось с целыми в остатке продавца.
+    requireQty(qty, 'Количество', { min: 1 });
     // Описание дефекта — свободный текст работника, поэтому режем длину:
     // в журнал и продавцу это уходит целиком, и полотно там никому не нужно.
     const note = typeof defectNote === 'string' ? defectNote.trim().slice(0, 300) : null;
@@ -50,7 +51,8 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
          JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
-         WHERE ii.id = $1 AND ii.warehouse_id = $2`,
+         WHERE ii.id = $1 AND ii.warehouse_id = $2
+         FOR UPDATE OF ii`,
         [invoiceItemId, warehouseId],
       );
       const item = itemResult.rows[0];
@@ -59,6 +61,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         throw new HttpError(400, 'Эта накладная не на возврат');
       }
 
+      // Строка накладной заблокирована выше (FOR UPDATE OF ii): без этого два
+      // одновременных разбора (двойной тап, два работника) проходили проверку
+      // оба, и на полке оказывалось больше, чем реально приехало.
       const soFar = await client.query(
         `SELECT COALESCE(SUM(qty), 0) AS total FROM return_records WHERE invoice_item_id = $1`,
         [invoiceItemId],

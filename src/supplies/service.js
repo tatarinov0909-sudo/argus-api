@@ -16,6 +16,10 @@ const STATUS_NAMES = {
   shipped: 'уехала',
 };
 
+// Сегодня по Москве, ГГГГ-ММ-ДД: и дата отгрузки, и номер поставки считаются
+// по дню склада, а не по часовому поясу сервера.
+const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
+
 // Номер поставки человеку, а не машине: дату видно глазами, счётчик внутри
 // дня короткий. Его называют вслух по телефону и пишут на коробке, поэтому
 // UUID здесь не годится.
@@ -24,15 +28,26 @@ const STATUS_NAMES = {
 // счётчик внутри дня, а не глобальная последовательность, и «предыдущий
 // номер» приходится читать. Три попытки с запасом: одновременных нажатий
 // на складе бывает два, не тридцать.
+//
+// Считаем не «сколько поставок сегодня», а «какой номер сегодня самый
+// большой». Со счётчиком по количеству разобранная поставка освобождала
+// число в середине дня: счётчик возвращался на уже занятый номер, все три
+// попытки давали один и тот же, и менеджер до полуночи получал «не удалось
+// выдать номер поставки».
+//
+// День берём по Москве — тот же день, что и у даты отгрузки. Раньше число
+// в номере бралось из часового пояса процесса, а счётчик — из пояса базы:
+// на UTC-сервере ночью по Москве это разные сутки.
 async function nextNumber(client, warehouseId) {
-  const today = new Date();
-  const stamp = `${String(today.getDate()).padStart(2, '0')}${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const stamp = moscowToday().slice(5).split('-').reverse().join('');
+  const prefix = `ПС-${stamp}-`;
   const r = await client.query(
-    `SELECT count(*)::int AS n FROM supplies
-      WHERE warehouse_id = $1 AND created_at::date = now()::date`,
-    [warehouseId],
+    `SELECT COALESCE(MAX(NULLIF(regexp_replace(number, '^.*-', ''), '')::int), 0) AS last
+       FROM supply_numbers
+      WHERE warehouse_id = $1 AND number ~ ('^' || $2 || '[0-9]+$')`,
+    [warehouseId, prefix],
   );
-  return `ПС-${stamp}-${String(r.rows[0].n + 1).padStart(2, '0')}`;
+  return `${prefix}${String(Number(r.rows[0].last) + 1).padStart(2, '0')}`;
 }
 
 const UNIQUE_VIOLATION = '23505';
@@ -43,6 +58,12 @@ async function insertWithNumber(client, warehouseId, {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const number = await nextNumber(client, warehouseId);
     try {
+      // Номер занимаем в том же шаге: разобранная поставка удаляется, а её
+      // номер остаётся занятым навсегда — по нему уже напечатан лист.
+      await client.query(
+        'INSERT INTO supply_numbers (warehouse_id, number) VALUES ($1, $2)',
+        [warehouseId, number],
+      );
       const r = await client.query(
         `INSERT INTO supplies (warehouse_id, company_id, number, marketplace, destination,
                                ship_date, mp_shipping_point_id)
@@ -96,9 +117,6 @@ function cleanDestination(value) {
   if (text.length > 120) throw new HttpError(400, 'Точка доставки длиннее 120 знаков');
   return text || null;
 }
-
-// Сегодня по Москве, ГГГГ-ММ-ДД: WB считает даты отгрузки по ней.
-const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
 
 // Плановая дата отгрузки. Прошедшую WB не примет — отказываем сразу, а не
 // когда машина уже у ворот.

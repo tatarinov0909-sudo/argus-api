@@ -394,6 +394,19 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     check('а самой поставки больше нет', () => {
       assert.equal(gone.status, 404, JSON.stringify(gone.body));
     });
+    // После разбора номера обязаны продолжаться. Со счётчиком «сколько поставок
+    // сегодня» разобранная поставка освобождала число в середине дня, и
+    // следующая поставка не создавалась вовсе до конца суток.
+    const afterDisband = await api('POST', '/api/supplies', {
+      token: ownerToken, body: { invoiceIds: [spare] },
+    });
+    check('после разбора поставки номера продолжают выдаваться', () => {
+      assert.equal(afterDisband.status, 201, JSON.stringify(afterDisband.body));
+      assert.notEqual(afterDisband.body.number, toDisband.body.number, 'номер повторился');
+      assert.match(afterDisband.body.number, /^ПС-\d{4}-\d{2,}$/, afterDisband.body.number);
+    });
+    await api('DELETE', `/api/supplies/${afterDisband.body.id}`, { token: ownerToken });
+
     const shippedDisband = await api('DELETE', `/api/supplies/${supplyId}`, { token: ownerToken });
     check('уехавшую поставку разобрать нельзя — машина ушла', () => {
       assert.equal(shippedDisband.status, 409, JSON.stringify(shippedDisband.body));

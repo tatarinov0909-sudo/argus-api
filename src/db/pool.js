@@ -31,7 +31,9 @@ async function withTenantContext({ warehouseId = null, companyId = null }, fn) {
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    // Если соединение уже оборвано, откат бросит свою ошибку и подменит
+    // настоящую причину сбоя — в логе останется безликая «внутренняя ошибка».
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();

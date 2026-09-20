@@ -1,6 +1,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const outbox = require('../sync/outbox');
+const { requireQty } = require('../middleware/qty');
 
 // Наборы («сплиты»): один артикул в заказе — несколько разных товаров на полке.
 //
@@ -119,13 +120,12 @@ async function consume(client, warehouseId, companyId, sku, qty) {
 async function assembleKit(client, warehouseId, {
   companyId, kitSku, qty, toCellBlockId, workerKeyId = null,
 }) {
-  const amount = Number(qty);
   if (!companyId || !kitSku || !toCellBlockId) {
     throw new HttpError(400, 'Нужны продавец, набор и ячейка');
   }
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new HttpError(400, 'Количество должно быть больше нуля');
-  }
+  // Целое: «0.5 набора» списывало половины компонентов и клало полнабора
+  // в ячейку — то же правило, что в приёмке и отборе.
+  const amount = requireQty(qty, 'Количество наборов', { min: 1 });
 
   const cell = await client.query(
     `SELECT id FROM cell_blocks WHERE id = $1 AND warehouse_id = $2`,

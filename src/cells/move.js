@@ -1,4 +1,5 @@
 const { HttpError } = require('../middleware/errorHandler');
+const { requireQty } = require('../middleware/qty');
 const { refreshCellFill } = require('./fill');
 
 // Перемещение товара: из ячейки в ячейку и/или из одного состояния в другое.
@@ -18,11 +19,10 @@ async function moveStock(client, warehouseId, {
   sku, companyId, fromCellBlockId, toCellBlockId, qty,
   fromQuality = 'good', toQuality, workerKeyId = null,
 }) {
-  const amount = Number(qty);
-  if (!sku || !fromCellBlockId || !amount) {
+  if (!sku || !fromCellBlockId) {
     throw new HttpError(400, 'Нужны товар, ячейка-источник и количество');
   }
-  if (amount <= 0) throw new HttpError(400, 'Количество должно быть больше нуля');
+  const amount = requireQty(qty, 'Количество', { min: 1 });
 
   const targetCell = toCellBlockId || fromCellBlockId;
   const targetQuality = toQuality || fromQuality;
@@ -57,8 +57,14 @@ async function moveStock(client, warehouseId, {
 
   // Списываем со старых строк, начиная с самой давней, — тем же правилом, что
   // и отбор на отгрузке, чтобы товар не «молодел» при перестановке.
+  //
+  // Продавца запоминаем построчно. Один артикул у двух продавцов — обычное
+  // дело (коды берутся от поставщика), и раньше всё перемещённое ложилось
+  // одной строкой на того, чья строка попалась последней: товар продавца А
+  // физически становился товаром продавца Б, и оба видели это как факт —
+  // и в остатке, и в истории операций.
   let left = amount;
-  let movedCompanyId = companyId || source.rows[0].company_id;
+  const takenByCompany = new Map();
   for (const row of source.rows) {
     if (left <= 0) break;
     const take = Math.min(left, Number(row.qty));
@@ -71,15 +77,18 @@ async function moveStock(client, warehouseId, {
         [row.id, rest],
       );
     }
-    movedCompanyId = row.company_id;
+    const key = row.company_id || '';
+    takenByCompany.set(key, (takenByCompany.get(key) || 0) + take);
     left -= take;
   }
 
-  await client.query(
-    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [targetCell, warehouseId, movedCompanyId, sku, amount, targetQuality],
-  );
+  for (const [key, moved] of takenByCompany) {
+    await client.query(
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [targetCell, warehouseId, key || null, sku, moved, targetQuality],
+    );
+  }
 
   await refreshCellFill(client, fromCellBlockId);
   if (targetCell !== fromCellBlockId) await refreshCellFill(client, targetCell);
@@ -87,15 +96,19 @@ async function moveStock(client, warehouseId, {
   // След операции: у перепаковки и перестановки тоже нет накладной, а остаток
   // они двигают. Перепаковку отличаем от простой перестановки по тому, менялось
   // ли состояние товара — для продавца это разные события.
-  await client.query(
-    `INSERT INTO stock_operations
-       (warehouse_id, company_id, kind, sku, qty,
-        from_cell_block_id, to_cell_block_id, details, worker_key_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [warehouseId, movedCompanyId, targetQuality === fromQuality ? 'move' : 'repack',
-      sku, amount, fromCellBlockId, targetCell,
-      JSON.stringify({ fromQuality, toQuality: targetQuality }), workerKeyId],
-  );
+  // След операции — тоже по каждому продавцу отдельно: в истории продавца
+  // должно стоять ровно его количество, а не общая сумма по ячейке.
+  for (const [key, moved] of takenByCompany) {
+    await client.query(
+      `INSERT INTO stock_operations
+         (warehouse_id, company_id, kind, sku, qty,
+          from_cell_block_id, to_cell_block_id, details, worker_key_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [warehouseId, key || null, targetQuality === fromQuality ? 'move' : 'repack',
+        sku, moved, fromCellBlockId, targetCell,
+        JSON.stringify({ fromQuality, toQuality: targetQuality }), workerKeyId],
+    );
+  }
 
   return {
     sku, qty: amount, fromQuality, toQuality: targetQuality,

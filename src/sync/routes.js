@@ -288,12 +288,19 @@ router.post('/changes/ack', requireAuth, requireRole('integration'), async (req,
   try {
     const { warehouseId } = req.auth;
     const upToId = Number(req.body?.upToId);
-    if (!Number.isFinite(upToId) || upToId <= 0) {
+    // Точное подтверждение по списку номеров, если 1С его прислала: «всё до N»
+    // может проштамповать строку, которая закоммитилась уже после выдачи и
+    // никому не уезжала. Старый вызов с одним upToId продолжает работать —
+    // рабочая обработка 1С менять ничего не обязана.
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.map(Number).filter((n) => Number.isInteger(n) && n > 0)
+      : null;
+    if ((!ids || ids.length === 0) && (!Number.isFinite(upToId) || upToId <= 0)) {
       throw new HttpError(400, 'Укажите upToId — идентификатор последнего обработанного события');
     }
     const acknowledged = await withTenantContext({ warehouseId }, async (client) => {
       await touchIntegrationKey(client, req.auth.integrationKeyId);
-      return outbox.markDelivered(client, warehouseId, upToId);
+      return outbox.markDelivered(client, warehouseId, upToId, ids);
     });
     res.json({ acknowledged });
   } catch (err) {

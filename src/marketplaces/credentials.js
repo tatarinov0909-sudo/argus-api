@@ -11,6 +11,14 @@ async function save(client, warehouseId, { companyId, marketplace, token }) {
   if (!companyId || !marketplace || !token) {
     throw new HttpError(400, 'Нужны продавец, площадка и ключ');
   }
+  // Продавец обязан быть с этого склада. Иначе ключ привязывался к компании
+  // чужого склада, и заказы с площадки приезжали бы в её кабинет: строки
+  // изоляции пускают и по company_id, а не только по складу.
+  const owner = await client.query(
+    'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
+    [companyId, warehouseId],
+  );
+  if (!owner.rows[0]) throw new HttpError(404, 'Продавец не найден на этом складе');
   const payload = encrypt(JSON.stringify({ token }));
   const r = await client.query(
     `INSERT INTO marketplace_credentials (warehouse_id, company_id, marketplace, encrypted_payload)

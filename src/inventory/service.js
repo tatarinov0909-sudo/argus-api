@@ -470,9 +470,18 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
   // Принять пересчёт — значит сделать ячейку такой, какой её увидел человек.
   // Стираем всё, что числилось, и кладём посчитанное: любая попытка «поправить
   // разницу» построчно рано или поздно оставит хвост, которого нет на полке.
+  //
+  // Но стираем ровно то, что человеку ПОКАЗАЛИ. Остаток архивированного
+  // продавца в список пересчёта не попадает (cellContents его скрывает), а
+  // удалялся вместе со всем остальным — товар исчезал бесследно, хотя лежал
+  // на полке, и архивацию продавца можно отменить, а этот товар — нет.
   const changes = diffOf(task.expected || [], counted);
   await client.query(
-    `DELETE FROM cell_stock WHERE warehouse_id = $1 AND cell_block_id = $2`,
+    `DELETE FROM cell_stock cs
+      WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2
+        AND (cs.company_id IS NULL
+             OR EXISTS (SELECT 1 FROM companies c
+                         WHERE c.id = cs.company_id AND c.archived_at IS NULL))`,
     [warehouseId, task.cell_block_id],
   );
   for (const line of counted) {

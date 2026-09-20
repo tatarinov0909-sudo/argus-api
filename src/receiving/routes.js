@@ -30,19 +30,30 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     const record = await withTenantContext({ warehouseId }, async (client) => {
       // Invoice and company are joined in for the sync payload, so the outbox
       // row carries the 1C identifiers without a second round trip.
+      // Строку блокируем до проверки «уже принята»: два нажатия подряд
+      // (двойной тап, повтор по таймауту) проходили проверку оба и клали
+      // товар в ячейку дважды — на полке десять, в базе двадцать, и оба
+      // прихода уезжали в 1С.
       const itemResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
-                ii.external_id,
+                ii.external_id, i.direction,
                 i.number AS invoice_number, i.external_id AS invoice_external_id,
                 c.external_id AS company_external_id
          FROM invoice_items ii
          JOIN invoices i ON i.id = ii.invoice_id
          JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
-         WHERE ii.id = $1 AND ii.warehouse_id = $2`,
+         WHERE ii.id = $1 AND ii.warehouse_id = $2
+         FOR UPDATE OF ii`,
         [invoiceItemId, warehouseId],
       );
       const item = itemResult.rows[0];
       if (!item) throw new HttpError(404, 'Позиция накладной не найдена');
+      // Принять можно приход и возврат, но не заказ на отгрузку: иначе товар
+      // заказа приписался бы на полку, а сам заказ закрылся бы несобранным.
+      // В отгрузке такая же проверка стоит с самого начала.
+      if (item.direction === 'out') {
+        throw new HttpError(400, `«${item.invoice_number}» — это заказ на отгрузку, его не принимают`);
+      }
 
       const existing = await client.query(
         `SELECT id FROM receiving_records WHERE invoice_item_id = $1`,

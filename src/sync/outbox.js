@@ -136,11 +136,19 @@ async function appendInventory(client, { warehouseId, companyId, changes, cellLa
 // Cursor read. `since` is exclusive, so a client that has processed up to N
 // asks for N and gets N+1 onward — the same call repeated returns the same
 // rows until they are acknowledged, which is what makes retrying safe.
+//
+// Одного курсора мало. Номер строке выдаётся при INSERT, а видимой она
+// становится при COMMIT: приёмка, начатая раньше, но зафиксированная позже
+// соседней, получает МЕНЬШИЙ номер и появляется уже за курсором. С условием
+// «id > курсора» такое событие не возвращалось никогда — движение остатка
+// молча терялось, и 1С навсегда расходилась со складом. Поэтому отдаём и
+// всё, что ещё не подтверждено: повтор для 1С безопасен, она обязана быть
+// идемпотентной, а неподтверждённое по смыслу и должно повторяться.
 async function listSince(client, warehouseId, { since = 0, limit = 100 } = {}) {
   const result = await client.query(
     `SELECT id, event_type, payload, created_at, delivered_at
      FROM sync_outbox
-     WHERE warehouse_id = $1 AND id > $2
+     WHERE warehouse_id = $1 AND (id > $2 OR delivered_at IS NULL)
      ORDER BY id
      LIMIT $3`,
     [warehouseId, since, limit],
@@ -151,7 +159,19 @@ async function listSince(client, warehouseId, { since = 0, limit = 100 } = {}) {
 // Idempotent by construction: marking "everything up to N" twice is a no-op the
 // second time, because already-stamped rows are excluded. 1C may retry an ack
 // after a network failure without any special handling.
-async function markDelivered(client, warehouseId, upToId) {
+async function markDelivered(client, warehouseId, upToId, ids = null) {
+  // Подтверждаем ровно то, что отдали, когда 1С называет номера строк. По
+  // «всё до N» можно проштамповать строку, которая закоммитилась уже ПОСЛЕ
+  // выдачи и никому не уезжала, — и она пропадёт из очереди непрочитанной.
+  if (Array.isArray(ids) && ids.length > 0) {
+    const result = await client.query(
+      `UPDATE sync_outbox SET delivered_at = now()
+       WHERE warehouse_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL
+       RETURNING id`,
+      [warehouseId, ids],
+    );
+    return result.rowCount;
+  }
   const result = await client.query(
     `UPDATE sync_outbox SET delivered_at = now()
      WHERE warehouse_id = $1 AND id <= $2 AND delivered_at IS NULL
