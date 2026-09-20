@@ -58,6 +58,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   const items = await client.query(
     `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty,
             ii.mp_article, COALESCE(NULLIF(BTRIM(ii.mp_barcode), ''), p.barcode) AS barcode,
+            m.photo_url,
             COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
                       WHERE sr.invoice_item_id = ii.id), 0) AS picked,
             EXISTS (SELECT 1 FROM shipping_records sr2
@@ -65,6 +66,10 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
      FROM invoice_items ii
      LEFT JOIN products p ON p.warehouse_id = ii.warehouse_id
                          AND p.company_id = ii.company_id AND p.sku = ii.sku
+     -- Фото товара с площадки, если оно есть: по нему узнают товар на полке.
+     LEFT JOIN LATERAL (SELECT pm.photo_url FROM marketplace_product_media pm
+                         WHERE pm.company_id = ii.company_id AND pm.nm_id = ii.mp_nm_id
+                           AND pm.photo_url IS NOT NULL LIMIT 1) m ON true
      WHERE ii.invoice_id = ANY($1::uuid[])
      ORDER BY ii.name`,
     [ids],
@@ -89,12 +94,14 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
         // а не по внутреннему коду.
         article: it.mp_article || null,
         barcode: it.barcode || null,
+        photo: it.photo_url || null,
         marketplaces: new Set(),
       });
     }
     const line = lines.get(key);
     line.needQty += need;
     if (!line.article && it.mp_article) line.article = it.mp_article;
+    if (!line.photo && it.photo_url) line.photo = it.photo_url;
     if (!line.barcode && it.barcode) line.barcode = it.barcode;
     line.marketplaces.add(bySource.get(it.invoice_id) || '1c');
     line.perOrder.push({
@@ -156,6 +163,7 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
       companyId: line.companyId,
       article: line.article,
       barcode: line.barcode,
+      photo: line.photo || null,
       marketplaces: [...line.marketplaces],
       needQty: line.needQty,
       cells,

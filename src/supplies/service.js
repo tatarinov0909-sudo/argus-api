@@ -237,8 +237,17 @@ async function contents(client, warehouseId, supplyId) {
 
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
-            ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id
+            ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id,
+            m.photo_url, st.part_b AS sticker_tail
        FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+       -- Фото товара с площадки: по нему кладовщик узнаёт товар на полке
+       -- быстрее, чем по названию. Нет фото — колонки на листе просто нет.
+       LEFT JOIN LATERAL (SELECT pm.photo_url FROM marketplace_product_media pm
+                           WHERE pm.company_id = ii.company_id AND pm.nm_id = ii.mp_nm_id
+                             AND pm.photo_url IS NOT NULL LIMIT 1) m ON true
+       -- Номер стикера: по нему упаковщик кладёт в коробку ту этикетку,
+       -- что от этого отправления, а не соседнюю.
+       LEFT JOIN marketplace_order_stickers st ON st.invoice_id = i.id
       WHERE i.warehouse_id = $1 AND i.supply_id = $2
       ORDER BY ii.name, i.number`,
     [warehouseId, supplyId],
@@ -250,7 +259,7 @@ async function contents(client, warehouseId, supplyId) {
     if (!bySku.has(key)) {
       bySku.set(key, {
         sku: l.sku, name: l.name, article: l.mp_article, barcode: l.mp_barcode,
-        nmId: l.mp_nm_id, qty: 0,
+        nmId: l.mp_nm_id, photo: l.photo_url || null, qty: 0,
         // `cells` — где лежит, `available` — сколько там годного. Второе нужно
         // отдельно: если в ячейках меньше, чем в поставке, узнать об этом надо
         // до похода к стеллажу, а не у стеллажа.
@@ -267,7 +276,9 @@ async function contents(client, warehouseId, supplyId) {
     article: l.mp_article,
     barcode: l.mp_barcode,
     nmId: l.mp_nm_id,
+    photo: l.photo_url || null,
     rid: l.mp_rid,
+    stickerTail: l.sticker_tail || null,
     qty: Number(l.declared_qty),
   }));
 
