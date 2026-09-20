@@ -3,6 +3,7 @@ const { requireAuth, requireRole, allowWarehouseView } = require('../middleware/
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { normalizeName } = require('../warehouses/naming');
+const { requireQty } = require('../middleware/qty');
 
 const router = express.Router();
 
@@ -119,6 +120,10 @@ router.post('/:zoneId/items', requireAuth, requireRole('owner', 'worker'), async
     if (!sku || qty == null || !['in', 'out'].includes(direction)) {
       throw new HttpError(400, 'Не хватает данных для позиции в зоне сортировки');
     }
+    // То же правило, что у приёмки, отбора и возвратов: целое и больше нуля.
+    // Иначе в зоне оказывалось «−200 шт», и на них же считалось предупреждение
+    // перед сносом схемы склада.
+    const zoneQty = requireQty(qty, 'Количество в зоне', { min: 1 });
 
     const item = await withTenantContext({ warehouseId }, async (client) => {
       const zoneResult = await client.query(
@@ -131,7 +136,7 @@ router.post('/:zoneId/items', requireAuth, requireRole('owner', 'worker'), async
         `INSERT INTO dropzone_items (dropzone_id, warehouse_id, company_id, sku, qty, direction)
          VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, company_id, sku, qty, direction`,
-        [zoneId, warehouseId, companyId || null, sku, qty, direction],
+        [zoneId, warehouseId, companyId || null, sku, zoneQty, direction],
       );
       return result.rows[0];
     });

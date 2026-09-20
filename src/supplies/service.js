@@ -1,6 +1,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { plural } = require('../journal/plural');
 const { formatBlockLabel } = require('../cells/label');
+const { refreshSupplyStatus } = require('./state');
 const journal = require('../journal/repository');
 
 // Поставка: пачка заказов, уезжающая одной машиной.
@@ -207,6 +208,11 @@ async function create(client, warehouseId, {
     `UPDATE invoices SET supply_id = $1 WHERE warehouse_id = $2 AND id = ANY($3::uuid[])`,
     [supply.id, warehouseId, invoiceIds],
   );
+  // Заказ мог быть собран ДО того, как его включили в поставку (накладную из
+  // 1С собирают и без поставки). Тогда новых отборов не будет, пересчитать
+  // статус поставки станет некому, и она навсегда зависала в «собирается»:
+  // ни «Уехала», ни «Разобрать» уже не нажимаются.
+  await refreshSupplyStatus(client, warehouseId, supply.id);
 
   await journal.createEntry(client, {
     warehouseId,
@@ -256,7 +262,15 @@ async function contents(client, warehouseId, supplyId) {
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
             ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id,
-            m.photo_url, st.part_b AS sticker_tail
+            m.photo_url, st.part_b AS sticker_tail,
+            -- Сколько по строке уже снято с полки и закрыта ли она. Лист
+            -- печатают не один раз: после перерыва в работе бумага, где
+            -- «взять» стоит полное количество, отправляет кладовщика за
+            -- товаром, который уже лежит на столе, и пишет «не хватает».
+            COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
+                       WHERE sr.invoice_item_id = ii.id), 0) AS picked,
+            EXISTS (SELECT 1 FROM shipping_records sr2
+                     WHERE sr2.invoice_item_id = ii.id AND sr2.is_final) AS picked_closed
        FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
        -- Фото товара с площадки: по нему кладовщик узнаёт товар на полке
        -- быстрее, чем по названию. Нет фото — колонки на листе просто нет.
@@ -271,21 +285,32 @@ async function contents(client, warehouseId, supplyId) {
     [warehouseId, supplyId],
   );
 
+  const remainingOf = (l) => (l.picked_closed
+    ? 0
+    : Math.max(0, Number(l.declared_qty) - Number(l.picked)));
+
   const bySku = new Map();
   for (const l of lines.rows) {
     const key = l.sku;
     if (!bySku.has(key)) {
       bySku.set(key, {
         sku: l.sku, name: l.name, article: l.mp_article, barcode: l.mp_barcode,
-        nmId: l.mp_nm_id, photo: l.photo_url || null, qty: 0,
+        nmId: l.mp_nm_id, photo: l.photo_url || null, qty: 0, total: 0, picked: 0,
         // `cells` — где лежит, `available` — сколько там годного. Второе нужно
         // отдельно: если в ячейках меньше, чем в поставке, узнать об этом надо
         // до похода к стеллажу, а не у стеллажа.
         cells: [], available: 0,
       });
     }
-    bySku.get(key).qty += Number(l.declared_qty);
+    const item = bySku.get(key);
+    // `qty` — сколько ещё взять со склада, `total` — сколько всего в поставке.
+    item.qty += remainingOf(l);
+    item.total += Number(l.declared_qty);
+    item.picked += Math.min(Number(l.picked), Number(l.declared_qty));
   }
+  // Полностью собранные позиции на листе комплектации не нужны: за ними
+  // больше не идут. В упаковочном листе они остаются — там считают коробки.
+  for (const [key, item] of bySku) if (item.qty <= 0) bySku.delete(key);
 
   const packing = lines.rows.map((l) => ({
     orderNumber: l.order_number,
@@ -334,6 +359,17 @@ async function contents(client, warehouseId, supplyId) {
     item.available += Number(row.qty);
   }
 
+  // Сколько брать из каждой ячейки — тем же правилом, что и в листе грузчика:
+  // сколько есть в первой по обходу, остаток во второй. Без этого на бумаге
+  // стоял один адрес и общее количество, а товар лежал в трёх местах.
+  for (const item of bySku.values()) {
+    let left = item.qty;
+    for (const cell of item.cells) {
+      cell.take = Math.max(0, Math.min(left, cell.qty));
+      left -= cell.take;
+    }
+  }
+
   // Порядок обхода, а не алфавит.
   //
   // Лист комплектации существует ради одного: пройти склад один раз. По
@@ -354,10 +390,11 @@ async function contents(client, warehouseId, supplyId) {
   // Этикетки заказов и QR поставки: их печатают перед отправкой, без них
   // посылки не принимают. Получены при передаче поставки на площадку.
   const stickers = await client.query(
-    `SELECT i.number AS order_number, ii.mp_rid, st.part_a, st.part_b, st.barcode, st.file
+    `SELECT i.number AS order_number, st.part_a, st.part_b, st.barcode, st.file,
+            (SELECT ii.mp_rid FROM invoice_items ii
+              WHERE ii.invoice_id = i.id AND ii.mp_rid IS NOT NULL LIMIT 1) AS mp_rid
        FROM invoices i
        JOIN marketplace_order_stickers st ON st.invoice_id = i.id
-       LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
       WHERE i.warehouse_id = $1 AND i.supply_id = $2
       ORDER BY i.number`,
     [warehouseId, supplyId],
@@ -509,7 +546,8 @@ async function list(client, warehouseId, { status = null } = {}) {
 // и в этом списке лишнее.
 async function pendingByCompany(client, warehouseId) {
   const r = await client.query(
-    `SELECT c.id AS company_id, c.name AS company_name, i.source AS marketplace,
+    `SELECT c.id AS company_id, c.name AS company_name,
+            array_agg(DISTINCT i.source) AS sources,
             count(DISTINCT i.id) FILTER (WHERE NOT ${WB_CONFIRMED_SQL})::int AS orders,
             COALESCE(sum(ii.declared_qty) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}), 0)::numeric AS units,
             min(i.created_at) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}) AS oldest,
@@ -523,14 +561,18 @@ async function pendingByCompany(client, warehouseId) {
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
         AND i.mp_closed_at IS NULL
-      GROUP BY c.id, c.name, i.source
+      GROUP BY c.id, c.name
       ORDER BY count(DISTINCT i.id) DESC, c.name`,
     [warehouseId],
   );
   return r.rows.map((x) => ({
     companyId: x.company_id,
     companyName: x.company_name,
-    marketplace: x.marketplace,
+    // Продавец — одна карточка, даже если заказы пришли и с площадки, и из 1С:
+    // раньше он шёл двумя строками, и менеджер составлял две поставки там,
+    // где нужна одна. Площадка карточки — WB, если среди заказов есть WB.
+    marketplaces: x.sources || [],
+    marketplace: (x.sources || []).includes('wb') ? 'wb' : (x.sources || [])[0] || null,
     orders: x.orders,
     units: Number(x.units),
     oldest: x.oldest,
@@ -595,7 +637,7 @@ async function pendingOrders(client, warehouseId, companyId) {
 // а уехавшую поставку не разбирают в базе, её разгружают руками.
 async function disband(client, warehouseId, supplyId, { actor }) {
   const s = await client.query(
-    'SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
+    'SELECT id, number, status, mp_supply_id FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
     [warehouseId, supplyId],
   );
   const supply = s.rows[0];
@@ -618,6 +660,14 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   if (Number(picked.rows[0].n) > 0) {
     throw new HttpError(409,
       `По поставке «${supply.number}» уже отбирали товар — разобрать нельзя.`);
+  }
+  // Поставка уже заведена на площадке: её заказы там числятся «на сборке».
+  // Удалив строку молча, мы теряем номер поставки WB — она остаётся висеть в
+  // кабинете продавца, а её заказы больше нельзя ни собрать, ни вернуть.
+  if (supply.mp_supply_id) {
+    throw new HttpError(409,
+      `Поставка «${supply.number}» уже создана на площадке (${supply.mp_supply_id}).`
+      + ' Сначала удалите её в кабинете WB, иначе заказы останутся числиться на сборке там.');
   }
 
   const freed = await client.query(

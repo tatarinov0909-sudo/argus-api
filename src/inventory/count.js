@@ -9,13 +9,22 @@ function validateCountLines(lines, expected) {
     throw new HttpError(400, 'Нужен список посчитанного: не более 1000 строк');
   }
   const seen = new Set();
+  const expectedKeys = new Set((expected || []).map(keyOf));
   const counted = lines.map((line) => {
     if (!line || typeof line !== 'object' || Array.isArray(line)
       || typeof line.sku !== 'string' || !line.sku.trim() || line.sku.length > 200) {
       throw new HttpError(400, 'В каждой строке нужен артикул выбранного товара');
     }
     const companyId = typeof line.companyId === 'string' ? line.companyId.toLowerCase() : null;
-    if (!companyId || !UUID.test(companyId)) {
+    if (companyId && !UUID.test(companyId)) {
+      throw new HttpError(400, 'Выберите продавца для каждой строки пересчёта');
+    }
+    // Строка без продавца принимается, только если такая уже числится в этой
+    // ячейке. «Ничейный» остаток появляется, когда продавца удалили (ссылка
+    // обнуляется), и раньше такую ячейку нельзя было пересчитать вовсе:
+    // задание висело вечно и блокировало инвентаризацию всего склада.
+    if (!companyId
+        && !expectedKeys.has(keyOf({ sku: line.sku.trim(), companyId: null, quality: line.quality }))) {
       throw new HttpError(400, 'Выберите продавца для каждой строки пересчёта');
     }
     if (!QUALITIES.has(line.quality)) {

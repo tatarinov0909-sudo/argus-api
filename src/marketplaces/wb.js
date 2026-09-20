@@ -23,6 +23,7 @@ async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res;
+  let text;
   try {
     res = await fetch(HOSTS[host] + path, {
       method,
@@ -30,6 +31,10 @@ async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
+    // Тело читаем под тем же таймером. Раньше таймер снимался сразу после
+    // заголовков, и площадка, отдающая ответ по капле, держала запрос вечно:
+    // соединение с базой не возвращалось в пул, а транзакция не закрывалась.
+    text = await res.text();
   } catch (err) {
     if (err.name === 'AbortError') throw new HttpError(504, 'Wildberries не ответил вовремя');
     throw new HttpError(502, 'Не удалось связаться с Wildberries');
@@ -37,17 +42,33 @@ async function call(token, host, path, { method = 'GET', body, timeoutMs = 15000
     clearTimeout(timer);
   }
 
-  const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = null; }
 
   if (!res.ok) {
-    if (res.status === 401) throw new HttpError(401, 'Ключ Wildberries не принят или срок его действия закончился');
-    if (res.status === 403) {
-      throw new HttpError(403, 'У ключа нет доступа к этому разделу Wildberries');
+    // Чужая авторизация не наша: 401 наружу означает «истёк вход в Аргус»,
+    // и кабинет выбрасывал владельца на экран входа вместо того, чтобы
+    // сказать «ключ WB не принят». Отдаём 424 — «нужен исправный ключ».
+    if (res.status === 401) {
+      const err = new HttpError(424, 'Ключ Wildberries не принят или срок его действия закончился');
+      err.marketplaceStatus = 401;
+      throw err;
     }
-    if (res.status === 429) throw new HttpError(429, 'Wildberries просит сбавить темп');
-    throw new HttpError(502, `Wildberries ответил с ошибкой ${res.status}`);
+    if (res.status === 403) {
+      const err = new HttpError(424, 'У ключа нет доступа к этому разделу Wildberries');
+      err.marketplaceStatus = 403;
+      throw err;
+    }
+    if (res.status === 429) {
+      const err = new HttpError(429, 'Wildberries просит сбавить темп');
+      err.marketplaceStatus = 429;
+      throw err;
+    }
+    // Ответ площадки помечаем на ошибке: вызывающему коду важно отличать
+    // «этот заказ не подходит» (400/409) от «площадка недоступна» (5xx).
+    const err = new HttpError(502, `Wildberries ответил с ошибкой ${res.status}`);
+    err.marketplaceStatus = res.status;
+    throw err;
   }
   return json;
 }

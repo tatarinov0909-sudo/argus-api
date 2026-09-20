@@ -14,7 +14,7 @@ const { formatBlockLabel } = require('../cells/label');
 async function findProducts(client, warehouseId, query) {
   const products = await client.query(
     `WITH product_catalog AS (
-       SELECT p.sku, p.name, p.category, p.weight_g,
+       SELECT p.sku, p.company_id, p.name, p.category, p.weight_g,
               COALESCE(NULLIF(BTRIM(p.barcode), ''), mapped.barcode) AS barcode,
               p.reserved_qty, p.reserved_at, p.stock_qty_1c, p.stock_at
        FROM products p
@@ -30,7 +30,7 @@ async function findProducts(client, warehouseId, query) {
        ) mapped ON true
        WHERE p.warehouse_id = $1 AND p.active
      )
-     SELECT p.sku, p.name, p.category, p.weight_g, p.barcode,
+     SELECT p.sku, p.company_id, p.name, p.category, p.weight_g, p.barcode,
             p.reserved_qty, p.reserved_at, p.stock_qty_1c, p.stock_at
      FROM product_catalog p
      WHERE p.sku ILIKE $2 OR p.name ILIKE $2 OR p.barcode ILIKE $2
@@ -39,7 +39,7 @@ async function findProducts(client, warehouseId, query) {
 
      -- То, что лежит в ячейках, но карточки не имеет. Имя берём из последней
      -- накладной, где этот артикул встречался, — иначе человек увидит голый код.
-     SELECT cs.sku, COALESCE(
+     SELECT cs.sku, cs.company_id, COALESCE(
               (SELECT ii.name FROM invoice_items ii
                WHERE ii.warehouse_id = cs.warehouse_id AND ii.sku = cs.sku
                ORDER BY ii.id DESC LIMIT 1), cs.sku) AS name,
@@ -60,6 +60,8 @@ async function findProducts(client, warehouseId, query) {
 
   const results = [];
   for (const p of products.rows) {
+    // Только этого продавца: один артикул у двух продавцов — разный товар,
+    // и агент отвечал суммой по обоим, обещая владельцу чужие штуки.
     // Суммируем по ячейке: приёмка кладёт по строке на каждое поступление, и
     // одна и та же ячейка возвращалась дважды — человек слышал «94 штуки и ещё
     // 9 там же», хотя ячейка одна и в ней 103.
@@ -70,10 +72,11 @@ async function findProducts(client, warehouseId, query) {
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        WHERE cs.warehouse_id = $1 AND cs.sku = $2
+         AND ($3::uuid IS NULL OR cs.company_id = $3::uuid)
        GROUP BY cb.id, cs.quality, wr.row_num, cb.label, cb.rack_start, cb.rack_end,
                 cb.tier_start, cb.tier_end
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-      [warehouseId, p.sku],
+      [warehouseId, p.sku, p.company_id || null],
     );
     // Годное и брак считаем раздельно и говорим об этом вслух. Иначе на
     // вопрос «сколько можно отгрузить» ответ включал бы брак, лежащий на той
@@ -102,12 +105,17 @@ async function findProducts(client, warehouseId, query) {
     // а наши ячейки наполняются только тем, что работник положил сам.
     const cells1c = await client.query(
       `SELECT cell_name, qty FROM product_cells_1c
-       WHERE warehouse_id = $1 AND sku = $2 ORDER BY cell_name`,
-      [warehouseId, p.sku],
+       WHERE warehouse_id = $1 AND sku = $2
+         AND ($3::uuid IS NULL OR company_id = $3::uuid)
+       ORDER BY cell_name`,
+      [warehouseId, p.sku, p.company_id || null],
     );
 
     results.push({
       sku: p.sku,
+      // Продавец обязателен в ответе: один и тот же код у двух продавцов —
+      // разный товар, и «60 штук» без имени продавца вводили бы в заблуждение.
+      companyId: p.company_id || null,
       name: p.name,
       category: p.category,
       weightG: p.weight_g,
@@ -316,7 +324,7 @@ async function invoiceDetails(client, warehouseId, number) {
   const inv = await client.query(
     `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
-     WHERE i.warehouse_id = $1 AND i.number ILIKE $2
+     WHERE i.warehouse_id = $1 AND upper(i.number) = upper($2)
      ORDER BY i.created_at DESC LIMIT 1`,
     [warehouseId, number],
   );

@@ -57,8 +57,12 @@ async function listEntries(client, warehouseId, { limit = 200, cellBlockId = nul
   return result.rows;
 }
 
+// Кто закрыл расхождение — владелец или менеджер. Журнал неизменяем и служит
+// следом действий: записывать решение менеджера как решение владельца значит
+// терять автора ровно там, где он и нужен — в споре о недостаче.
 async function resolveEntry(client, {
   warehouseId, originalEntryId, resolution, resolvedByOwnerId, note,
+  actorType = 'owner', actorId = null,
 }) {
   const originalResult = await client.query(
     `SELECT * FROM journal_entries WHERE id = $1 AND warehouse_id = $2`,
@@ -68,19 +72,21 @@ async function resolveEntry(client, {
   if (!original) return null;
 
   const status = resolution === 'confirm' ? 'confirmed' : 'rolled_back';
+  const who = actorType === 'manager' ? 'менеджером' : 'владельцем';
   const actionText = resolution === 'confirm'
-    ? `Подтверждено владельцем: ${note || original.action_text}`
-    : `Отклонено владельцем: ${note || original.action_text}`;
+    ? `Подтверждено ${who}: ${note || original.action_text}`
+    : `Отклонено ${who}: ${note || original.action_text}`;
 
   const result = await client.query(
     `INSERT INTO journal_entries
        (warehouse_id, agent, action_text, entity_type, entity_id, actor_type, actor_id,
         status, root_entry_id, related_entry_id, resolved_at, resolved_by_owner_id)
-     VALUES ($1, $2, $3, $4, $5, 'owner', $6, $7, $8, $9, now(), $6)
+     VALUES ($1, $2, $3, $4, $5, $10, $6, $7, $8, $9, now(), $11)
      RETURNING *`,
     [
       warehouseId, original.agent, actionText, original.entity_type, original.entity_id,
-      resolvedByOwnerId, status, original.root_entry_id || original.id, original.id,
+      actorId || resolvedByOwnerId, status, original.root_entry_id || original.id, original.id,
+      actorType, actorType === 'owner' ? resolvedByOwnerId : null,
     ],
   );
   return result.rows[0];

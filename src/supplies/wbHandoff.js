@@ -74,11 +74,22 @@ async function handOver({
       }
     }
   };
+  // «Заказ не подходит» и «площадка недоступна» — разные вещи. Пока всё
+  // подряд считалось отказом по заказу, один обрыв связи выкидывал из местной
+  // поставки ВСЕ заказы и заводил на каждый задачу в журнале. Содержательным
+  // считаем только ответ самой площадки про содержимое пачки (400/409).
+  // Содержательный отказ: так ответила площадка про содержимое пачки, либо
+  // наша же проверка не пустила кривой номер заказа (HttpError 400 из
+  // wbWrite). Всё остальное — «площадка недоступна», и состав поставки при
+  // этом трогать нельзя.
+  const aboutOrders = (err) => [400, 409, 422].includes(err.marketplaceStatus)
+    || (!err.marketplaceStatus && err.status === 400);
   const place = async (part) => {
     try {
       await add(part.map((o) => o.externalId));
       confirmed.push(...part);
     } catch (err) {
+      if (!aboutOrders(err)) throw err;
       if (part.length === 1) { rejected.push({ ...part[0], error: err.message }); return; }
       const half = Math.ceil(part.length / 2);
       await pause(PACE_MS);
@@ -87,9 +98,34 @@ async function handOver({
       await place(part.slice(half));
     }
   };
-  for (let i = 0; i < orders.length; i += 100) {
-    if (i > 0) await pause(PACE_MS);
-    await place(orders.slice(i, i + 100));
+  try {
+    for (let i = 0; i < orders.length; i += 100) {
+      if (i > 0) await pause(PACE_MS);
+      await place(orders.slice(i, i + 100));
+    }
+  } catch (err) {
+    // Площадка недоступна. Состав местной поставки не трогаем — товар уже
+    // расписан по листам, и разбирать её из-за обрыва связи нельзя. Номер
+    // созданной поставки WB запоминаем, иначе она останется сиротой.
+    await withTx(async (client) => {
+      await client.query(
+        `UPDATE supplies SET mp_supply_id = COALESCE(mp_supply_id, $3)
+          WHERE warehouse_id = $1 AND id = $2`,
+        [warehouseId, supply.id, mpSupplyId],
+      );
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Обмен с WB',
+        actorType: 'system',
+        entityType: 'supply',
+        entityId: supply.id,
+        status: 'pending',
+        actionText: `Поставка «${supply.number}»: WB не ответил (${err.message}).`
+          + ` Поставка на площадке ${mpSupplyId} создана, но заказы в неё добавлены не все.`
+          + ' Состав поставки в Аргусе не меняли — повторите передачу или доделайте в кабинете WB.',
+      });
+    });
+    return { mpSupplyId, confirmed: [], rejected: [], error: err.message };
   }
   // Если что-то не прошло, решает не наш подсчёт, а состав поставки на WB:
   // пачка могла закрепиться частично.
@@ -121,15 +157,25 @@ async function handOver({
       await api.setShipping(token, mpSupplyId, { pointId: supply.mp_shipping_point_id, date: supply.ship_date });
     } catch (err) { shippingError = err.message; }
   } else {
-    shippingError = 'не выбраны пункт и дата отгрузки';
+    const missing = [!supply.mp_shipping_point_id && 'пункт', !supply.ship_date && 'дата'].filter(Boolean);
+    shippingError = `не ${missing.length > 1 ? 'выбраны' : 'выбран' + (missing[0] === 'дата' ? 'а' : '')} `
+      + `${missing.join(' и ')} отгрузки`;
   }
 
   // Этикетки заказов печатают сразу. QR поставки WB отдаёт только после
   // передачи в доставку — его забираем в deliver().
-  let stickers = [];
-  try {
-    stickers = await api.orderStickers(token, confirmed.map((o) => o.externalId));
-  } catch { stickers = []; }
+  //
+  // Пачками по сотне, как и добавление заказов: WB больше ста за раз не
+  // отдаёт, и поставка из полутора сотен заказов оставалась вообще без
+  // этикеток. Неудача одной пачки теперь не обнуляет остальные.
+  const stickers = [];
+  for (let i = 0; i < confirmed.length; i += 100) {
+    if (i > 0) await pause(PACE_MS);
+    const part = confirmed.slice(i, i + 100).map((o) => o.externalId);
+    try {
+      stickers.push(...await api.orderStickers(token, part));
+    } catch { /* этикетки этой пачки возьмём позже, из кабинета WB */ }
+  }
 
   await withTx(async (client) => {
     await client.query(
@@ -194,8 +240,6 @@ async function deliver({
   warehouseId, companyId, supply, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
 }) {
   if (!supply.mp_supply_id) return { skipped: 'no_mp_supply' };
-  const token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
-  if (!token) return { skipped: 'write_disabled' };
 
   // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
   // что на площадке поставка осталась несданной, и оставляем след.
@@ -213,14 +257,43 @@ async function deliver({
     return { error: reason };
   };
 
-  // Без пункта отгрузки WB ответит 409 — и не спрашиваем.
-  if (!supply.mp_shipping_point_id) return complain('не выбран пункт отгрузки');
-  // Дата — сегодняшняя: машина уехала сейчас, что бы ни планировали. Не
-  // принял, но прежние параметры у поставки уже есть — пробуем сдать с ними.
+  // Ключ читаем здесь же: раньше его ошибка (сменился MARKETPLACE_KEY_SECRET,
+  // ключ удалили) улетала мимо журнала — поставка уезжала, на WB оставалась
+  // «на сборке», и следа не было нигде.
+  let token;
   try {
-    await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: moscowToday() });
+    token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
   } catch (err) {
-    if (!supply.mp_shipping_set_at) return complain(err.message);
+    return complain(err.message);
+  }
+  if (!token) return { skipped: 'write_disabled' };
+
+  // Дата — сегодняшняя: машина уехала сейчас, что бы ни планировали.
+  //
+  // Пункта у поставки может не быть вовсе — например, она составлена до того,
+  // как в Аргусе появился выбор пункта, или список пунктов не загрузился, а
+  // менеджер задал их руками в кабинете WB. Тогда просто не трогаем параметры
+  // и всё равно пробуем сдать: отказать должна площадка и назвать причину,
+  // а не мы — молча.
+  if (supply.mp_shipping_point_id) {
+    try {
+      await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: moscowToday() });
+    } catch (err) {
+      if (!supply.mp_shipping_set_at) return complain(err.message);
+      // Параметры на площадке остались прежними: дата там будет плановая, а
+      // не сегодняшняя. Это не повод не сдавать поставку, но человек должен
+      // знать — на воротах сверяют именно её.
+      await withTx((client) => journal.createEntry(client, {
+        warehouseId,
+        agent: 'Обмен с WB',
+        actorType: 'system',
+        entityType: 'supply',
+        entityId: supply.id,
+        status: 'pending',
+        actionText: `Поставка «${supply.number}»: дату отгрузки на WB сменить не удалось (${err.message}).`
+          + ' На площадке осталась прежняя дата — проверьте её в кабинете WB.',
+      }));
+    }
   }
 
   try {

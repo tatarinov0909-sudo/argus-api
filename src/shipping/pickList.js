@@ -11,17 +11,19 @@
 
 const { HttpError } = require('../middleware/errorHandler');
 const { kitSkusAmong, kitInfo } = require('../kits/kits');
+// Имя ячейки — общее на всё приложение. Своя копия этой функции печатала
+// наши координаты «3.12.2» там, где на стеллаже висит табличка «01-10-015»:
+// лист грузчика и лист комплектации называли одно место по-разному.
+const { formatBlockLabel } = require('../cells/label');
 
-function cellLabel(r) {
-  const rack = r.rack_start === r.rack_end ? r.rack_start : `${r.rack_start}–${r.rack_end}`;
-  const tier = r.tier_start === r.tier_end ? r.tier_start : `${r.tier_start}–${r.tier_end}`;
-  return `${r.row_num}.${rack}.${tier}`;
-}
+const cellLabel = (r) => formatBlockLabel(r.row_num, r);
 
 // Точка доставки приходит от поставки: по ней собранное раскладывают по
 // машинам, и по ней же грузчик сортирует лист.
 function orderView(r) {
   return {
+    // id нужен печати: на бумагу уходит ровно то, что отобрано на экране.
+    id: r.id,
     number: r.number,
     company: r.company_name,
     marketplace: r.source === '1c' ? '1c' : r.source,
@@ -119,12 +121,12 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // Где это лежит — только годное: брак и ждущий перепаковки клиенту не едут.
   const stock = await client.query(
     `SELECT cs.company_id, cs.sku, cs.cell_block_id, SUM(cs.qty) AS available,
-            wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+            wr.row_num, cb.label, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      FROM cell_stock cs
      JOIN cell_blocks cb ON cb.id = cs.cell_block_id
      JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE cs.warehouse_id = $1 AND cs.qty > 0 AND cs.quality = 'good'
-     GROUP BY cs.company_id, cs.sku, cs.cell_block_id, wr.row_num,
+     GROUP BY cs.company_id, cs.sku, cs.cell_block_id, wr.row_num, cb.label,
               cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
     [warehouseId],
@@ -179,14 +181,33 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // писал бы «не хватает 5», отправляя работника искать то, чего не существует.
   const shortSkus = result.filter((l) => l.shortfall > 0).map((l) => l.sku);
   const kitSkus = await kitSkusAmong(client, warehouseId, shortSkus);
+  // Компоненты общие: два разных набора из одной и той же коробки нельзя
+  // обещать оба. Ведём счёт уже занятого — иначе лист говорит «собрать 5» и
+  // «собрать 5», а на полке хватит только на пять всего.
+  const takenComponents = new Map();
   for (const line of result) {
     if (line.shortfall <= 0 || !kitSkus.has(line.sku)) continue;
     const info = await kitInfo(client, warehouseId, line.companyId, line.sku);
     if (!info) continue;
+    const key = (sku) => `${line.companyId}|${sku}`;
+    // Сколько наборов реально соберём с учётом уже занятых компонентов.
+    let buildable = info.buildable;
+    for (const part of info.components || []) {
+      const perKit = Number(part.perKit ?? part.qty ?? 0);
+      if (!perKit) continue;
+      const free = Math.max(0, Number(part.available ?? 0) - (takenComponents.get(key(part.sku)) || 0));
+      buildable = Math.min(buildable, Math.floor(free / perKit));
+    }
+    buildable = Math.max(0, Math.min(buildable, line.shortfall));
+    for (const part of info.components || []) {
+      const perKit = Number(part.perKit ?? part.qty ?? 0);
+      if (!perKit) continue;
+      takenComponents.set(key(part.sku), (takenComponents.get(key(part.sku)) || 0) + perKit * buildable);
+    }
     line.kit = {
       // Сколько из нехватки закрывается сборкой, а сколько не закрывается ничем.
-      canBuild: Math.min(line.shortfall, info.buildable),
-      stillShort: Math.max(0, line.shortfall - info.buildable),
+      canBuild: buildable,
+      stillShort: Math.max(0, line.shortfall - buildable),
       components: info.components,
       limitedBy: info.limitedBy,
     };

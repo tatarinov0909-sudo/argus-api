@@ -23,7 +23,13 @@ function fakeWb({ bad = new Set(), tooManyOnce = false } = {}) {
       calls.push(ids.length);
       if (burst > 20) throw new HttpError(429, 'Wildberries просит сбавить темп');
       if (tooManyOnce && !refusedOnce) { refusedOnce = true; throw new HttpError(429, 'Wildberries просит сбавить темп'); }
-      if (ids.some((id) => bad.has(String(id)))) throw new HttpError(502, 'Wildberries ответил с ошибкой 409');
+      if (ids.some((id) => bad.has(String(id)))) {
+        // Так отвечает площадка про содержимое пачки. Обрыв связи выглядит
+        // иначе и поставку разбирать не должен — это отдельная проверка.
+        const err = new HttpError(502, 'Wildberries ответил с ошибкой 409');
+        err.marketplaceStatus = 409;
+        throw err;
+      }
       ids.forEach((id) => attached.add(String(id)));
       return true;
     },

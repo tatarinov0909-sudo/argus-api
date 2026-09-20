@@ -25,7 +25,9 @@ test('WB statuses use documented read-only POST with 1..1000 integer order IDs',
   global.fetch = async () => ({ ok: true, text: async () => '{}' });
   await assert.rejects(() => wb.orderStatuses('synthetic-test-token', [101]), /не передал список/);
   global.fetch = async () => ({ok:false,status:401,text:async()=>JSON.stringify({detail:'echo synthetic-test-token'})});
-  await assert.rejects(() => wb.orderStatuses('synthetic-test-token',[101]),error=>!error.message.includes('synthetic-test-token')&&error.status===401);
+  // 401 площадки наружу отдаётся как 424: 401 означает «истёк вход в Аргус»,
+  // и кабинет выбрасывал владельца на экран входа из-за чужого ключа.
+  await assert.rejects(() => wb.orderStatuses('synthetic-test-token',[101]),error=>!error.message.includes('synthetic-test-token')&&error.status===424&&error.marketplaceStatus===401);
 });
 
 test('only explicit terminal WB statuses end demand; removal, missing and unknown statuses never cancel', () => {

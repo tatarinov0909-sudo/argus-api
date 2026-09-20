@@ -159,6 +159,10 @@ async function save(client, warehouseId, {
         AND ii.warehouse_id = $1
         AND ii.company_id = $2
         AND i.direction = 'out'
+        -- Только заказы этой площадки. У накладной из 1С артикул уже верный,
+        -- и подмена sku и name означала бы, что кладовщик пойдёт за другим
+        -- товаром, а в документе продавца строка будет выглядеть нормальной.
+        AND i.source = $8
         AND i.supply_id IS NULL
         AND i.status <> 'shipped'
         AND i.mp_closed_at IS NULL
@@ -167,7 +171,7 @@ async function save(client, warehouseId, {
           OR ($6::text IS NOT NULL AND ii.mp_nm_id::text = $6)
           OR ($7::text IS NOT NULL AND ii.mp_barcode = $7))`,
     [warehouseId, companyId, sku, product.rows[0].name || sku,
-      mpArticle || null, mpSku || null, mpBarcode || null],
+      mpArticle || null, mpSku || null, mpBarcode || null, marketplace],
   );
 
   return { id: ins.rows[0].id, sku, name: product.rows[0].name, fixedOrders: fixed.rowCount };

@@ -1,5 +1,6 @@
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
+const { HttpError } = require('../middleware/errorHandler');
 const { withTenantContext } = require('../db/pool');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const service = require('./service');
@@ -97,6 +98,11 @@ router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'selle
     const data = await withTenantContext(ctx, (client) => service.contents(
       client, req.auth.warehouseId, req.params.id,
     ));
+    if (req.auth.role === 'seller') {
+      // Продавцу — что и сколько уезжает, без адресов ячеек: раскладка склада
+      // его не касается и в других местах от него скрыта.
+      data.picking = data.picking.map(({ cells, available, ...rest }) => rest);
+    }
     res.json(data);
   } catch (err) { next(err); }
 });
@@ -121,6 +127,36 @@ router.post('/:id/ship', requireAuth, requireRole('owner', 'manager', 'worker'),
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
     }).catch((err) => ({ error: err.message }));
     res.json({ ...out, marketplace: marketplaceResult });
+  } catch (err) { next(err); }
+});
+
+// Повторить передачу поставки в доставку на WB.
+//
+// Журнал прямо советует «повторите из Аргуса», когда площадка не ответила, —
+// а повторить было нечем: «Уехала» второй раз не нажимается (поставка уже
+// уехала), и поставка оставалась висеть на WB «на сборке» навсегда.
+router.post('/:id/marketplace/deliver', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const supply = await withTenantContext({ warehouseId }, (client) => client.query(
+      `SELECT id, number, company_id, status, mp_supply_id, mp_delivered_at,
+              mp_shipping_point_id, mp_shipping_set_at, to_char(ship_date, 'YYYY-MM-DD') AS ship_date
+         FROM supplies WHERE warehouse_id = $1 AND id = $2`,
+      [warehouseId, req.params.id],
+    ).then((r) => r.rows[0]));
+    if (!supply) throw new HttpError(404, 'Поставка не найдена');
+    if (!supply.mp_supply_id) throw new HttpError(409, 'Этой поставки нет на площадке');
+    if (supply.mp_delivered_at) return res.json({ alreadyDelivered: true });
+    if (supply.status !== 'shipped') {
+      throw new HttpError(409, 'Поставка ещё не уехала — передавать её в доставку рано');
+    }
+    const result = await wbHandoff.deliver({
+      warehouseId,
+      companyId: supply.company_id,
+      supply,
+      withTx: (fn) => withTenantContext({ warehouseId }, fn),
+    }).catch((err) => ({ error: err.message }));
+    res.json(result);
   } catch (err) { next(err); }
 });
 

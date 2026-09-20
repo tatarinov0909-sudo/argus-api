@@ -90,7 +90,13 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       createSupply: async (token, name) => { calls.push(['createSupply', name]); return 'WB-GI-777'; },
       addOrders: async (token, supply, ids) => {
         calls.push(['addOrders', supply, ids.map(String).join(',')]);
-        if (ids.map(String).includes('80003')) throw new Error('Заказ уже в другой поставке');
+        if (ids.map(String).includes('80003')) {
+          // Так отвечает площадка про содержимое пачки: 409 на конкретный
+          // заказ. Обрыв связи выглядит иначе и разбирать поставку не должен.
+          const err = new Error('Заказ уже в другой поставке');
+          err.marketplaceStatus = 409;
+          throw err;
+        }
         ids.forEach((id) => attached.add(String(id)));
         return true;
       },
@@ -215,24 +221,29 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       assert.equal(shipped.ship_date, planned);
     });
 
-    // Без пункта WB ответит 409 — Аргус и не пробует, а говорит человеку.
+    // Пункта у поставки может не быть (составлена до появления этого поля или
+    // параметры задали руками в кабинете WB). Тогда параметры не трогаем, но
+    // сдать поставку всё равно пробуем: отказывать должна площадка, а не мы.
     const before = calls.length;
     const noPoint = await wbHandoff.deliver({
       warehouseId, companyId: company.id, api: fakeWb,
       supply: { ...shippedRow, mp_shipping_point_id: null },
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
     });
-    check('без пункта отгрузки в доставку не передаём, а оставляем задачу человеку', () => {
-      assert.ok(noPoint.error && /пункт/.test(noPoint.error), JSON.stringify(noPoint));
-      assert.equal(calls.length, before, 'был вызов WB');
+    check('без пункта отгрузки параметры не трогаем, но поставку сдать пробуем', () => {
+      assert.equal(noPoint.delivered, true, JSON.stringify(noPoint));
+      const after = calls.slice(before);
+      assert.ok(after.some((c) => c[0] === 'deliverSupply'), JSON.stringify(after));
+      assert.ok(!after.some((c) => c[0] === 'setShipping'), 'параметры трогать не должны');
     });
 
+    const beforeFull = calls.length;
     const delivered = await wbHandoff.deliver({
       warehouseId, companyId: company.id, api: fakeWb, supply: shippedRow,
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
     });
     check('перед передачей в доставку дата отгрузки — сегодняшняя, и только потом deliver', () => {
-      const after = calls.slice(before);
+      const after = calls.slice(beforeFull);
       const set = after.findIndex((c) => c[0] === 'setShipping');
       const dlv = after.findIndex((c) => c[0] === 'deliverSupply');
       assert.ok(set >= 0 && dlv > set, JSON.stringify(after));
@@ -244,6 +255,33 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       assert.ok(afterDeliver.rows[0].mp_delivered_at);
       assert.ok(calls.some((c) => c[0] === 'deliverSupply' && c[1] === 'WB-GI-777'));
       assert.equal(afterDeliver.rows[0].mp_barcode, 'WB-BARCODE-777');
+    });
+
+    // ---------- Обрыв связи не разбирает поставку ----------
+    //
+    // Раньше любая ошибка при добавлении заказов считалась отказом по заказу:
+    // один обрыв связи выкидывал из местной поставки ВСЕ заказы и заводил на
+    // каждый задачу в журнале, хотя товар уже расписан по листам.
+    const flaky = await order(80005);
+    const supplyFlaky = await run((c) => service.create(c, warehouseId, {
+      invoiceIds: [flaky.id], marketplace: 'wb', shipDate: planned, shippingPointId: 100, actor: { type: 'owner' },
+    }));
+    const offline = {
+      ...fakeWb,
+      createSupply: async () => 'WB-GI-778',
+      addOrders: async () => { const e = new Error('Не удалось связаться с Wildberries'); e.status = 502; throw e; },
+    };
+    const broke = await wbHandoff.handOver({
+      warehouseId, companyId: company.id, supply: supplyFlaky, orders: supplyFlaky.marketplaceOrders,
+      withTx: (fn) => withTenantContext({ warehouseId }, fn), api: offline,
+    });
+    const keptRow = await run((c) => c.query(
+      `SELECT (SELECT count(*)::int FROM invoices i WHERE i.supply_id = s.id) AS orders, s.mp_supply_id
+         FROM supplies s WHERE s.id = $1`, [supplyFlaky.id]));
+    check('обрыв связи с WB не разбирает поставку и не теряет её номер на площадке', () => {
+      assert.ok(broke.error, JSON.stringify(broke));
+      assert.equal(keptRow.rows[0].orders, 1, 'заказ выкинули из поставки');
+      assert.equal(keptRow.rows[0].mp_supply_id, 'WB-GI-778', 'номер поставки WB потерян');
     });
 
     // ---------- Площадка не ответила ----------

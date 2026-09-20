@@ -32,7 +32,13 @@ async function syncPhotos(client, warehouseId, companyId, { fetchPage = wb.produ
       await client.query(`UPDATE marketplace_credentials SET photo_sync_after=now()+($2 * interval '1 minute') WHERE id=$1`, [credential.id, minutes]);
       return { count, unavailable: true };
     }
-    if (!Array.isArray(result?.cards) || !result.cursor) throw new Error('Invalid WB catalog response');
+    if (!Array.isArray(result?.cards) || !result.cursor) {
+      // Площадка ответила не тем. Бросать нельзя: транзакция откатит уже
+      // записанные страницы и курсор, и следующий проход начнёт всё заново —
+      // так фотографии не наполнятся никогда. Отходим на полчаса.
+      await client.query(`UPDATE marketplace_credentials SET photo_sync_after=now()+interval '30 minutes' WHERE id=$1`, [credential.id]);
+      return { count, unavailable: true };
+    }
     const rows = result.cards.filter(card => /^\d+$/.test(String(card.nmID))).map(card => ({ nm_id: String(card.nmID), photo_url: photoUrl(card) }));
     if (rows.length) await client.query(`INSERT INTO marketplace_product_media
       (credential_id,warehouse_id,company_id,nm_id,photo_url,credential_version)
@@ -43,7 +49,10 @@ async function syncPhotos(client, warehouseId, companyId, { fetchPage = wb.produ
     count += rows.length;
     if (result.cards.length) {
       const next = { updatedAt: result.cursor.updatedAt, nmID: result.cursor.nmID };
-      if (!next.updatedAt || next.nmID == null || JSON.stringify(next) === JSON.stringify(cursor)) throw new Error('WB catalog cursor did not advance');
+      if (!next.updatedAt || next.nmID == null || JSON.stringify(next) === JSON.stringify(cursor)) {
+        await client.query(`UPDATE marketplace_credentials SET photo_sync_after=now()+interval '30 minutes' WHERE id=$1`, [credential.id]);
+        return { count, unavailable: true };
+      }
       cursor = next;
     }
     complete = Number(result.cursor.total) < 100;

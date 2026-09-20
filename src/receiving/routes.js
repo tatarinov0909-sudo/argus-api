@@ -25,7 +25,10 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     }
     // Отрицательная приёмка — это не «ничего не приняли», а списание чужого
     // товара с полки: остаток в ячейке уменьшится, и никто не узнает.
-    requireQty(acceptedQty, 'Принятое количество', { min: 0 });
+    // Пишем в базу проверенное число: «true» и «0x10» превращались в 1 и 16
+    // при проверке, а в NUMERIC уезжало сырое значение и Postgres отвечал
+    // ошибкой — работник видел «внутреннюю ошибку» вместо понятного отказа.
+    const accepted = requireQty(acceptedQty, 'Принятое количество', { min: 0 });
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
       // Invoice and company are joined in for the sync payload, so the outbox
@@ -71,7 +74,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         await client.query(
           `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty)
            VALUES ($1, $2, $3, $4, $5)`,
-          [cellBlockId, warehouseId, item.company_id, item.sku, acceptedQty],
+          [cellBlockId, warehouseId, item.company_id, item.sku, accepted],
         );
         // Процент считается от того, сколько штук в ячейке, а не ставится в
         // сотню при любом приходе: иначе ячейка с пятью штуками горит на карте
@@ -86,15 +89,15 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
          VALUES ($1, $2, $3, $4, $5, $6, now(), $7, $8)
          RETURNING id, accepted_qty, finished_at, paused_ms, pause_reasons`,
         [
-          invoiceItemId, warehouseId, item.company_id, acceptedQty, cellBlockId || null,
+          invoiceItemId, warehouseId, item.company_id, accepted, cellBlockId || null,
           staffKeyId, pausedMs || 0, JSON.stringify(pauseReasons || []),
         ],
       );
 
-      const hasDiscrepancy = Number(acceptedQty) !== Number(item.declared_qty);
+      const hasDiscrepancy = accepted !== Number(item.declared_qty);
       const actionText = hasDiscrepancy
-        ? `Нашёл расхождение по «${item.name}» (${item.sku}): заявлено ${item.declared_qty}, по факту ${acceptedQty}.`
-        : `Принял «${item.name}» (${item.sku}) по факту ${acceptedQty} — расхождений не найдено.`;
+        ? `Нашёл расхождение по «${item.name}» (${item.sku}): заявлено ${item.declared_qty}, по факту ${accepted}.`
+        : `Принял «${item.name}» (${item.sku}) по факту ${accepted} — расхождений не найдено.`;
       await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
@@ -119,7 +122,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
           external_id: item.invoice_external_id,
         },
         company: { id: item.company_id, external_id: item.company_external_id },
-        actualQty: acceptedQty,
+        actualQty: accepted,
       });
 
       // Чем кончилась подсказка: согласился работник или положил по-своему.

@@ -40,11 +40,11 @@ function sellerStockResponse(rows) {
   const inventoryRows = rows.filter(row => row.listed && row.qtyIn1c !== null);
   const unknownRows = inventoryRows.filter(row => !row.totalKnown);
   const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
+  // Сортировка строк давала не самую свежую дату, а последнюю по алфавиту.
   const updatedAt = inventoryRows
     .map(row => row.totalUpdatedAt)
     .filter(Boolean)
-    .sort()
-    .at(-1) || null;
+    .reduce((latest, value) => (!latest || new Date(value) > new Date(latest) ? value : latest), null);
 
   return {
     rows: inventoryRows.map(sellerStockView),

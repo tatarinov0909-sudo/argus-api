@@ -34,7 +34,7 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
 
 router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
-    const { warehouseId, ownerId } = req.auth;
+    const { warehouseId, ownerId, role, staffKeyId } = req.auth;
     const { id } = req.params;
     const { resolution, note } = req.body; // resolution: 'confirm' | 'rollback'
     if (!['confirm', 'rollback'].includes(resolution)) {
@@ -52,6 +52,8 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
       }
       return repository.resolveEntry(client, {
         warehouseId, originalEntryId: id, resolution, resolvedByOwnerId: ownerId, note,
+        actorType: role === 'manager' ? 'manager' : 'owner',
+        actorId: ownerId || staffKeyId || null,
       });
     });
     if (!entry) throw new HttpError(404, 'Запись не найдена');
