@@ -149,11 +149,20 @@ async function loadStock(client, companyId) {
       // остатку, сначала сборкой: она ближе к отгрузке.
       const assemblyDemand = Number(r.assembly_qty || 0);
       const queuedDemand = Number(r.queued_qty || 0);
-      const inAssembly = total === null ? 0 : Math.min(total, assemblyDemand);
-      const orderedNotInSupply = total === null ? 0 : Math.min(total - inAssembly, queuedDemand);
-      const sellerAvailable = total === null ? null : total - inAssembly - orderedNotInSupply;
+      // Сами числа не режем: «в сборке 5» и «заказано 3» — это про заказы,
+      // и обрезка по остатку 1С показывала ноль там, где заказы есть. Режем
+      // только «доступно»: обещать больше, чем лежит, нельзя.
+      const inAssembly = assemblyDemand;
+      const orderedNotInSupply = queuedDemand;
+      const sellerAvailable = total === null
+        ? null : Math.max(0, total - inAssembly - orderedNotInSupply);
+      // Заказов больше, чем товара по учёту: об этом продавец должен знать,
+      // а не гадать, почему «доступно» ноль.
+      const shortage = total === null
+        ? false : inAssembly + orderedNotInSupply > total;
       return {
       sku: r.sku,
+      shortage,
       listed: r.product_sku != null,
       name: r.name,
       barcode: r.barcode || null,

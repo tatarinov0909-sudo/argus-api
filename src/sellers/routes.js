@@ -37,7 +37,11 @@ function sellerStockResponse(rows) {
   // Only products with a current accounting quantity belong in the seller's
   // inventory. Order-only lines stay visible on the orders page and cannot
   // invent a product or a stock quantity.
-  const inventoryRows = rows.filter(row => row.listed && row.qtyIn1c !== null);
+  // Строка без числа из 1С — это «остаток не получен», а не «товара нет»:
+  // раньше такие строки исчезали из кабинета вместе с товаром, который лежит
+  // в ячейках и по которому идут заказы. Поля totalKnown/unknownRows как раз
+  // для этого и заведены, и до сих пор были мертвы.
+  const inventoryRows = rows.filter(row => row.listed);
   const unknownRows = inventoryRows.filter(row => !row.totalKnown);
   const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
   // Сортировка строк давала не самую свежую дату, а последнюю по алфавиту.
