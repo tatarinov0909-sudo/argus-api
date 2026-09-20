@@ -45,13 +45,22 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
                 -- руками, здесь же чужое утверждение об этой полке. Количества
                 -- в нём нет вовсе — регистр владельца отвечает «лежит тут»,
                 -- но не «сколько».
+                -- По одной строке на артикул. Один и тот же код у двух
+                -- продавцов — обычное дело, а соединение с номенклатурой без
+                -- продавца давало столько одинаковых строк, сколько продавцов
+                -- завели этот артикул, и каждый раз с чужим названием.
                 COALESCE((
-                  SELECT json_agg(json_build_object('sku', pc.sku, 'name', p.name)
-                                  ORDER BY p.name, pc.sku)
-                    FROM product_cells_1c pc
-                    LEFT JOIN products p
-                      ON p.warehouse_id = pc.warehouse_id AND p.sku = pc.sku
-                   WHERE pc.warehouse_id = cb.warehouse_id AND pc.cell_name = cb.label
+                  SELECT json_agg(json_build_object('sku', x.sku, 'name', x.name)
+                                  ORDER BY x.name, x.sku)
+                    FROM (
+                      SELECT DISTINCT pc.sku,
+                             COALESCE((SELECT p.name FROM products p
+                                        WHERE p.warehouse_id = pc.warehouse_id AND p.sku = pc.sku
+                                        ORDER BY p.active DESC, p.name
+                                        LIMIT 1), pc.sku) AS name
+                        FROM product_cells_1c pc
+                       WHERE pc.warehouse_id = cb.warehouse_id AND pc.cell_name = cb.label
+                    ) x
                 ), '[]') AS stock_1c
          FROM cell_blocks cb
          WHERE cb.warehouse_id = $1`,
