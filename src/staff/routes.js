@@ -144,4 +144,44 @@ router.patch('/:id/toggle', requireAuth, requireGrant('staff'), async (req, res,
   }
 });
 
+// Поменять права менеджера. Только владелец и только у ключа менеджера:
+// у работника прав нет по определению, а менеджер с правом на ключи не должен
+// расширять себе (или коллеге) доступ — по той же причине, что и выдача.
+//
+// Права вшиты во вход: уже вошедший менеджер увидит новые при следующем входе.
+router.patch('/:id/permissions', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { id } = req.params;
+    const { permissions } = req.body || {};
+    if (!Array.isArray(permissions)) throw new HttpError(400, 'Передайте список прав');
+    const unknown = permissions.filter((g) => !Object.prototype.hasOwnProperty.call(GRANTS, g));
+    if (unknown.length > 0) {
+      throw new HttpError(400, `Неизвестное право: ${unknown.join(', ')}. `
+        + `Бывают: ${Object.keys(GRANTS).join(', ')}`);
+    }
+    const grants = [...new Set(permissions)];
+    const key = await withTenantContext({ warehouseId }, async (client) => {
+      const target = await client.query(
+        'SELECT kind FROM staff_keys WHERE id = $1 AND warehouse_id = $2', [id, warehouseId],
+      );
+      if (!target.rows[0]) return null;
+      if (target.rows[0].kind !== 'manager') {
+        throw new HttpError(400, 'Права открываются менеджеру — у работника их нет');
+      }
+      const result = await client.query(
+        `UPDATE staff_keys SET permissions = $3
+          WHERE id = $1 AND warehouse_id = $2
+          RETURNING id, key_code, name, active, issued_at, revoked_at, kind, permissions`,
+        [id, warehouseId, grants],
+      );
+      return result.rows[0];
+    });
+    if (!key) throw new HttpError(404, 'Ключ не найден');
+    res.json(key);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

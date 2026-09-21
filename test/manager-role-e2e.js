@@ -169,6 +169,35 @@ async function api(method, path, { token, body } = {}) {
     });
 
 
+    // ---------- Права можно поменять после выдачи ----------
+    //
+    // Раньше единственный способ дать менеджеру новое право — отозвать ключ и
+    // выдать другой; человек при этом терял вход посреди смены.
+    const regrant = await api('PATCH', `/api/staff/${mgrKey.body.id}/permissions`, {
+      token: ownerToken, body: { permissions: ['warehouse', 'clients'] },
+    });
+    check('владелец меняет права менеджера без перевыдачи ключа', () => {
+      assert.equal(regrant.status, 200, JSON.stringify(regrant.body));
+      assert.deepEqual([...regrant.body.permissions].sort(), ['clients', 'warehouse']);
+    });
+    const listAfter = await api('GET', '/api/staff', { token: ownerToken });
+    check('и в списке ключей права обновились', () => {
+      const row = listAfter.body.find((k) => k.id === mgrKey.body.id);
+      assert.deepEqual([...row.permissions].sort(), ['clients', 'warehouse']);
+    });
+    const regrantByManager = await api('PATCH', `/api/staff/${mgrKey.body.id}/permissions`, {
+      token: igorToken, body: { permissions: ['billing'] },
+    });
+    check('менеджер права не меняет — даже с правом на ключи', () => {
+      assert.equal(regrantByManager.status, 403, JSON.stringify(regrantByManager.body));
+    });
+    const regrantWorker = await api('PATCH', `/api/staff/${madeWorker.body.id}/permissions`, {
+      token: ownerToken, body: { permissions: ['clients'] },
+    });
+    check('работнику права не назначаются', () => {
+      assert.equal(regrantWorker.status, 400, JSON.stringify(regrantWorker.body));
+    });
+
     // ---------- Ключи менеджеров закрыты и от менеджера с правом ----------
     //
     // Запрет «второго менеджера не выдать» ничего не стоил, пока список
