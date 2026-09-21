@@ -7,6 +7,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { plural } = require('../journal/plural');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
 const { moveStock } = require('./move');
+const initialStock = require('./initialStock');
 const journal = require('../journal/repository');
 
 const router = express.Router();
@@ -148,6 +149,9 @@ router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, ne
     }
 
     const rows = await withTenantContext({ warehouseId }, async (client) => {
+      // Все ячейки склада — под блокировку до подсчёта: перестройка иначе
+      // не видит незафиксированную приёмку или загрузку и каскадом её стирает.
+      await client.query('SELECT id FROM cell_blocks WHERE warehouse_id = $1 FOR UPDATE', [warehouseId]);
       const existing = await client.query(
         `SELECT
            (SELECT count(*)::int FROM cell_stock WHERE warehouse_id=$1) AS stock_positions,
@@ -440,9 +444,12 @@ router.post('/blocks/:id/split', requireAuth, requireGrant('warehouse'), async (
     const { id } = req.params;
 
     const cells = await withTenantContext({ warehouseId }, async (client) => {
+      // FOR UPDATE — до подсчёта остатка: незафиксированная приёмка или
+      // загрузка в эту ячейку иначе не видна, а DELETE после её COMMIT
+      // каскадом стёр бы только что положенный товар.
       const blockResult = await client.query(
         `SELECT id, warehouse_row_id, rack_start, rack_end, tier_start, tier_end
-         FROM cell_blocks WHERE id = $1 AND warehouse_id = $2`,
+         FROM cell_blocks WHERE id = $1 AND warehouse_id = $2 FOR UPDATE`,
         [id, warehouseId],
       );
       const block = blockResult.rows[0];
@@ -539,6 +546,56 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
       return result;
     });
     res.status(201).json(moved);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Первичная загрузка остатков по ячейкам — правила в initialStock.js.
+// Только владелец: это остаток без документа, и решать, что склад посчитал
+// верно, — ему. Бланк отдаётся тому же владельцу.
+router.get('/initial-stock/template', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, (client) => initialStock.template(
+      client, warehouseId, req.query.companyId,
+    )));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/initial-stock/batches', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, (client) => initialStock.batches(client, warehouseId)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Отмена загрузки целиком — пока в её ячейках ничего не двигалось.
+router.post('/initial-stock/batches/:batch/undo', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId, ownerId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, (client) => initialStock.undo(
+      client, warehouseId, req.params.batch, { ownerId },
+    )));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// apply:false — только проверка (предпросмотр), apply:true — проверка заново
+// под блокировкой и запись, если ошибок нет. С ошибками не пишется ничего.
+router.post('/initial-stock', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId, ownerId } = req.auth;
+    const body = req.body || {};
+    const out = await withTenantContext({ warehouseId }, (client) => (body.apply === true
+      ? initialStock.apply(client, warehouseId, body, { ownerId })
+      : initialStock.plan(client, warehouseId, body)));
+    res.json(out);
   } catch (err) {
     next(err);
   }

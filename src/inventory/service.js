@@ -70,9 +70,19 @@ async function saveSettings(client, warehouseId, patch) {
 async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
   const r = await client.query(
     `WITH last_count AS (
-       SELECT cell_block_id, MAX(counted_at) AS counted_at
-       FROM inventory_tasks
-       WHERE warehouse_id = $1 AND counted_at IS NOT NULL
+       -- Начальная загрузка остатков — тоже подсчёт: полку посчитали руками.
+       -- Без этого вчера посчитанные ячейки первыми уходили в пересчёт как
+       -- «ни разу не считали», а непосчитанные ждали.
+       SELECT cell_block_id, MAX(at) AS counted_at FROM (
+         SELECT cell_block_id, counted_at AS at FROM inventory_tasks
+          WHERE warehouse_id = $1 AND counted_at IS NOT NULL
+         UNION ALL
+         SELECT op.to_cell_block_id, op.created_at FROM stock_operations op
+          WHERE op.warehouse_id = $1 AND op.kind = 'initial_load' AND op.to_cell_block_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM stock_operations u
+                             WHERE u.warehouse_id = $1 AND u.kind = 'initial_load_undo'
+                               AND u.details->>'batch' = op.details->>'batch')
+       ) c
        GROUP BY cell_block_id
      ),
      moves AS (
@@ -83,9 +93,11 @@ async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
          UNION ALL
          SELECT cell_block_id, finished_at FROM return_records WHERE warehouse_id = $1
          UNION ALL
-         SELECT from_cell_block_id, created_at FROM stock_operations WHERE warehouse_id = $1
+         SELECT from_cell_block_id, created_at FROM stock_operations
+          WHERE warehouse_id = $1 AND kind NOT IN ('initial_load', 'initial_load_undo')
          UNION ALL
-         SELECT to_cell_block_id, created_at FROM stock_operations WHERE warehouse_id = $1
+         SELECT to_cell_block_id, created_at FROM stock_operations
+          WHERE warehouse_id = $1 AND kind NOT IN ('initial_load', 'initial_load_undo')
        ) m
        WHERE m.cell_block_id IS NOT NULL
        GROUP BY cell_block_id
@@ -575,7 +587,8 @@ async function advice(client, warehouseId) {
          SELECT finished_at AS at FROM receiving_records WHERE warehouse_id = $1
          UNION ALL SELECT finished_at FROM shipping_records WHERE warehouse_id = $1
          UNION ALL SELECT finished_at FROM return_records WHERE warehouse_id = $1
-         UNION ALL SELECT created_at FROM stock_operations WHERE warehouse_id = $1
+         UNION ALL SELECT created_at FROM stock_operations
+                    WHERE warehouse_id = $1 AND kind NOT IN ('initial_load', 'initial_load_undo')
        ) m WHERE m.at > now() - interval '30 days'
      )
      SELECT (SELECT count(*)::int FROM cell_blocks WHERE warehouse_id = $1) AS cells,
@@ -584,7 +597,12 @@ async function advice(client, warehouseId) {
               WHERE warehouse_id = $1 AND status = 'waiting_owner') AS waiting,
             (SELECT count(*)::int FROM stocked s
               WHERE NOT EXISTS (SELECT 1 FROM inventory_tasks t
-                                WHERE t.cell_block_id = s.id AND t.counted_at IS NOT NULL)) AS never_counted,
+                                WHERE t.cell_block_id = s.id AND t.counted_at IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM stock_operations op
+                                WHERE op.to_cell_block_id = s.id AND op.kind = 'initial_load'
+                                  AND NOT EXISTS (SELECT 1 FROM stock_operations u
+                                                   WHERE u.warehouse_id = $1 AND u.kind = 'initial_load_undo'
+                                                     AND u.details->>'batch' = op.details->>'batch'))) AS never_counted,
             t.counted, t.mismatched, t.last_counted,
             p.total AS picks, p.short AS shortfalls, mv.n AS moves_30d
      FROM tasks t, picks p, moves mv`,

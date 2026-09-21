@@ -51,7 +51,8 @@ const EVENTS_SQL = `
     JOIN invoices i ON i.id=ii.invoice_id AND i.company_id=$1
    WHERE rr.company_id=$1 AND ii.sku=$2
   UNION ALL
-  SELECT op.id, 'stock:' || op.id, op.created_at, op.kind, op.qty, NULL, NULL, NULL, NULL,
+  SELECT op.id, 'stock:' || op.id, op.created_at, op.kind, op.qty, NULL, NULL,
+         CASE WHEN op.kind IN ('initial_load', 'initial_load_undo') THEN op.details->>'quality' END, NULL,
          op.from_cell_block_id, op.to_cell_block_id, NULL
     FROM stock_operations op WHERE op.company_id=$1 AND op.sku=$2`;
 
