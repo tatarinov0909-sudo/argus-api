@@ -23,8 +23,9 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
     const cellBlockId = one(req.query.cellBlockId, 'cellBlockId');
     const invoiceId = one(req.query.invoiceId, 'invoiceId');
 
+    const hideUrgent = req.auth.role === 'manager' && !(req.auth.grants || []).includes('shortages');
     const entries = await withTenantContext({ warehouseId }, (client) => (
-      repository.listEntries(client, warehouseId, { cellBlockId, invoiceId })
+      repository.listEntries(client, warehouseId, { cellBlockId, invoiceId, hideUrgent })
     ));
     res.json(entries);
   } catch (err) {
@@ -43,10 +44,15 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 
     const entry = await withTenantContext({ warehouseId }, async (client) => {
       const original = await client.query(
-        'SELECT agent FROM journal_entries WHERE id = $1 AND warehouse_id = $2',
+        'SELECT agent, urgent FROM journal_entries WHERE id = $1 AND warehouse_id = $2',
         [id, warehouseId],
       );
       if (!original.rows[0]) return null;
+      // Срочную отметку решает тот, кому она адресована: менеджер без права
+      // «отметки о нехватке» её и не видит.
+      if (original.rows[0].urgent && role === 'manager' && !(req.auth.grants || []).includes('shortages')) {
+        throw new HttpError(403, 'Отметки «нет товара» решает владелец или менеджер с этим правом');
+      }
       if (original.rows[0].agent === 'Обмен с WB') {
         throw new HttpError(409, 'Решение по заказу WB принимается в разделе «Сверка заказов WB»');
       }

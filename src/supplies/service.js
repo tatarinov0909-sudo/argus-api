@@ -247,7 +247,7 @@ async function create(client, warehouseId, {
 // их в один список нельзя: упаковщику нужна строка на каждое отправление со
 // своим стикером, кладовщику — сумма по артикулу, чтобы идти за товаром один
 // раз, а не столько раз, сколько заказов.
-async function contents(client, warehouseId, supplyId) {
+async function contents(client, warehouseId, supplyId, { showShortages = false } = {}) {
   const head = await client.query(
     `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
@@ -400,7 +400,22 @@ async function contents(client, warehouseId, supplyId) {
     [warehouseId, supplyId],
   );
 
+  // Отметки грузчиков «нет товара» — видны в самой поставке, пока не решены.
+  const shortages = !showShortages ? { rows: [] } : await client.query(
+    `SELECT je.id, je.action_text, je.created_at, i.number AS order_number
+       FROM journal_entries je
+       JOIN invoices i ON i.id = je.invoice_id
+      WHERE je.warehouse_id = $1 AND i.supply_id = $2
+        AND je.urgent AND je.status = 'pending' AND je.entity_type = 'invoice_item'
+        AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)
+      ORDER BY je.created_at DESC`,
+    [warehouseId, supplyId],
+  );
+
   return {
+    shortages: shortages.rows.map((x) => ({
+      entryId: x.id, text: x.action_text, at: x.created_at, orderNumber: x.order_number,
+    })),
     supply: {
       id: head.rows[0].id,
       number: head.rows[0].number,
@@ -509,7 +524,7 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
   };
 }
 
-async function list(client, warehouseId, { status = null } = {}) {
+async function list(client, warehouseId, { status = null, showShortages = false } = {}) {
   // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
   // в запросе роняло его целиком, и человек получал «внутреннюю ошибку»
   // там, где должен получить «такого статуса нет».
@@ -523,14 +538,20 @@ async function list(client, warehouseId, { status = null } = {}) {
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             count(i.id)::int AS orders,
-            count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked
+            count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked,
+            -- Сколько по поставке отмечено «нет товара» и ещё не решено.
+            CASE WHEN $3::boolean THEN (
+              SELECT count(*)::int FROM journal_entries je JOIN invoices i3 ON i3.id = je.invoice_id
+               WHERE i3.supply_id = s.id AND je.urgent AND je.status = 'pending'
+                 AND je.entity_type = 'invoice_item'
+                 AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) END AS missing
        FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
       GROUP BY s.id, c.name
       ORDER BY s.created_at DESC`,
-    [warehouseId, status],
+    [warehouseId, status, showShortages === true],
   );
   return r.rows.map((x) => ({ ...x, statusName: STATUS_NAMES[x.status] }));
 }

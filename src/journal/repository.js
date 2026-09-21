@@ -15,15 +15,17 @@ async function createEntry(client, {
   // Документ и место события. Необязательны — но без них запись остаётся
   // текстом, из которого никуда нельзя перейти.
   invoiceId = null, cellBlockId = null,
+  // «Очень важно»: отметка, по которой стоит работа (грузчик не нашёл товар).
+  urgent = false,
 }) {
   const result = await client.query(
     `INSERT INTO journal_entries
        (warehouse_id, agent, action_text, entity_type, entity_id, actor_type, actor_id,
-        status, invoice_id, cell_block_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        status, invoice_id, cell_block_id, urgent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
     [warehouseId, agent, actionText, entityType, entityId, actorType, actorId, status,
-      invoiceId, cellBlockId],
+      invoiceId, cellBlockId, urgent === true],
   );
   return result.rows[0];
 }
@@ -31,11 +33,22 @@ async function createEntry(client, {
 // cellBlockId / invoiceId — обратный ход: «что происходило в этой ячейке» и
 // «что происходило с этой накладной». Из записи уже можно уйти к месту и к
 // документу; отсюда можно вернуться и посмотреть всю их историю.
-async function listEntries(client, warehouseId, { limit = 200, cellBlockId = null, invoiceId = null } = {}) {
+//
+// answered — есть ли уже ответ (запись с related_entry_id на эту). Решение
+// не меняет исходную запись — журнал только дописывается, — и без этого
+// признака кабинет держал уже решённое «ждёт решения» навсегда.
+//
+// hideUrgent — менеджеру без права «отметки о нехватке» срочные отметки не
+// показываются. Неотвеченные срочные попадают в ленту всегда, даже старше
+// двухсот последних записей: по ним стоит поставка.
+async function listEntries(client, warehouseId, {
+  limit = 200, cellBlockId = null, invoiceId = null, hideUrgent = false,
+} = {}) {
   // Номер накладной и адрес ячейки собираем здесь, а не на клиенте: иначе
   // кабинету пришлось бы держать в памяти всю карту склада только ради подписи.
   const result = await client.query(
     `SELECT je.*,
+            EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
             i.number AS invoice_number,
             CASE WHEN cb.id IS NULL THEN NULL ELSE
               wr.row_num
@@ -51,8 +64,17 @@ async function listEntries(client, warehouseId, { limit = 200, cellBlockId = nul
      WHERE je.warehouse_id = $1
        AND ($3::uuid IS NULL OR je.cell_block_id = $3::uuid)
        AND ($4::uuid IS NULL OR je.invoice_id = $4::uuid)
-     ORDER BY je.created_at DESC LIMIT $2`,
-    [warehouseId, limit, cellBlockId, invoiceId],
+       AND ($5::boolean IS NOT TRUE OR NOT je.urgent)
+       AND (je.id IN (SELECT j2.id FROM journal_entries j2
+                       WHERE j2.warehouse_id = $1
+                         AND ($3::uuid IS NULL OR j2.cell_block_id = $3::uuid)
+                         AND ($4::uuid IS NULL OR j2.invoice_id = $4::uuid)
+                         AND ($5::boolean IS NOT TRUE OR NOT j2.urgent)
+                       ORDER BY j2.created_at DESC LIMIT $2)
+            OR (je.urgent AND je.status = 'pending'
+                AND NOT EXISTS (SELECT 1 FROM journal_entries a2 WHERE a2.related_entry_id = je.id)))
+     ORDER BY je.created_at DESC`,
+    [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
   return result.rows;
 }

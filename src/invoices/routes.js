@@ -107,6 +107,13 @@ router.get('/:id', requireAuth, async (req, res, next) => {
           `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
                   COALESCE(SUM(sr.picked_qty), 0) AS picked_qty,
                   COALESCE(BOOL_OR(sr.is_final), false) AS closed,
+                  -- Грузчик уже отметил «нет товара», а руководитель ещё не
+                  -- ответил: экран сборки не предлагает позицию снова.
+                  EXISTS (SELECT 1 FROM journal_entries je
+                           WHERE je.urgent AND je.status = 'pending'
+                             AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
+                             AND NOT EXISTS (SELECT 1 FROM journal_entries a
+                                              WHERE a.related_entry_id = je.id)) AS missing_marked,
                   COALESCE(
                     json_agg(
                       json_build_object(

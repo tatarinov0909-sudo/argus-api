@@ -125,6 +125,96 @@ router.get('/pick-list', requireAuth, requireRole('owner', 'manager', 'worker'),
   }
 });
 
+// «Товара нет» — отметка грузчика со сборки.
+//
+// Грузчик собирает заказ, а товара нет или не хватает. Раньше он мог только
+// отложить позицию и «сказать менеджеру» устно — в базу ничего не попадало.
+// Теперь отметка уходит в журнал с пометкой «очень важно» владельцу и
+// менеджеру с правом «отметки о нехватке» и видна в самой поставке.
+//
+// Это отметка, а не отбор: остаток, строку заказа и 1С она не трогает.
+// Строка остаётся открытой, поэтому поставка не уедет полупустой, пока
+// руководитель не решит, что делать.
+router.post('/missing', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const { invoiceItemId, missingQty, note } = req.body || {};
+    if (!invoiceItemId) throw new HttpError(400, 'Нужна позиция заказа');
+    const qty = requireQty(missingQty, 'Сколько не хватает', { min: 1 });
+    const comment = typeof note === 'string' ? note.trim().replace(/\s+/g, ' ').slice(0, 300) : '';
+
+    const out = await withTenantContext({ warehouseId }, async (client) => {
+      const pre = await client.query(
+        'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
+        [invoiceItemId, warehouseId],
+      );
+      if (!pre.rows[0]) throw new HttpError(404, 'Позиция заказа не найдена');
+      // Тот же порядок блокировок, что у отбора: поставка, потом заказ.
+      await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
+      const itemResult = await client.query(
+        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.invoice_id,
+                i.number AS invoice_number, i.direction, i.status, i.mp_closed_at, s.number AS supply_number
+           FROM invoice_items ii
+           JOIN invoices i ON i.id = ii.invoice_id
+           JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
+           LEFT JOIN supplies s ON s.id = i.supply_id
+          WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
+        [invoiceItemId, warehouseId],
+      );
+      const item = itemResult.rows[0];
+      if (!item) throw new HttpError(404, 'Позиция заказа не найдена');
+      if (item.direction !== 'out') throw new HttpError(400, 'Это не заказ на отгрузку');
+      if (item.mp_closed_at || item.status === 'shipped') {
+        throw new HttpError(409, 'Заказ уже закрыт — отмечать нечего');
+      }
+      const picked = await client.query(
+        `SELECT COALESCE(SUM(picked_qty), 0) AS picked, COALESCE(BOOL_OR(is_final), false) AS closed
+           FROM shipping_records WHERE invoice_item_id = $1`,
+        [invoiceItemId],
+      );
+      if (picked.rows[0].closed) throw new HttpError(409, 'Эта позиция уже собрана и закрыта');
+      const remaining = Number(item.declared_qty) - Number(picked.rows[0].picked);
+      if (qty > remaining) {
+        throw new HttpError(400, `По позиции осталось собрать ${remaining} шт. — не хватать может не больше`);
+      }
+
+      // Второе нажатие (или та же позиция с другого экрана) — не вторая
+      // тревога: возвращаем уже отправленную, пока по ней не ответили.
+      const open = await client.query(
+        `SELECT je.* FROM journal_entries je
+          WHERE je.warehouse_id = $1 AND je.urgent AND je.status = 'pending'
+            AND je.entity_type = 'invoice_item' AND je.entity_id = $2
+            AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)
+          ORDER BY je.created_at DESC LIMIT 1`,
+        [warehouseId, invoiceItemId],
+      );
+      if (open.rows[0]) return { repeated: true, entry: open.rows[0] };
+
+      const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
+      const entry = await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `ОЧЕНЬ ВАЖНО: нет товара «${item.name}» (${item.sku}) — не хватает ${qty} из ${remaining} шт. `
+          + `Заказ «${item.invoice_number}»`
+          + (item.supply_number ? `, поставка «${item.supply_number}»` : '')
+          + `. Отметил ${who.rows[0] ? who.rows[0].name : 'грузчик'} при сборке.`
+          + (comment ? ` Комментарий: ${comment}` : ''),
+        entityType: 'invoice_item',
+        entityId: item.id,
+        invoiceId: item.invoice_id,
+        actorType: 'worker',
+        actorId: staffKeyId,
+        status: 'pending',
+        urgent: true,
+      });
+      return { repeated: false, entry };
+    });
+    res.status(out.repeated ? 200 : 201).json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Worker records one pick: how much was taken out of which cell. Called once
 // per cell visited, with isFinal on the last one to close the line item.
 router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {

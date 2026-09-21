@@ -10,6 +10,11 @@ const credentials = require('../marketplaces/credentials');
 
 const router = express.Router();
 
+// Отметки «нет товара» видят владелец и менеджер с правом «отметки о
+// нехватке» — так решил владелец. Грузчику и продавцу — нет.
+const seesShortages = (auth) => auth.role === 'owner'
+  || (auth.role === 'manager' && (auth.grants || []).includes('shortages'));
+
 const actorOf = (auth) => ({
   type: auth.role,
   id: auth.staffKeyId || auth.ownerId || null,
@@ -83,7 +88,7 @@ router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller')
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const rows = await withTenantContext(ctx, (client) => service.list(
-      client, req.auth.warehouseId, { status: req.query.status || null },
+      client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth) },
     ));
     res.json(rows);
   } catch (err) { next(err); }
@@ -96,7 +101,7 @@ router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'selle
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const data = await withTenantContext(ctx, (client) => service.contents(
-      client, req.auth.warehouseId, req.params.id,
+      client, req.auth.warehouseId, req.params.id, { showShortages: seesShortages(req.auth) },
     ));
     if (req.auth.role === 'seller') {
       // Продавцу — что и сколько уезжает, без адресов ячеек: раскладка склада
