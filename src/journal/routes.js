@@ -44,10 +44,16 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 
     const entry = await withTenantContext({ warehouseId }, async (client) => {
       const original = await client.query(
-        'SELECT agent, urgent FROM journal_entries WHERE id = $1 AND warehouse_id = $2',
+        `SELECT agent, urgent,
+                EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered
+           FROM journal_entries je WHERE id = $1 AND warehouse_id = $2`,
         [id, warehouseId],
       );
       if (!original.rows[0]) return null;
+      // Второй ответ на одну запись — два противоречащих решения в следе.
+      // Так бывает с открытого давно кабинета: заказ уже убрали из поставки,
+      // а на экране ещё висит «Принять».
+      if (original.rows[0].answered) throw new HttpError(409, 'По этой записи уже решено');
       // Срочную отметку решает тот, кому она адресована: менеджер без права
       // «отметки о нехватке» её и не видит.
       if (original.rows[0].urgent && role === 'manager' && !(req.auth.grants || []).includes('shortages')) {

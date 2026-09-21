@@ -1,7 +1,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { plural } = require('../journal/plural');
 const { formatBlockLabel } = require('../cells/label');
-const { refreshSupplyStatus } = require('./state');
+const { refreshSupplyStatus, lockSupplyOfInvoice } = require('./state');
 const journal = require('../journal/repository');
 
 // Поставка: пачка заказов, уезжающая одной машиной.
@@ -402,7 +402,11 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
 
   // Отметки грузчиков «нет товара» — видны в самой поставке, пока не решены.
   const shortages = !showShortages ? { rows: [] } : await client.query(
-    `SELECT je.id, je.action_text, je.created_at, i.number AS order_number
+    `SELECT je.id, je.action_text, je.created_at, i.number AS order_number, i.id AS invoice_id,
+            -- Убрать из поставки можно только заказ, по которому ничего не
+            -- отобрано (см. removeOrder) — экран знает это заранее.
+            EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+                     WHERE ii.invoice_id = i.id AND sr.picked_qty > 0) AS order_picked
        FROM journal_entries je
        JOIN invoices i ON i.id = je.invoice_id
       WHERE je.warehouse_id = $1 AND i.supply_id = $2
@@ -415,6 +419,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
   return {
     shortages: shortages.rows.map((x) => ({
       entryId: x.id, text: x.action_text, at: x.created_at, orderNumber: x.order_number,
+      invoiceId: x.invoice_id, orderPicked: x.order_picked,
     })),
     supply: {
       id: head.rows[0].id,
@@ -711,6 +716,117 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   return { number: supply.number, returned: freed.rowCount };
 }
 
+// Убрать один заказ из поставки — обычно потому, что грузчик отметил «нет
+// товара».
+//
+// Без этого один ненайденный товар держал поставку навсегда: «Уехала» ждёт,
+// пока соберут каждый заказ, а «Разобрать» запрещено, как только по поставке
+// отобрали хоть что-то. Теперь заказ возвращается в очередь менеджера, а
+// поставка едет без него — и сама становится «собранной», если остальное
+// собрано.
+//
+// Убрать можно только заказ, по которому ещё ничего не отобрали: отобранное
+// снято с полки, и «вернуть в очередь» значило бы отобрать его второй раз.
+async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveShortages = false }) {
+  // Порядок блокировок тот же, что у отбора и отгрузки: поставка, потом заказ.
+  const supplyId = await lockSupplyOfInvoice(client, warehouseId, invoiceId);
+  const inv = await client.query(
+    `SELECT i.id, i.number, i.supply_id, s.number AS supply_number, s.status AS supply_status,
+            s.mp_supply_id
+       FROM invoices i LEFT JOIN supplies s ON s.id = i.supply_id
+      WHERE i.warehouse_id = $1 AND i.id = $2 FOR UPDATE OF i`,
+    [warehouseId, invoiceId],
+  );
+  const order = inv.rows[0];
+  if (!order) throw new HttpError(404, 'Заказ не найден');
+  if (!order.supply_id || order.supply_id !== supplyId) {
+    throw new HttpError(409, `Заказ «${order.number}» не в поставке — убирать неоткуда`);
+  }
+  if (order.supply_status === 'shipped') {
+    throw new HttpError(409, `Поставка «${order.supply_number}» уже уехала — назад её не вернуть`);
+  }
+  // Поставка уже заведена на площадке: там заказ числится в её составе, и
+  // убрать его только у себя — значит разойтись с WB.
+  if (order.mp_supply_id) {
+    throw new HttpError(409,
+      `Поставка «${order.supply_number}» уже создана на площадке (${order.mp_supply_id}) — `
+      + 'заказ числится в ней и там. Убрать его только в Аргусе нельзя.');
+  }
+  const picked = await client.query(
+    `SELECT COALESCE(SUM(sr.picked_qty), 0)::int AS qty FROM shipping_records sr
+       JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+      WHERE ii.invoice_id = $1 AND sr.warehouse_id = $2`,
+    [invoiceId, warehouseId],
+  );
+  if (Number(picked.rows[0].qty) > 0) {
+    throw new HttpError(409,
+      `По заказу «${order.number}» уже отобрано ${picked.rows[0].qty} шт. — товар снят с полки, `
+      + 'поэтому убрать заказ из поставки нельзя. Убрать можно только заказ, по которому ещё ничего не отбирали.');
+  }
+  const others = await client.query(
+    'SELECT count(*)::int AS n FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 AND id <> $3',
+    [warehouseId, supplyId, invoiceId],
+  );
+  // Пустая поставка осталась бы строкой без заказов (как ПС-1409-01) —
+  // для этого есть «Разобрать».
+  if (Number(others.rows[0].n) === 0) {
+    throw new HttpError(409,
+      `Это единственный заказ поставки «${order.supply_number}» — разберите поставку целиком.`);
+  }
+
+  // Отметки «нет товара» по этому заказу решаются самим действием: без ответа
+  // они висели бы «очень важно» по заказу, которого в поставке уже нет. Решает
+  // их тот, кому они адресованы, — владелец или менеджер с правом «нет товара»;
+  // менеджер без права их и не видит.
+  const open = await client.query(
+    `SELECT je.id FROM journal_entries je
+      WHERE je.warehouse_id = $1 AND je.invoice_id = $2 AND je.urgent AND je.status = 'pending'
+        AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)`,
+    [warehouseId, invoiceId],
+  );
+  if (open.rows.length > 0 && !canResolveShortages) {
+    throw new HttpError(403,
+      `По заказу «${order.number}» есть отметка «нет товара» — её решает владелец или менеджер с этим правом`);
+  }
+
+  await client.query('UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND id = $2',
+    [warehouseId, invoiceId]);
+  await refreshSupplyStatus(client, warehouseId, supplyId);
+  const status = await client.query('SELECT status FROM supplies WHERE warehouse_id = $1 AND id = $2',
+    [warehouseId, supplyId]);
+
+  const who = actor?.type === 'manager' ? 'менеджером' : 'владельцем';
+  const text = `Заказ «${order.number}» убран ${who} из поставки «${order.supply_number}» и вернулся в очередь.`;
+  for (const row of open.rows) {
+    await journal.resolveEntry(client, {
+      warehouseId, originalEntryId: row.id, resolution: 'confirm',
+      resolvedByOwnerId: actor?.type === 'owner' ? actor.id || null : null,
+      // Кто решил, запись ответа скажет сама («Подтверждено менеджером: …»).
+      note: `заказ «${order.number}» убран из поставки «${order.supply_number}» и вернулся в очередь`,
+      actorType: actor?.type === 'manager' ? 'manager' : 'owner', actorId: actor?.id || null,
+    });
+  }
+  await journal.createEntry(client, {
+    warehouseId,
+    agent: 'Кладовщик',
+    actionText: text,
+    entityType: 'supply',
+    entityId: supplyId,
+    invoiceId,
+    actorType: actor?.type || 'owner',
+    actorId: actor?.id || null,
+  });
+
+  return {
+    orderNumber: order.number,
+    supplyId,
+    supplyNumber: order.supply_number,
+    supplyStatus: status.rows[0].status,
+    supplyStatusName: STATUS_NAMES[status.rows[0].status],
+    answeredMarks: open.rows.length,
+  };
+}
+
 module.exports = {
-  create, contents, ship, list, pendingByCompany, pendingOrders, disband, moscowToday, STATUS_NAMES,
+  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, moscowToday, STATUS_NAMES,
 };

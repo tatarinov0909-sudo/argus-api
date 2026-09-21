@@ -50,6 +50,9 @@ async function listEntries(client, warehouseId, {
     `SELECT je.*,
             EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
             i.number AS invoice_number,
+            -- Заказ сейчас в поставке? Тогда у отметки «нет товара» есть
+            -- решение «убрать заказ из поставки».
+            i.supply_id AS invoice_supply_id,
             CASE WHEN cb.id IS NULL THEN NULL ELSE
               wr.row_num
               || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text

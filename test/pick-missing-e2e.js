@@ -134,6 +134,70 @@ const { withTenantContext } = require('../src/db/pool');
     const closed = await api('POST', '/api/shipping/missing', worker, { invoiceItemId: itemId, missingQty: 1 });
     check('по закрытой позиции отмечать нечего', () => assert.equal(closed.status, 409));
 
+    // ---------- Заказ без товара больше не держит поставку ----------
+    must(await api('POST', '/api/products', owner, { sku: 'PB-2', name: 'Вафли', companyId: company }), 201);
+    must(await api('POST', '/api/products', owner, { sku: 'PB-3', name: 'Пастила', companyId: company }), 201);
+    const cell2 = must(await api('GET', '/api/cells/rows', owner)).flatMap((r) => r.blocks)[1].id;
+    const receipt2 = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-2',
+      items: [{ sku: 'PB-2', name: 'Вафли', declaredQty: 1 }] }), 201);
+    must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt2.items[0].id, acceptedQty: 1, cellBlockId: cell2 }), 201);
+    const wbOrder = async (n, sku, name) => {
+      const o = must(await api('POST', '/api/invoices', owner, { companyId: company, number: `WB-${n}`, direction: 'out',
+        items: [{ sku, name, declaredQty: 1 }] }), 201);
+      await run((c) => c.query(`UPDATE invoices SET source = 'wb', external_id = $2, mp_supplier_status = 'new' WHERE id = $1`, [o.id, String(n)]));
+      await run((c) => c.query('UPDATE invoice_items SET mp_rid = $2 WHERE invoice_id = $1', [o.id, `rid-${n}`]));
+      return o;
+    };
+    const has = await wbOrder(900002, 'PB-2', 'Вафли');
+    const lacks = await wbOrder(900003, 'PB-3', 'Пастила');
+    const supply2 = must(await api('POST', '/api/supplies', owner, { invoiceIds: [has.id, lacks.id], marketplace: 'wb' }), 201);
+    const mark2 = must(await api('POST', '/api/shipping/missing', worker, { invoiceItemId: lacks.items[0].id, missingQty: 1 }), 201);
+    must(await api('POST', '/api/shipping', worker, { invoiceItemId: has.items[0].id, pickedQty: 1, cellBlockId: cell2, isFinal: true }), 201);
+    const stuckShip = await api('POST', `/api/supplies/${supply2.id}/ship`, owner, {});
+    const stuckDisband = await api('DELETE', `/api/supplies/${supply2.id}`, owner);
+    check('заказ без товара держит поставку: ни «Уехала», ни «Разобрать»', () => {
+      assert.equal(stuckShip.status, 409); assert.equal(stuckDisband.status, 409);
+    });
+    const insideStuck = must(await api('GET', `/api/supplies/${supply2.id}`, owner));
+    check('в поставке у отметки есть заказ, и видно, что по нему ничего не отобрано', () => {
+      assert.equal(insideStuck.shortages.length, 1);
+      assert.equal(insideStuck.shortages[0].invoiceId, lacks.id);
+      assert.equal(insideStuck.shortages[0].orderPicked, false);
+    });
+    const pickedOut = await api('POST', `/api/supplies/orders/${has.id}/remove`, owner);
+    const byPlain = await api('POST', `/api/supplies/orders/${lacks.id}/remove`, plain);
+    const byWorker = await api('POST', `/api/supplies/orders/${lacks.id}/remove`, worker);
+    check('собранный заказ не убрать; заказ с отметкой — только владелец или менеджер с правом', () => {
+      assert.equal(pickedOut.status, 409); assert.match(pickedOut.body.error, /уже отобрано 1 шт/);
+      assert.equal(byPlain.status, 403); assert.equal(byWorker.status, 403);
+    });
+    const removed = must(await api('POST', `/api/supplies/orders/${lacks.id}/remove`, granted));
+    const feed2 = must(await api('GET', '/api/journal', owner));
+    const list2 = must(await api('GET', '/api/supplies', owner)).find((s) => s.id === supply2.id);
+    const queue = must(await api('GET', `/api/supplies/pending/${company}`, owner));
+    check('заказ убран: вернулся в очередь, отметка решена, поставка сама стала собранной', () => {
+      assert.equal(removed.supplyStatus, 'ready');
+      assert.equal(removed.answeredMarks, 1);
+      assert.equal(list2.orders, 1);
+      assert.equal(list2.missing, 0);
+      assert.ok(queue.some((o) => o.id === lacks.id));
+      assert.equal(feed2.find((x) => x.id === mark2.entry.id).answered, true);
+      assert.ok(feed2.some((x) => /^Заказ «WB-900003» убран менеджером из поставки/.test(x.action_text)));
+    });
+    const removeAgain = await api('POST', `/api/supplies/orders/${lacks.id}/remove`, granted);
+    const lateConfirm = await api('POST', `/api/journal/${mark2.entry.id}/resolve`, owner, { resolution: 'confirm' });
+    check('повтор и запоздалое «Принять» с открытого экрана — отказ, а не второе решение', () => {
+      assert.equal(removeAgain.status, 409); assert.equal(lateConfirm.status, 409);
+    });
+    const shipped = must(await api('POST', `/api/supplies/${supply2.id}/ship`, owner, {}));
+    check('поставка уехала без него', () => assert.equal(shipped.status, 'shipped'));
+    const supply3 = must(await api('POST', '/api/supplies', owner, { invoiceIds: [lacks.id], marketplace: 'wb' }), 201);
+    const lonely = await api('POST', `/api/supplies/orders/${lacks.id}/remove`, owner);
+    check('убранный заказ встаёт в новую поставку; единственный заказ не убрать — поставку разбирают', () => {
+      assert.ok(supply3.id);
+      assert.equal(lonely.status, 409); assert.match(lonely.body.error, /единственный заказ/);
+    });
+
     console.log(`\n${passed} checks passed`);
   } catch (e) {
     console.error('FAIL', e);

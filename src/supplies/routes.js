@@ -177,4 +177,18 @@ router.delete('/:id', requireAuth, requireRole('owner', 'manager'), async (req, 
   } catch (err) { next(err); }
 });
 
+// Убрать заказ из поставки — ответ на отметку грузчика «нет товара»: заказ
+// возвращается в очередь, поставка едет без него. Право владельца и
+// менеджера: состав поставки — их решение (см. service.removeOrder).
+router.post('/orders/:invoiceId/remove', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => service.removeOrder(
+      client, warehouseId, req.params.invoiceId,
+      { actor: actorOf(req.auth), canResolveShortages: seesShortages(req.auth) },
+    ));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
