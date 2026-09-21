@@ -326,7 +326,10 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
   };
 }
 
-async function apply(client, warehouseId, body, { ownerId }) {
+// basis — откуда количество: 'count' — посчитано на полке (так грузит окно),
+// 'accounting' — учётное число 1С, разложенное по плану. Второе пишется в
+// журнал прямо так: «не пересчёт». Выдавать план за подсчёт нельзя.
+async function apply(client, warehouseId, body, { ownerId, basis = 'count' }) {
   const checked = await plan(client, warehouseId, body, { lock: true });
   if (checked.summary.errors > 0 || checked.summary.ok === 0) {
     return { applied: false, ...checked };
@@ -358,7 +361,7 @@ async function apply(client, warehouseId, body, { ownerId }) {
       `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, to_cell_block_id, details)
        VALUES ($1, $2, 'initial_load', $3, $4, $5, $6::jsonb)`,
       [warehouseId, checked.seller.id, l.sku, l.qty, l.cellId,
-        JSON.stringify({ batch, line: l.line, quality: l.quality, ownerId, cellStockId: l.cellStockId })],
+        JSON.stringify({ batch, line: l.line, quality: l.quality, ownerId, cellStockId: l.cellStockId, basis })],
     );
   }
   for (const id of cellIds) await refreshCellFill(client, id);
@@ -372,7 +375,9 @@ async function apply(client, warehouseId, body, { ownerId }) {
     actionText: `Загружены остатки по ячейкам, продавец «${checked.seller.name}»: `
       + `${s.units} шт., ${s.products} ${plural(s.products, 'товар', 'товара', 'товаров')} `
       + `в ${s.cells} ${plural(s.cells, 'ячейке', 'ячейках', 'ячейках')}. `
-      + 'Количество — по пересчёту склада; в 1С ничего не отправлялось.',
+      + (basis === 'accounting'
+        ? 'Количество — по учёту 1С, разложено по плану раскладки, а не посчитано на полках; в 1С ничего не отправлялось.'
+        : 'Количество — по пересчёту склада; в 1С ничего не отправлялось.'),
     entityType: 'company',
     entityId: checked.seller.id,
     actorType: 'owner',
