@@ -184,4 +184,43 @@ router.patch('/:id/permissions', requireAuth, requireRole('owner'), async (req, 
   }
 });
 
+// Поменять роль уже выданного ключа: работник ↔ менеджер.
+//
+// Без этого ключ, выданный не той ролью, приходилось отзывать и выдавать
+// заново — человек оставался без входа и получал новый код, который надо
+// снова ему передать. Роль живёт в столбце, а не в самом коде ключа, поэтому
+// менять её безопасно; как и выдача менеджера, это право только владельца.
+//
+// Роль вшита во вход: человек увидит новый кабинет при следующем входе.
+router.patch('/:id/kind', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { id } = req.params;
+    const { kind, permissions } = req.body || {};
+    if (kind !== 'worker' && kind !== 'manager') {
+      throw new HttpError(400, 'Сотрудник бывает либо работником, либо менеджером');
+    }
+    const grants = kind === 'manager' && Array.isArray(permissions)
+      ? [...new Set(permissions)] : [];
+    const unknown = grants.filter((g) => !Object.prototype.hasOwnProperty.call(GRANTS, g));
+    if (unknown.length > 0) {
+      throw new HttpError(400, `Неизвестное право: ${unknown.join(', ')}. `
+        + `Бывают: ${Object.keys(GRANTS).join(', ')}`);
+    }
+    const key = await withTenantContext({ warehouseId }, async (client) => {
+      const result = await client.query(
+        `UPDATE staff_keys SET kind = $3, permissions = $4
+          WHERE id = $1 AND warehouse_id = $2
+          RETURNING id, key_code, name, active, issued_at, revoked_at, kind, permissions`,
+        [id, warehouseId, kind, grants],
+      );
+      return result.rows[0];
+    });
+    if (!key) throw new HttpError(404, 'Ключ не найден');
+    res.json(key);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

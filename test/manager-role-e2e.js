@@ -169,6 +169,36 @@ async function api(method, path, { token, body } = {}) {
     });
 
 
+    // ---------- Роль ключа можно поменять, не перевыдавая его ----------
+    //
+    // Ключ, выданный не той ролью, раньше приходилось отзывать: человек терял
+    // вход и получал новый код, который надо снова ему передать.
+    const asWorker = await api('POST', '/api/staff', {
+      token: ownerToken, body: { name: 'Стал менеджером' },
+    });
+    const promoted = await api('PATCH', `/api/staff/${asWorker.body.id}/kind`, {
+      token: ownerToken, body: { kind: 'manager', permissions: ['warehouse'] },
+    });
+    check('владелец делает работника менеджером, код ключа не меняется', () => {
+      assert.equal(promoted.status, 200, JSON.stringify(promoted.body));
+      assert.equal(promoted.body.kind, 'manager');
+      assert.equal(promoted.body.key_code, asWorker.body.key_code);
+      assert.deepEqual(promoted.body.permissions, ['warehouse']);
+    });
+    const afterPromote = await api('POST', '/api/auth/staff/login',
+      { body: { keyCode: asWorker.body.key_code } });
+    check('и вход по тому же ключу открывает кабинет менеджера', () => {
+      assert.equal(afterPromote.body.role, 'manager', JSON.stringify(afterPromote.body));
+    });
+    const demoted = await api('PATCH', `/api/staff/${asWorker.body.id}/kind`, {
+      token: ownerToken, body: { kind: 'worker' },
+    });
+    check('и обратно в работники — права при этом снимаются', () => {
+      assert.equal(demoted.status, 200, JSON.stringify(demoted.body));
+      assert.equal(demoted.body.kind, 'worker');
+      assert.deepEqual(demoted.body.permissions, []);
+    });
+
     // ---------- Права можно поменять после выдачи ----------
     //
     // Раньше единственный способ дать менеджеру новое право — отозвать ключ и
@@ -190,6 +220,12 @@ async function api(method, path, { token, body } = {}) {
     });
     check('менеджер права не меняет — даже с правом на ключи', () => {
       assert.equal(regrantByManager.status, 403, JSON.stringify(regrantByManager.body));
+    });
+    const promoteBySelf = await api('PATCH', `/api/staff/${madeWorker.body.id}/kind`, {
+      token: igorToken, body: { kind: 'manager' },
+    });
+    check('и роль ключа менеджер не меняет — иначе он заведёт себе второго', () => {
+      assert.equal(promoteBySelf.status, 403, JSON.stringify(promoteBySelf.body));
     });
     const regrantWorker = await api('PATCH', `/api/staff/${madeWorker.body.id}/permissions`, {
       token: ownerToken, body: { permissions: ['clients'] },
