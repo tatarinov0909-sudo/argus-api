@@ -11,6 +11,19 @@ const journal = require('../journal/repository');
 
 const router = express.Router();
 
+// Незакрытый пересчёт по этим ячейкам. Пока он есть, ячейки не трогаем:
+// назначенное задание и особенно посчитанное расхождение, ждущее решения
+// владельца, исчезали вместе с удалённой ячейкой — вместе с цифрами.
+async function openCountTasks(client, warehouseId, cellBlockIds) {
+  const r = await client.query(
+    `SELECT count(*)::int AS n FROM inventory_tasks
+      WHERE warehouse_id = $1 AND cell_block_id = ANY($2::uuid[])
+        AND status IN ('pending', 'waiting_owner')`,
+    [warehouseId, cellBlockIds],
+  );
+  return Number(r.rows[0].n);
+}
+
 // Full layout: rows -> blocks -> stock, everything the frontend needs to
 // render the floorplan and rack grids in one round trip.
 router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
@@ -388,6 +401,12 @@ router.post('/blocks/merge-rect', requireAuth, requireGrant('warehouse'), async 
       const [keeper, ...absorbed] = blocks;
       const absorbedIds = absorbed.map((b) => b.id);
 
+      const counting = await openCountTasks(client, warehouseId, blocks.map((b) => b.id));
+      if (counting > 0) {
+        throw new HttpError(409, 'По этим ячейкам идёт пересчёт — сначала закройте его, '
+          + 'иначе посчитанное потеряется вместе с ячейкой');
+      }
+
       // Move stock BEFORE deleting, or ON DELETE CASCADE takes it with them.
       await client.query(
         `UPDATE cell_stock SET cell_block_id = $1, updated_at = now()
@@ -439,6 +458,11 @@ router.post('/blocks/:id/split', requireAuth, requireGrant('warehouse'), async (
       );
       if (stockResult.rows[0].n > 0) {
         throw new HttpError(409, 'В ячейке лежит товар — разберите её после того, как товар заберут');
+      }
+
+      const counting = await openCountTasks(client, warehouseId, [id]);
+      if (counting > 0) {
+        throw new HttpError(409, 'По этой ячейке идёт пересчёт — сначала закройте его');
       }
 
       await client.query(`DELETE FROM cell_blocks WHERE id = $1`, [id]);

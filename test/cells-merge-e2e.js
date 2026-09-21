@@ -13,6 +13,7 @@
 
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
+const { withTenantContext } = require('../src/db/pool');
 
 const PORT = 3997;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -64,6 +65,7 @@ async function api(method, path, { token, body } = {}) {
     });
     assert.equal(reg.status, 201, `register: ${JSON.stringify(reg.body)}`);
     const ownerToken = reg.body.token;
+    const warehouseId = JSON.parse(Buffer.from(ownerToken.split('.')[1], 'base64url').toString('utf8')).warehouseId;
 
     const company = await api('POST', '/api/sellers/companies', {
       token: ownerToken, body: { name: 'Alpha' },
@@ -127,6 +129,60 @@ async function api(method, path, { token, body } = {}) {
     check('2x2 merge collapsed 4 blocks into 1', () => {
       // 12 atomic cells - 4 absorbed + 1 merged = 9
       assert.equal(row.blocks.length, 9, `got ${row.blocks.length} blocks`);
+    });
+
+    // ---------- Пересчёт запрещает трогать ячейку ----------
+    //
+    // Решение владельца 21.09.2026: пока по ячейке идёт пересчёт, объединять
+    // её нельзя. Раньше задание (и уже посчитанные цифры, ждущие решения)
+    // исчезало вместе с удалённой ячейкой.
+    const freeBlocks = (await getRow()).blocks
+      .filter((b) => b.rack_start === b.rack_end && b.tier_start === b.tier_end
+        && b.rack_start >= 3 && b.tier_start <= 2);
+    const countedCell = freeBlocks[0];
+    await withTenantContext({ warehouseId }, async (client) => {
+      const run = await client.query(
+        'INSERT INTO inventory_runs (warehouse_id) VALUES ($1) RETURNING id', [warehouseId],
+      );
+      await client.query(
+        `INSERT INTO inventory_tasks (run_id, warehouse_id, cell_block_id, status, reason)
+         VALUES ($1, $2, $3, 'pending', 'проверка теста')`,
+        [run.rows[0].id, warehouseId, countedCell.id],
+      );
+    });
+    const whileCounting = await api('POST', '/api/cells/blocks/merge-rect', {
+      token: ownerToken,
+      body: {
+        rowNum: 1,
+        rackStart: countedCell.rack_start, rackEnd: countedCell.rack_start + 1,
+        tierStart: countedCell.tier_start, tierEnd: countedCell.tier_start,
+      },
+    });
+    check('ячейку с незакрытым пересчётом объединить нельзя', () => {
+      assert.equal(whileCounting.status, 409, JSON.stringify(whileCounting.body));
+      assert.match(String(whileCounting.body.error || ''), /пересч/i);
+    });
+    // Закрываем пересчёт, иначе он будет мешать следующим проверкам — как и
+    // положено: смысл правки в том, что незакрытый пересчёт держит ячейку.
+    await withTenantContext({ warehouseId }, (client) => client.query(
+      `UPDATE inventory_tasks SET status = 'matched' WHERE cell_block_id = $1`, [countedCell.id],
+    ));
+    const afterCounting = await api('POST', '/api/cells/blocks/merge-rect', {
+      token: ownerToken,
+      body: {
+        rowNum: 1,
+        rackStart: countedCell.rack_start, rackEnd: countedCell.rack_start + 1,
+        tierStart: countedCell.tier_start, tierEnd: countedCell.tier_start,
+      },
+    });
+    check('пересчёт закрыт — объединение снова работает', () => {
+      assert.equal(afterCounting.status, 201, JSON.stringify(afterCounting.body));
+    });
+    // Возвращаем сетку в прежний вид, чтобы следующие проверки шли по той же
+    // раскладке ячеек, что и до этой.
+    const restored = await api('POST', `/api/cells/blocks/${afterCounting.body.id}/split`, { token: ownerToken });
+    check('и такую ячейку можно расцепить обратно', () => {
+      assert.ok([200, 201].includes(restored.status), JSON.stringify(restored.body));
     });
 
     // ---------- Rejections ----------
