@@ -86,7 +86,8 @@ function check(name, fn) {
     await receive(alpha.id, 'PB-A', 'Печенье овсяное', 100, blocks[0].id, `ПРХ-A-${stamp}`);
     await receive(beta.id, 'PB-B', 'Чужой товар', 55, blocks[1].id, `ПРХ-B-${stamp}`);
 
-    // «Всего» продавцу даёт учёт 1С: это его товар в учёте склада.
+    // Обмен с 1С работает как прежде, но «Всего» продавцу считается по
+    // Аргусу (решение владельца 23.09.2026): 1С — только для сверки.
     const syncKey = await must('POST', '/api/sync/keys', { token: ownerToken, body: { label: 'Тест остатков' } });
     const syncToken = (await must('POST', '/api/sync/auth', { body: { keyCode: syncKey.key_code } })).token;
     await must('POST', '/api/sync/push/companies', {
@@ -118,7 +119,8 @@ function check(name, fn) {
       assert.equal(a.ordered, 0);
       assert.equal(a.inAssembly, 0);
       assert.equal(a.available, 100);
-      assert.equal(rowOf(start, 'PB-ONLY-1C').total, 700, 'товар из 1С без ячеек не показан');
+      // В 1С 700, а на полках Аргуса ничего: продавцу — то, что лежит у нас.
+      assert.equal(rowOf(start, 'PB-ONLY-1C').total, 0, 'цифра 1С протекла в «Всего»');
     });
     check('и чужого не видит', () => {
       assert.ok(!rowOf(start, 'PB-B'), 'в остатке продавца оказался чужой товар');
@@ -130,8 +132,8 @@ function check(name, fn) {
       }
     });
     check('сводка складывает те же числа', () => {
-      assert.equal(start.summary.total, 800);
-      assert.equal(start.summary.available, 800);
+      assert.equal(start.summary.total, 100);
+      assert.equal(start.summary.available, 100);
       assert.equal(start.summary.productCount, 2);
     });
 
@@ -176,11 +178,10 @@ function check(name, fn) {
       assert.equal(a.available, 70);
     });
 
-    // ---------- Уехало: числа сходятся после следующего обмена с 1С ----------
+    // ---------- Уехало: «Всего» падает сразу, без обмена с 1С ----------
     await must('POST', `/api/supplies/${supply.id}/ship`, { token: ownerToken, body: { destination: 'СЦ' } });
-    await pushStock([{ sku: 'PB-A', qty: 70 }]);
     const afterShip = await sellerStock();
-    check('после отгрузки и обмена с 1С остаток уменьшился, обещаний больше нет', () => {
+    check('по «Уехала» остаток уменьшился сразу, обещаний больше нет', () => {
       const a = rowOf(afterShip, 'PB-A');
       assert.equal(a.total, 70, JSON.stringify(a));
       assert.equal(a.ordered, 0);
@@ -205,7 +206,8 @@ function check(name, fn) {
       const a = ownerView.find((r) => r.sku === 'PB-A');
       assert.equal(a.qty, 70, 'годное в ячейках');
       assert.equal(a.notForSale, 9, 'брак показан отдельно');
-      assert.equal(a.qtyIn1c, 70);
+      // В 1С реализацию ещё не провели — владелец видит расхождение для сверки.
+      assert.equal(a.qtyIn1c, 100);
       assert.ok(a.cells >= 1);
     });
     const moves = await must('GET', '/api/sellers/movements', { token: alphaToken });

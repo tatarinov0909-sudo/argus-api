@@ -135,12 +135,15 @@ async function loadStock(client, companyId) {
       const onHand = Number(r.good_qty || 0) + staged;
       const ordered = Number(r.ordered_qty || 0);
       const stockKnown = Number(r.stock_records || 0) > 0 || r.observed_sku != null;
-      // The latest accounting balance from 1C is the seller-facing total.
-      // Accepted file snapshots remain stored for audit, but they must not
-      // freeze the cabinet after a newer automatic 1C exchange arrives.
+      // «Всего» у продавца — по Аргусу, без 1С (решение владельца 23.09.2026):
+      // годное в ячейках плюс собранное, но ещё не уехавшее. Так оно растёт
+      // сразу после приёмки и падает сразу по «Уехала», а не через полчаса
+      // после обмена, когда в 1С проведут реализацию. Весь товар продавца
+      // лежит у нас в ячейках, поэтому ноль здесь — честный ноль. Цифра 1С
+      // остаётся для сверки (qtyIn1c) и продавцу не показывается.
       const accountingTotal = r.stock_qty_1c === null || r.stock_qty_1c === undefined
         ? null : Number(r.stock_qty_1c);
-      const total = accountingTotal === null ? null : Math.max(0, accountingTotal);
+      const total = onHand;
       // Четыре числа продавца (решение владельца 17.09.2026):
       // «в сборке» — заказы, переданные складу поставкой (или уже
       // отобранные), «заказано» — купленное на площадке, чего в поставке
@@ -186,7 +189,7 @@ async function loadStock(client, companyId) {
       // quantities; it does not reveal 1C, cells, or reconciliation details.
       total,
       totalKnown: total !== null,
-      totalUpdatedAt: accountingTotal === null ? null : (r.stock_at || null),
+      totalUpdatedAt: r.counted_at || null,
       inAssembly,
       orderedNotInSupply,
       sellerAvailable,

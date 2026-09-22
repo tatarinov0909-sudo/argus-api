@@ -203,7 +203,9 @@ function calculation(overrides = {}) {
         ok(await api('GET', '/api/sync/status', { token }), 403);
       }
       const stock = ok(await api('GET', '/api/sellers/stock', { token: seller.token }));
-      assert.deepEqual(stock.rows.map(row => row.total).sort((a, b) => a - b), [7, 8, 9]);
+      // «Всего» продавцу — по ячейкам Аргуса (решение владельца 23.09.2026):
+      // в ячейках этих товаров нет, и цифра 1С продавцу не уходит.
+      assert.deepEqual(stock.rows.map(row => row.total), [0, 0, 0]);
       for (const row of stock.rows) {
         assert.ok(!Object.hasOwn(row, 'stockCalculation'));
         assert.ok(!Object.hasOwn(row, 'stock_calculation'));
