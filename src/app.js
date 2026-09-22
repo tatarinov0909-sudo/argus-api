@@ -32,7 +32,9 @@ function createApp() {
   // после пятой заявки. Один прокси, поэтому доверяем ровно одному хопу.
   app.set('trust proxy', 1);
 
-  app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') ?? true }));
+  // X-Argus-Token — продлённый вход (см. renewIfOld): без expose браузер
+  // спрячет заголовок от страницы.
+  app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') ?? true, exposedHeaders: ['X-Argus-Token'] }));
   // Default body-parser limit is 100kb — a 500-record 1C sync batch
   // (companies/products/invoices) routinely exceeds that.
   app.use(express.json({ limit: '5mb' }));

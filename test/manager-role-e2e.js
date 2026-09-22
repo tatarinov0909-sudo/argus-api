@@ -30,7 +30,7 @@ async function api(method, path, { token, body } = {}) {
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
-  return { status: res.status, body: json };
+  return { status: res.status, body: json, headers: res.headers };
 }
 
 (async () => {
@@ -213,6 +213,10 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(demoted.body.kind, 'worker');
       assert.deepEqual(demoted.body.permissions, []);
     });
+    const oldMgrEntry = await api('GET', '/api/supplies/pending', { token: afterPromote.body.token });
+    check('старый вход менеджера после перевода в работники больше не пускает', () => {
+      assert.equal(oldMgrEntry.status, 401, JSON.stringify(oldMgrEntry.body));
+    });
 
     // ---------- Права можно поменять после выдачи ----------
     //
@@ -229,6 +233,35 @@ async function api(method, path, { token, body } = {}) {
     check('и в списке ключей права обновились', () => {
       const row = listAfter.body.find((k) => k.id === mgrKey.body.id);
       assert.deepEqual([...row.permissions].sort(), ['clients', 'warehouse']);
+    });
+    await new Promise((r) => setTimeout(r, 2100));   // ответ о ключе живёт в памяти 2 с
+    const mapWithOldEntry = await api('GET', '/api/cells/rows', { token: mgrToken });
+    check('новое право действует сразу, без повторного входа', () => {
+      assert.equal(mapWithOldEntry.status, 200, JSON.stringify(mapWithOldEntry.body));
+    });
+    await api('PATCH', `/api/staff/${mgrKey.body.id}/permissions`, { token: ownerToken, body: { permissions: ['clients'] } });
+    await new Promise((r) => setTimeout(r, 2100));   // ответ о ключе живёт в памяти 2 с
+    const mapAfterRevoke = await api('GET', '/api/cells/rows', { token: mgrToken });
+    check('и снятое право перестаёт действовать сразу', () => {
+      assert.equal(mapAfterRevoke.status, 403, JSON.stringify(mapAfterRevoke.body));
+    });
+
+    // ---------- Вход продлевается сам ----------
+    const jwt = require('jsonwebtoken');
+    const ownerClaims = JSON.parse(Buffer.from(ownerToken.split('.')[1], 'base64url').toString());
+    const nowSec = Math.floor(Date.now() / 1000);
+    const { iat: _iat, exp: _exp, ...claims } = ownerClaims;
+    const oldToken = jwt.sign({ ...claims, iat: nowSec - 40000 }, process.env.JWT_SECRET, { expiresIn: 43200 });
+    const renewed = await api('GET', '/api/staff', { token: oldToken });
+    const fresh = await api('GET', '/api/staff', { token: ownerToken });
+    check('старый, но живой вход получает свежий в ответе; свежий — не трогаем', () => {
+      assert.equal(renewed.status, 200, JSON.stringify(renewed.body));
+      const next = renewed.headers.get('x-argus-token');
+      assert.ok(next, 'нет продлённого входа');
+      const p = jwt.verify(next, process.env.JWT_SECRET);
+      assert.equal(p.role, 'owner');
+      assert.ok(p.exp - nowSec > 40000, 'срок не продлён');
+      assert.equal(fresh.headers.get('x-argus-token'), null);
     });
     const regrantByManager = await api('PATCH', `/api/staff/${mgrKey.body.id}/permissions`, {
       token: igorToken, body: { permissions: ['billing'] },

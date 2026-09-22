@@ -115,6 +115,9 @@ function normalizeOrder(o) {
     // молча делить на сто значит однажды поделить дважды.
     salePriceKopecks: o.salePrice ?? null,
     createdAt: o.createdAt || null,
+    // Куда едет заказ — города/пункты покупателя. Менеджеру видно, откуда
+    // заказ, без захода в кабинет площадки.
+    offices: Array.isArray(o.offices) ? o.offices.map(String).filter(Boolean) : [],
     warehouseId: o.warehouseId == null ? null : String(o.warehouseId),
     deliveryType: o.deliveryType || null,
     // Требования площадки к позиции: маркировка «Честного ЗНАКа» и прочее.

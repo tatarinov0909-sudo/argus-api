@@ -586,7 +586,7 @@ async function pendingByCompany(client, warehouseId) {
             array_agg(DISTINCT i.source) AS sources,
             count(DISTINCT i.id) FILTER (WHERE NOT ${WB_CONFIRMED_SQL})::int AS orders,
             COALESCE(sum(ii.declared_qty) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}), 0)::numeric AS units,
-            min(i.created_at) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}) AS oldest,
+            min(COALESCE(i.mp_created_at, i.created_at)) FILTER (WHERE NOT ${WB_CONFIRMED_SQL}) AS oldest,
             count(DISTINCT i.id) FILTER (WHERE NOT ${WB_CONFIRMED_SQL} AND (${UNPICKABLE_SQL}))::int AS incomplete,
             count(DISTINCT i.id) FILTER (WHERE ${WB_CONFIRMED_SQL})::int AS wb_confirmed
        FROM invoices i
@@ -625,6 +625,7 @@ async function pendingByCompany(client, warehouseId) {
 async function pendingOrders(client, warehouseId, companyId) {
   const r = await client.query(
     `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
+            i.mp_created_at, i.mp_offices, i.mp_sale_price_kopecks,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
             ii.mp_nm_id, ii.mp_rid,
             NOT (${UNPICKABLE_SQL}) AS pickable,
@@ -644,6 +645,10 @@ async function pendingOrders(client, warehouseId, companyId) {
     id: x.id,
     number: x.number,
     createdAt: x.created_at,
+    // Когда покупатель оформил заказ на площадке (у заказа из 1С — нет).
+    orderedAt: x.mp_created_at,
+    offices: x.mp_offices || [],
+    salePriceKopecks: x.mp_sale_price_kopecks == null ? null : Number(x.mp_sale_price_kopecks),
     marketplace: x.marketplace,
     status: x.status,
     sku: x.sku,

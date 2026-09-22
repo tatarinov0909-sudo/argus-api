@@ -128,14 +128,32 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
       : `Не сопоставлен с номенклатурой: артикул WB ${order.article || order.nmId}`;
 
     const inserted = await client.query(
-      `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, external_id)
-       VALUES ($1, $2, $3, 'out', 'wb', $4)
+      `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, external_id,
+                             mp_created_at, mp_offices, mp_sale_price_kopecks)
+       VALUES ($1, $2, $3, 'out', 'wb', $4, $5, $6, $7)
        ON CONFLICT DO NOTHING
        RETURNING id`,
-      [warehouseId, companyId, `WB-${order.externalId}`, order.externalId],
+      [warehouseId, companyId, `WB-${order.externalId}`, order.externalId,
+        order.createdAt || null, order.offices || [], order.salePriceKopecks ?? null],
     );
     if (!inserted.rows[0]) {
       existed += 1;
+      // Когда оформлен, куда едет, цена — то же дозаполнение для заказов,
+      // заведённых до того, как мы стали это хранить. Трогаем строку, только
+      // если есть чем заполнить пустое: иначе каждый обмен переписывал бы
+      // сотни строк впустую.
+      await client.query(
+        `UPDATE invoices
+            SET mp_created_at = COALESCE(mp_created_at, $3::timestamptz),
+                mp_offices = COALESCE(mp_offices, $4::text[]),
+                mp_sale_price_kopecks = COALESCE(mp_sale_price_kopecks, $5::bigint)
+          WHERE warehouse_id = $1 AND external_id = $2 AND source = 'wb'
+            AND ((mp_created_at IS NULL AND $3::timestamptz IS NOT NULL)
+                 OR mp_offices IS NULL
+                 OR (mp_sale_price_kopecks IS NULL AND $5::bigint IS NOT NULL))`,
+        [warehouseId, order.externalId, order.createdAt || null, order.offices || [],
+          order.salePriceKopecks ?? null],
+      );
       // Заказ уже заведён — но, возможно, ещё до того, как мы стали сохранять
       // поля площадки. Дозаполняем, пока он в очереди: уйдёт из неё — взять
       // будет негде. COALESCE, а не перезапись: то, что уже сохранено, площадка

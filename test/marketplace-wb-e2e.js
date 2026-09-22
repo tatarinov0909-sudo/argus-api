@@ -365,6 +365,9 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       barcodes: ['2053278139291'],
       rid: 'ebb.id1e2405565cd1b61b4e47cbad090b4b4.0.0',
       orderUid: 'id1e2405565cd1b61b4e47cbad090b4b4',
+      createdAt: '2026-09-21T09:15:00Z',
+      offices: ['Калуга'],
+      salePriceKopecks: 49900,
     }];
     const imported = await withTenantContext({ warehouseId },
       (c) => sync.importOrders(c, warehouseId, { companyId: companyId, orders: ORDERS }));
@@ -409,6 +412,22 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       assert.equal(healed.rows.length, 1, 'поля не дозаполнились');
       assert.equal(healed.rows[0].mp_rid, ORDERS[0].rid);
       assert.equal(healed.rows[0].mp_article, '1201010228');
+    });
+
+    // Когда оформлен и куда едет — менеджеру в список, и тоже дозаполняется.
+    await withTenantContext({ warehouseId }, (c) => c.query(
+      `UPDATE invoices SET mp_created_at = NULL, mp_offices = NULL, mp_sale_price_kopecks = NULL
+        WHERE warehouse_id = $1 AND external_id = '900001'`, [warehouseId]));
+    await withTenantContext({ warehouseId },
+      (c) => sync.importOrders(c, warehouseId, { companyId, orders: ORDERS }));
+    const pending = await api('GET', `/api/supplies/pending/${companyId}`, { token: ownerToken });
+    check('в списке менеджера — когда заказ оформлен, куда едет и цена', () => {
+      assert.equal(pending.status, 200, JSON.stringify(pending.body));
+      const o = pending.body.find((x) => x.number === 'WB-900001');
+      assert.ok(o, JSON.stringify(pending.body));
+      assert.equal(new Date(o.orderedAt).toISOString(), '2026-09-21T09:15:00.000Z');
+      assert.deepEqual(o.offices, ['Калуга']);
+      assert.equal(o.salePriceKopecks, 49900);
     });
 
   } finally {

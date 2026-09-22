@@ -31,7 +31,10 @@ function normalizeEmail(email) {
 
 function signToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '45m',
+    // Смена, а не 45 минут: пока человек работает, requireAuth продлевает
+    // вход сам. Отзыв ключа, роль и права менеджера проверяются на каждом
+    // запросе по базе, так что длинный срок их не задерживает.
+    expiresIn: process.env.JWT_EXPIRES_IN || '12h',
   });
 }
 
@@ -216,4 +219,5 @@ module.exports = {
   loginStaffKey,
   loginSellerKey,
   transliteratePrefix,
+  signToken,
 };

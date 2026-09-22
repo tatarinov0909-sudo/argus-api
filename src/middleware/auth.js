@@ -11,21 +11,47 @@ const { withoutTenantContext } = require('../db/pool');
 const KEY_CACHE_MS = 2000;
 const keyCache = new Map();
 
-async function keyStillActive(role, id) {
+// Что с ключом сейчас: жив ли, а у сотрудника ещё роль и права. Роль и
+// права берём отсюда, а не из токена — вход живёт смену, и снятое право
+// должно переставать действовать сразу.
+async function keyState(role, id) {
   const cacheKey = role + ':' + id;
   const hit = keyCache.get(cacheKey);
-  if (hit && Date.now() - hit.at < KEY_CACHE_MS) return hit.active;
+  if (hit && Date.now() - hit.at < KEY_CACHE_MS) return hit.state;
 
-  const fn = role === 'seller' ? 'seller_key_is_active' : 'staff_key_is_active';
-  const r = await withoutTenantContext((client) => client.query(
-    `SELECT ${fn}($1) AS active`, [id],
-  ));
-  const active = r.rows[0]?.active === true;
-  keyCache.set(cacheKey, { active, at: Date.now() });
+  let state;
+  if (role === 'seller') {
+    const r = await withoutTenantContext((client) => client.query(
+      'SELECT seller_key_is_active($1) AS active', [id],
+    ));
+    state = { active: r.rows[0]?.active === true };
+  } else {
+    const r = await withoutTenantContext((client) => client.query(
+      'SELECT * FROM staff_key_state($1)', [id],
+    ));
+    const row = r.rows[0];
+    state = row
+      ? { active: row.active === true, kind: row.kind, permissions: row.permissions || [] }
+      : { active: false };
+  }
+  keyCache.set(cacheKey, { state, at: Date.now() });
   if (keyCache.size > 500) {
     for (const [k, v] of keyCache) if (Date.now() - v.at >= KEY_CACHE_MS) keyCache.delete(k);
   }
-  return active;
+  return state;
+}
+
+// Продление входа. Токен, у которого прошла половина срока, меняем на
+// свежий в заголовке ответа — кабинеты подхватывают его сами. Работающего
+// человека не выкидывает никогда; выйдет только тот, кто не открывал
+// Аргус дольше срока (12 часов). Только для людей: у обмена с 1С свой срок.
+const RENEWED_ROLES = new Set(['owner', 'manager', 'worker', 'seller']);
+function renewIfOld(res, payload) {
+  if (!RENEWED_ROLES.has(payload.role) || !payload.exp || !payload.iat) return;
+  if (payload.exp - Date.now() / 1000 > (payload.exp - payload.iat) / 2) return;
+  const { iat, exp, ...claims } = payload;
+  // Позднее подключение: auth/service сам тянет базу и ошибки.
+  res.set('X-Argus-Token', require('../auth/service').signToken(claims));
 }
 
 // Verifies the JWT and attaches req.auth = { role, warehouseId, ownerId, companyId, staffKeyId, sellerKeyId }.
@@ -55,17 +81,30 @@ async function requireAuth(req, res, next) {
   const keyId = payload.role === 'seller' ? payload.sellerKeyId
     : (payload.role === 'worker' || payload.role === 'manager') ? payload.staffKeyId : null;
   if (keyId) {
+    let state;
     try {
-      if (!await keyStillActive(payload.role, keyId)) {
-        return res.status(401).json({ error: 'Ваш ключ отозван. Обратитесь к руководителю склада.' });
-      }
+      state = await keyState(payload.role, keyId);
     } catch (err) {
       // База недоступна — не превращаем это в «всех выгнать»: ошибка связи и
       // отзыв ключа для человека выглядят одинаково, а причины разные.
       return res.status(503).json({ error: 'Сервер временно недоступен, повторите' });
     }
+    if (!state.active) {
+      return res.status(401).json({ error: 'Ваш ключ отозван. Обратитесь к руководителю склада.' });
+    }
+    if (payload.role !== 'seller') {
+      // Руководитель перевёл ключ из менеджеров в работники или обратно —
+      // старый вход в чужой кабинет не годится, нужен новый.
+      const role = state.kind === 'manager' ? 'manager' : 'worker';
+      if (role !== payload.role) {
+        return res.status(401).json({ error: 'Руководитель склада изменил вашу роль — войдите заново.' });
+      }
+      // Права менеджера — те, что открыты сейчас, а не при входе.
+      if (role === 'manager') payload.grants = state.permissions;
+    }
   }
 
+  renewIfOld(res, payload);
   req.auth = payload;
   return next();
 }
