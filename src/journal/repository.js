@@ -51,8 +51,10 @@ async function listEntries(client, warehouseId, {
             EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
             i.number AS invoice_number,
             -- Заказ сейчас в поставке? Тогда у отметки «нет товара» есть
-            -- решение «убрать заказ из поставки».
+            -- решение «убрать заказ из поставки», а вся сборка этой поставки
+            -- собирается в кабинете в одну запись вместо строки на каждый товар.
             i.supply_id AS invoice_supply_id,
+            s.number AS invoice_supply_number,
             CASE WHEN cb.id IS NULL THEN NULL ELSE
               wr.row_num
               || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
@@ -62,6 +64,7 @@ async function listEntries(client, warehouseId, {
             END AS cell_label
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id
+     LEFT JOIN supplies s ON s.id = i.supply_id
      LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
      LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE je.warehouse_id = $1
@@ -80,6 +83,27 @@ async function listEntries(client, warehouseId, {
     [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
   return result.rows;
+}
+
+// Сколько позиций поставки уже собрано. Кабинет показывает сборку поставки
+// одной записью с полосой «собрано N из M», а не строкой на каждый товар:
+// с поставки из сорока заказов владельцу падало сорок одинаковых уведомлений.
+async function supplyPickProgress(client, warehouseId, supplyIds) {
+  if (!supplyIds.length) return new Map();
+  const result = await client.query(
+    `SELECT i.supply_id,
+            COUNT(ii.id)::int AS total,
+            COUNT(ii.id) FILTER (WHERE EXISTS (
+              SELECT 1 FROM shipping_records sr
+               WHERE sr.invoice_item_id = ii.id AND sr.is_final
+            ))::int AS done
+       FROM invoices i
+       JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE i.warehouse_id = $1 AND i.supply_id = ANY($2::uuid[])
+      GROUP BY i.supply_id`,
+    [warehouseId, supplyIds],
+  );
+  return new Map(result.rows.map((row) => [row.supply_id, row]));
 }
 
 // Кто закрыл расхождение — владелец или менеджер. Журнал неизменяем и служит
@@ -117,4 +141,4 @@ async function resolveEntry(client, {
   return result.rows[0];
 }
 
-module.exports = { createEntry, listEntries, resolveEntry };
+module.exports = { createEntry, listEntries, supplyPickProgress, resolveEntry };

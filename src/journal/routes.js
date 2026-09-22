@@ -24,9 +24,20 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
     const invoiceId = one(req.query.invoiceId, 'invoiceId');
 
     const hideUrgent = req.auth.role === 'manager' && !(req.auth.grants || []).includes('shortages');
-    const entries = await withTenantContext({ warehouseId }, (client) => (
-      repository.listEntries(client, warehouseId, { cellBlockId, invoiceId, hideUrgent })
-    ));
+    const entries = await withTenantContext({ warehouseId }, async (client) => {
+      const rows = await repository.listEntries(client, warehouseId, { cellBlockId, invoiceId, hideUrgent });
+      // Сборка поставки уходит в кабинет одной записью с полосой готовности,
+      // поэтому к строкам этой поставки прикладываем её счёт позиций.
+      const supplyIds = [...new Set(rows.map((r) => r.invoice_supply_id).filter(Boolean))];
+      const progress = await repository.supplyPickProgress(client, warehouseId, supplyIds);
+      rows.forEach((row) => {
+        const done = progress.get(row.invoice_supply_id);
+        if (!done) return;
+        row.supply_items_total = done.total;
+        row.supply_items_done = done.done;
+      });
+      return rows;
+    });
     res.json(entries);
   } catch (err) {
     next(err);
