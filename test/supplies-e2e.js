@@ -155,6 +155,17 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     });
     const supplyId = created.body.id;
 
+    const listed = (await api('GET', '/api/supplies', { token: ownerToken })).body.find((x) => x.id === supplyId);
+    const orderRows = (await api('GET', '/api/invoices', { token: ownerToken })).body.filter((x) => [o1, o2, o3].includes(x.id));
+    check('в списке видно, кто и когда составил поставку, а у заказа — его поставка и куда она едет', () => {
+      assert.equal(listed.created_by, 'владелец');
+      assert.equal(listed.created_by_role, 'owner');
+      assert.ok(listed.created_at);
+      assert.equal(orderRows.length, 3);
+      assert.ok(orderRows.every((x) => x.supply_id === supplyId && x.supply_number === created.body.number
+        && x.supply_destination === 'СЦ Подольск'), JSON.stringify(orderRows));
+    });
+
     const pickSheet = await api('GET', '/api/shipping/pick-list', { token: ownerToken });
     check('лист грузчика знает точку доставки заказа — по ней его сортируют', () => {
       assert.equal(pickSheet.status, 200, JSON.stringify(pickSheet.body));

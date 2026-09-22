@@ -28,8 +28,12 @@ router.get('/', requireAuth, async (req, res, next) => {
         `SELECT i.id, i.number, i.status, i.direction, i.created_at, i.company_id,
                 i.source, i.external_id, i.mp_status, i.mp_supplier_status,
                 i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
-                c.name AS company_name
+                c.name AS company_name,
+                -- Поставка заказа: экран грузчика собирает заказы по поставкам
+                -- и показывает, куда она едет.
+                i.supply_id, s.number AS supply_number, s.destination AS supply_destination
          FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+         LEFT JOIN supplies s ON s.id = i.supply_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
            -- Работнику: закрытые на площадке не нужны, а заказы площадки —
            -- только отправленные на сборку, то есть в поставке.

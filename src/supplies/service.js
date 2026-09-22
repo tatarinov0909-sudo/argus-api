@@ -542,6 +542,9 @@ async function list(client, warehouseId, { status = null, showShortages = false 
             s.marketplace, s.mp_supply_id,
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
+            -- Кто составил: первая запись журнала о поставке. «Когда пришла»
+            -- на склад — created_at.
+            cb.actor_type AS created_by_role, cb.actor_name AS created_by,
             count(i.id)::int AS orders,
             count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked,
             -- Сколько по поставке отмечено «нет товара» и ещё не решено.
@@ -552,9 +555,16 @@ async function list(client, warehouseId, { status = null, showShortages = false 
                  AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) END AS missing
        FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT je.actor_type,
+                CASE WHEN je.actor_type = 'owner' THEN 'владелец' ELSE sk.name END AS actor_name
+           FROM journal_entries je
+           LEFT JOIN staff_keys sk ON sk.id = je.actor_id
+          WHERE je.warehouse_id = s.warehouse_id AND je.entity_type = 'supply' AND je.entity_id = s.id
+          ORDER BY je.created_at LIMIT 1) cb ON true
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
-      GROUP BY s.id, c.name
+      GROUP BY s.id, c.name, cb.actor_type, cb.actor_name
       ORDER BY s.created_at DESC`,
     [warehouseId, status, showShortages === true],
   );
