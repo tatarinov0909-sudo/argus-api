@@ -74,6 +74,21 @@ async function api(method, path, { token, body } = {}) {
     });
     const mgrToken = login.body.token;
 
+    const wrongDoor = await api('POST', '/api/auth/staff/login', { body: { keyCode: mgrKey.body.key_code, as: 'worker' } });
+    const rightDoor = await api('POST', '/api/auth/staff/login', { body: { keyCode: mgrKey.body.key_code, as: 'manager' } });
+    const workerKey = await api('POST', '/api/staff', { token: ownerToken, body: { name: 'Грузчик Вася' } });
+    const workerAsMgr = await api('POST', '/api/auth/staff/login', { body: { keyCode: workerKey.body.key_code, as: 'manager' } });
+    const workerAsWorker = await api('POST', '/api/auth/staff/login', { body: { keyCode: workerKey.body.key_code, as: 'worker' } });
+    check('каждая дверь пускает только свои ключи, без токена для чужой', () => {
+      assert.equal(wrongDoor.status, 403, JSON.stringify(wrongDoor.body));
+      assert.ok(!wrongDoor.body.token);
+      assert.equal(rightDoor.status, 200, JSON.stringify(rightDoor.body));
+      assert.equal(workerAsMgr.status, 403, JSON.stringify(workerAsMgr.body));
+      assert.ok(!workerAsMgr.body.token);
+      assert.equal(workerAsWorker.status, 200, JSON.stringify(workerAsWorker.body));
+      assert.equal(workerAsWorker.body.role, 'worker');
+    });
+
     // ---------- Своя работа ----------
     const pending = await api('GET', '/api/supplies/pending', { token: mgrToken });
     check('менеджер видит накопившиеся заказы — это его работа', () => {

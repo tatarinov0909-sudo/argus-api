@@ -123,7 +123,7 @@ async function loginOwner({ email, password }) {
   });
 }
 
-async function loginStaffKey({ keyCode }) {
+async function loginStaffKey({ keyCode, as }) {
   if (!keyCode || typeof keyCode !== 'string') throw new HttpError(400, 'Введите ключ доступа');
   const normalized = keyCode.trim().toUpperCase();
 
@@ -141,6 +141,14 @@ async function loginStaffKey({ keyCode }) {
     // Роль берётся из ключа, а не из того, куда человек постучался. Иначе
     // достаточно было бы зайти «как менеджер» с ключом работника.
     const role = key.kind === 'manager' ? 'manager' : 'worker';
+    // Дверь выбрана на входе («Менеджер» или «Работник склада») — пускаем
+    // только своих: ключ работника в дверь менеджера не открывает, и
+    // наоборот (решение владельца 22.09). Без `as` — по виду ключа.
+    if ((as === 'manager' || as === 'worker') && as !== role) {
+      throw new HttpError(403, role === 'manager'
+        ? 'Это ключ менеджера. Вернитесь и выберите кабинет «Менеджер».'
+        : 'Это ключ работника склада. Вернитесь и выберите кабинет «Работник склада».');
+    }
     const token = signToken({
       role,
       warehouseId: key.warehouse_id,
