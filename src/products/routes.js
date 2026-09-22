@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
+const journal = require('../journal/repository');
 
 const router = express.Router();
 
@@ -45,19 +46,28 @@ router.get('/', requireAuth, async (req, res, next) => {
   }
 });
 
-// Manual entry — the same stand-in role the manual invoice form plays until
-// the 1C module exists. Rows created here carry no external_id; the sync will
-// later match them by (company, sku) and fill it in.
-router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
+// Новый товар — заводится в Аргусе, не дожидаясь 1С (решение владельца 22.09).
+// Карточка без external_id; когда такой же артикул того же продавца придёт из
+// 1С, обмен сам свяжет их (sync/service.js, «adoption»). Заводит владелец или
+// менеджер: приход товара открыт обоим, и новый товар часто появляется
+// именно на приходе.
+router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
-    const { warehouseId } = req.auth;
+    const { warehouseId, role, ownerId, staffKeyId } = req.auth;
     const {
-      companyId, sku, name, category,
+      companyId, sku, name, category, barcode,
       lengthMm, widthMm, heightMm, weightG, externalId,
     } = req.body;
 
-    if (!companyId || !sku || !sku.trim() || !name || !name.trim()) {
-      throw new HttpError(400, 'Укажите компанию, артикул и название товара');
+    if (!companyId || typeof sku !== 'string' || !sku.trim() || typeof name !== 'string' || !name.trim()) {
+      throw new HttpError(400, 'Укажите продавца, артикул и название товара');
+    }
+    if (sku.trim().length > 100 || name.trim().length > 300) {
+      throw new HttpError(400, 'Артикул — до 100 знаков, название — до 300');
+    }
+    const code = typeof barcode === 'string' && barcode.trim() ? barcode.trim() : null;
+    if (code && !/^[0-9A-Za-z-]{4,64}$/.test(code)) {
+      throw new HttpError(400, 'Штрихкод — цифры (или латиница), от 4 до 64 знаков');
     }
     const dims = {
       length_mm: optionalNumber(lengthMm, 'длина'),
@@ -68,33 +78,47 @@ router.post('/', requireAuth, requireRole('owner'), async (req, res, next) => {
 
     const product = await withTenantContext({ warehouseId }, async (client) => {
       const companyResult = await client.query(
-        `SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
-        [companyId, warehouseId],
+        `SELECT id, name FROM companies WHERE id::text = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
+        [String(companyId), warehouseId],
       );
-      if (!companyResult.rows[0]) throw new HttpError(404, 'Компания не найдена');
+      if (!companyResult.rows[0]) throw new HttpError(404, 'Продавец не найден');
 
+      // Без учёта регистра: «pb000021144» и «PB000021144» — один товар, и две
+      // карточки разделили бы его остаток и заказы надвое.
       const existing = await client.query(
-        `SELECT id FROM products WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3`,
+        `SELECT id, sku, name FROM products WHERE warehouse_id = $1 AND company_id = $2 AND lower(sku) = lower($3)`,
         [warehouseId, companyId, sku.trim()],
       );
       if (existing.rows[0]) {
-        throw new HttpError(409, 'Товар с таким артикулом у этой компании уже есть');
+        throw new HttpError(409, `У этого продавца уже есть товар с артикулом ${existing.rows[0].sku} — «${existing.rows[0].name}»`);
       }
 
       const result = await client.query(
         `INSERT INTO products
            (warehouse_id, company_id, sku, name, category,
-            length_mm, width_mm, height_mm, weight_g, external_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         RETURNING id, company_id, sku, name, category,
+            length_mm, width_mm, height_mm, weight_g, external_id, barcode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id, company_id, sku, name, category, barcode,
                    length_mm, width_mm, height_mm, weight_g,
                    active, external_id, created_at, updated_at`,
         [
           warehouseId, companyId, sku.trim(), name.trim(), category?.trim() || null,
           dims.length_mm, dims.width_mm, dims.height_mm, dims.weight_g,
-          externalId || null,
+          // Связь с 1С ставит только обмен; руками — лишь владелец (так
+          // заводили карточки до модуля 1С).
+          role === 'owner' ? (externalId || null) : null, code,
         ],
       );
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `Заведён товар «${name.trim()}» (${sku.trim()}) продавца «${companyResult.rows[0].name}» — вручную в Аргусе. `
+          + 'Когда такой артикул придёт из 1С, карточки свяжутся сами.',
+        entityType: 'product',
+        entityId: result.rows[0].id,
+        actorType: role === 'manager' ? 'manager' : 'owner',
+        actorId: role === 'manager' ? staffKeyId : ownerId,
+      });
       return result.rows[0];
     });
     res.status(201).json(product);

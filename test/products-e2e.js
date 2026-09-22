@@ -248,6 +248,40 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(sellerCreate.status, 403, JSON.stringify(sellerCreate.body));
     });
 
+    // ---------- Новый товар в Аргусе: менеджер, штрихкод, регистр, журнал ----------
+    const mgrKey = await api('POST', '/api/staff', { token: ownerToken, body: { name: 'Менеджер', kind: 'manager' } });
+    const mgr = await api('POST', '/api/auth/staff/login', { body: { keyCode: mgrKey.body.key_code } });
+    const byManager = await api('POST', '/api/products', {
+      token: mgr.body.token, body: { companyId: compAId, sku: 'NEW-100', name: 'Новый батончик', barcode: '4607012345678' },
+    });
+    check('менеджер заводит товар, штрихкод сохраняется, связи с 1С нет', () => {
+      assert.equal(byManager.status, 201, JSON.stringify(byManager.body));
+      assert.equal(byManager.body.barcode, '4607012345678');
+      assert.equal(byManager.body.external_id, null);
+    });
+    const caseDup = await api('POST', '/api/products', {
+      token: ownerToken, body: { companyId: compAId, sku: 'new-100', name: 'Тот же' },
+    });
+    const badCode = await api('POST', '/api/products', {
+      token: ownerToken, body: { companyId: compAId, sku: 'NEW-101', name: 'Штрихкод кривой', barcode: 'ab cd' },
+    });
+    const mgrExt = await api('POST', '/api/products', {
+      token: mgr.body.token, body: { companyId: compAId, sku: 'NEW-102', name: 'С чужой связью', externalId: 'ext-hack' },
+    });
+    check('тот же артикул другим регистром — отказ; кривой штрихкод — отказ; менеджер связь с 1С не ставит', () => {
+      assert.equal(caseDup.status, 409, JSON.stringify(caseDup.body));
+      assert.equal(badCode.status, 400, JSON.stringify(badCode.body));
+      assert.equal(mgrExt.status, 201, JSON.stringify(mgrExt.body));
+      assert.equal(mgrExt.body.external_id, null);
+    });
+    const journalFeed = await api('GET', '/api/journal', { token: ownerToken });
+    check('в журнале видно, кто и какой товар завёл', () => {
+      const e = journalFeed.body.find((x) => x.entity_type === 'product' && x.entity_id === byManager.body.id);
+      assert.ok(e, 'нет записи журнала');
+      assert.equal(e.actor_type, 'manager');
+      assert.match(e.action_text, /Заведён товар «Новый батончик» \(NEW-100\)/);
+    });
+
     const sellerPatch = await api('PATCH', `/api/products/${created.body.id}`, {
       token: sellerToken, body: { name: 'Hacked' },
     });
