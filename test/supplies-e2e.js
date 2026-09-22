@@ -175,6 +175,13 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.ok(inSupply.every((o) => o.destination === 'СЦ Подольск'), JSON.stringify(inSupply));
       assert.ok(outside.every((o) => o.destination === null), 'у заказа без поставки точки нет');
     });
+    check('в шапку листа — номер поставки, адрес и когда она пришла', () => {
+      const sup = pickSheet.body.orders.find((o) => o.company === 'Альфа').supply;
+      assert.equal(sup.number, created.body.number);
+      assert.equal(sup.destination, 'СЦ Подольск');
+      assert.ok(sup.arrivedAt, JSON.stringify(sup));
+      assert.ok(pickSheet.body.orders.filter((o) => o.company !== 'Альфа').every((o) => o.supply === null));
+    });
 
     const twice = await api('POST', '/api/supplies', {
       token: ownerToken, body: { invoiceIds: [o1] },

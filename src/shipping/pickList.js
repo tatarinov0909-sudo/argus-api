@@ -28,6 +28,14 @@ function orderView(r) {
     company: r.company_name,
     marketplace: r.source === '1c' ? '1c' : r.source,
     destination: r.destination || null,
+    // Поставка целиком — для шапки листа: номер, куда везти, когда
+    // отгрузка и когда пришла на склад. Заказ со склада без поставки — null.
+    supply: r.supply_number ? {
+      number: r.supply_number,
+      destination: r.destination || null,
+      shipDate: r.ship_date || null,
+      arrivedAt: r.supply_created_at,
+    } : null,
   };
 }
 
@@ -39,7 +47,8 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
   // не менеджер, а тот, кто первым взял лист.
   const invoices = await client.query(
     `SELECT i.id, i.number, i.company_id, i.source, c.name AS company_name,
-            s.destination
+            s.destination, s.number AS supply_number,
+            to_char(s.ship_date, 'YYYY-MM-DD') AS ship_date, s.created_at AS supply_created_at
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      LEFT JOIN supplies s ON s.id = i.supply_id
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
