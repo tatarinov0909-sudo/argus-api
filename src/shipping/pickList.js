@@ -39,7 +39,7 @@ function orderView(r) {
   };
 }
 
-async function buildPickList(client, warehouseId, invoiceIds = []) {
+async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = null) {
   // Без списка берём всё, что реально ждёт отбора: открытые и начатые
   // отгрузки. Именно этот случай и есть «утро, заказов много». Заказы
   // с площадки — только отправленные менеджером на сборку, то есть
@@ -56,8 +56,9 @@ async function buildPickList(client, warehouseId, invoiceIds = []) {
        AND i.mp_closed_at IS NULL
        AND (i.source = '1c' OR i.supply_id IS NOT NULL)
        AND ($2::uuid[] IS NULL OR i.id = ANY($2::uuid[]))
+       AND ($3::uuid IS NULL OR i.supply_id = $3::uuid)
      ORDER BY i.created_at`,
-    [warehouseId, invoiceIds.length ? invoiceIds : null],
+    [warehouseId, invoiceIds.length ? invoiceIds : null, supplyId],
   );
   if (invoices.rows.length === 0) {
     return { orders: [], lines: [], totalUnits: 0, cellsToVisit: 0 };

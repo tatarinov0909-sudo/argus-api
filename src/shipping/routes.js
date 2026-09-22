@@ -109,6 +109,8 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
 });
 
 // «Лист грузчика» — один обход склада на несколько заказов сразу.
+// ?supplyId=… — вся поставка (печать листа поставки: номера двухсот заказов
+// в адресе не помещаются, сервер отвечает 414).
 // ?invoiceIds=a,b,c — конкретные заказы; без параметра берутся все, что ждут
 // отбора. Кладовщик здесь именно сводит, а не решает: количество и маршрут —
 // арифметика (см. pickList.js).
@@ -116,8 +118,9 @@ router.get('/pick-list', requireAuth, requireRole('owner', 'manager', 'worker'),
   try {
     const { warehouseId } = req.auth;
     const invoiceIds = parseInvoiceIds(req.query.invoiceIds);
+    const supplyId = req.query.supplyId ? parseInvoiceIds(String(req.query.supplyId))[0] : null;
     const list = await withTenantContext({ warehouseId }, (client) => (
-      buildPickList(client, warehouseId, invoiceIds)
+      buildPickList(client, warehouseId, invoiceIds, supplyId)
     ));
     res.json(list);
   } catch (err) {

@@ -175,6 +175,14 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.ok(inSupply.every((o) => o.destination === 'СЦ Подольск'), JSON.stringify(inSupply));
       assert.ok(outside.every((o) => o.destination === null), 'у заказа без поставки точки нет');
     });
+    const bySupply = await api('GET', `/api/shipping/pick-list?supplyId=${supplyId}`, { token: ownerToken });
+    const badSupply = await api('GET', '/api/shipping/pick-list?supplyId=не-uuid', { token: ownerToken });
+    check('лист целой поставки — по её номеру, без перечня заказов в адресе', () => {
+      assert.equal(bySupply.status, 200, JSON.stringify(bySupply.body));
+      assert.equal(bySupply.body.orders.length, 3, JSON.stringify(bySupply.body.orders));
+      assert.ok(bySupply.body.orders.every((o) => o.supply && o.supply.number === created.body.number));
+      assert.equal(badSupply.status, 400, JSON.stringify(badSupply.body));
+    });
     check('в шапку листа — номер поставки, адрес и когда она пришла', () => {
       const sup = pickSheet.body.orders.find((o) => o.company === 'Альфа').supply;
       assert.equal(sup.number, created.body.number);
