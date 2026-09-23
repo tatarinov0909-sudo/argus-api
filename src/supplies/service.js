@@ -262,7 +262,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
             ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id,
-            m.photo_url, st.part_b AS sticker_tail,
+            m.photo_url, st.part_a AS sticker_head, st.part_b AS sticker_tail,
             -- Сколько по строке уже снято с полки и закрыта ли она. Лист
             -- печатают не один раз: после перерыва в работе бумага, где
             -- «взять» стоит полное количество, отправляет кладовщика за
@@ -321,6 +321,9 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
     nmId: l.mp_nm_id,
     photo: l.photo_url || null,
     rid: l.mp_rid,
+    // Номер стикера WB — две части, как на самой этикетке: мелкая сверху
+    // (5815412) и крупная снизу (5865). По ним сверяют посылку с этикеткой.
+    stickerHead: l.sticker_head || null,
     stickerTail: l.sticker_tail || null,
     qty: Number(l.declared_qty),
   }));
