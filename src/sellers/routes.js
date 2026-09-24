@@ -71,6 +71,68 @@ async function requireActiveCompany(client, companyId) {
   if (!company) throw new HttpError(404, 'Компания не найдена');
 }
 
+// Поставки на WB с товаром продавца. Видны с той минуты, как менеджер
+// составил поставку, а не после отгрузки (решение владельца 24.09.2026): это
+// его заказы уезжают, и знать, когда и куда, — его законный интерес. Приходы
+// на склад — другое слово и другой раздел («Приходы и документы»).
+const SUPPLY_STATUS = { collecting: 'Собирается', ready: 'Собрана, ждёт машину', shipped: 'Уехала' };
+
+router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
+      await requireActiveCompany(c, companyId);
+      const supplies = (await c.query(
+        `SELECT s.id, s.number, s.status, s.created_at, s.ready_at, s.shipped_at, s.ship_date,
+                s.destination, s.mp_supply_id, s.mp_barcode, s.mp_barcode_file,
+                count(DISTINCT i.id)::int AS orders,
+                COALESCE(sum(ii.declared_qty), 0)::int AS units,
+                count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready
+           FROM supplies s
+           JOIN invoices i ON i.supply_id = s.id AND i.company_id = $1
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+          WHERE s.company_id = $1
+          GROUP BY s.id
+          ORDER BY s.created_at DESC
+          LIMIT 200`,
+        [companyId],
+      )).rows;
+      const lines = supplies.length ? (await c.query(
+        `SELECT i.supply_id, i.number, i.status, ii.sku, ii.name, ii.declared_qty
+           FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+          WHERE i.company_id = $1 AND i.supply_id = ANY($2::uuid[])
+          ORDER BY i.number`,
+        [companyId, supplies.map((x) => x.id)],
+      )).rows : [];
+      return supplies.map((x) => ({
+        id: x.id,
+        number: x.number,
+        status: x.status,
+        statusName: SUPPLY_STATUS[x.status] || x.status,
+        createdAt: x.created_at,
+        readyAt: x.ready_at,
+        shippedAt: x.shipped_at,
+        shipDate: x.ship_date,
+        destination: x.destination,
+        orders: x.orders,
+        ordersReady: x.orders_ready,
+        units: x.units,
+        // Номер и QR поставки на WB — их показывают на воротах
+        // сортировочного центра. Появляются, когда поставка передана на WB.
+        mpSupplyId: x.mp_supply_id,
+        mpBarcode: x.mp_barcode,
+        mpBarcodeFile: x.mp_barcode_file,
+        items: lines.filter((l) => l.supply_id === x.id).map((l) => ({
+          order: l.number, sku: l.sku, name: l.name, qty: Number(l.declared_qty),
+          status: l.status === 'shipped' ? 'уехал' : l.status === 'ready' ? 'собран' : 'собирается',
+        })),
+      }));
+    });
+    res.set('Cache-Control', 'no-store').json(rows);
+  } catch (err) { next(err); }
+});
+
 router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
