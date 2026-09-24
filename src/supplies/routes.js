@@ -50,14 +50,59 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
 });
 
 // Пункты приёма WB, куда можно везти поставку этого продавца. Только чтение
-// ключом продавца. Город и габарит — Москва и обычный товар (решение
-// владельца 19.09.2026); станут настройкой склада, когда появится второй.
+// ключом продавца. Москва и Московская область (решения владельца 19.09 и
+// 24.09.2026), товар обычного размера. Станут настройкой склада, когда
+// появится склад в другом регионе.
+//
+// WB ищет пункты по названию города, а городов в области десятки: запрос
+// «Московская область» отдаёт семь пунктов, «Подольск» — двести с лишним.
+// Поэтому спрашиваем по списку и держим ответ шесть часов: пункты приёма
+// меняются редко, а семьдесят запросов на каждое открытие экрана WB не
+// простит (300 в минуту, всплеск — 20).
+const REGION_CITIES = [
+  'Москва', 'Московская область', 'Балашиха', 'Подольск', 'Химки', 'Мытищи', 'Королёв', 'Люберцы',
+  'Красногорск', 'Электросталь', 'Коломна', 'Одинцово', 'Домодедово', 'Серпухов', 'Щёлково',
+  'Орехово-Зуево', 'Раменское', 'Долгопрудный', 'Жуковский', 'Пушкино', 'Реутов', 'Сергиев Посад',
+  'Воскресенск', 'Лобня', 'Клин', 'Ивантеевка', 'Дубна', 'Егорьевск', 'Чехов', 'Дмитров', 'Видное',
+  'Ступино', 'Павловский Посад', 'Наро-Фоминск', 'Фрязино', 'Лыткарино', 'Дзержинский',
+  'Солнечногорск', 'Истра', 'Котельники', 'Ногинск', 'Электроугли', 'Коледино', 'Белые Столбы',
+  'Апрелевка', 'Бронницы', 'Можайск', 'Волоколамск', 'Кашира', 'Луховицы', 'Зарайск', 'Шатура',
+  'Талдом', 'Руза', 'Звенигород', 'Краснознаменск', 'Старая Купавна', 'Лосино-Петровский',
+  'Черноголовка', 'Электрогорск', 'Куровское', 'Ликино-Дулёво', 'Софрино', 'Красноармейск',
+  'Хотьково', 'Яхрома', 'Кубинка', 'Голицыно', 'Внуково',
+];
+const POINTS_TTL_MS = 6 * 60 * 60 * 1000;
+const pointsCache = new Map(); // companyId → { at, points }
+
+async function regionPoints(token) {
+  const byId = new Map();
+  // По пять городов за раз и секунда паузы: в пределах всплеска WB.
+  for (let i = 0; i < REGION_CITIES.length; i += 5) {
+    const batch = REGION_CITIES.slice(i, i + 5);
+    const lists = await Promise.all(batch.map((city) => wb.shippingPoints(token, { city, cargoType: 1 })
+      .catch((err) => {
+        // Один город не ответил — остальные пункты всё равно нужны. Но ключ
+        // WB не принят — это для всех городов, молчать нельзя.
+        if (err.status === 424 || err.status === 401 || err.status === 403) throw err;
+        return [];
+      })));
+    for (const list of lists) for (const p of list) if (!byId.has(p.id)) byId.set(p.id, p);
+    if (i + 5 < REGION_CITIES.length) await new Promise((r) => setTimeout(r, 1100));
+  }
+  return [...byId.values()];
+}
+
 router.get('/shipping-points/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
+    const { companyId } = req.params;
+    const cached = pointsCache.get(companyId);
+    if (cached && Date.now() - cached.at < POINTS_TTL_MS) return res.json(cached.points);
     const token = await withTenantContext({ warehouseId },
-      (client) => credentials.tokenFor(client, warehouseId, req.params.companyId, 'wb'));
-    res.json(await wb.shippingPoints(token, { city: 'Москва', cargoType: 1 }));
+      (client) => credentials.tokenFor(client, warehouseId, companyId, 'wb'));
+    const points = await regionPoints(token);
+    pointsCache.set(companyId, { at: Date.now(), points });
+    res.json(points);
   } catch (err) { next(err); }
 });
 
