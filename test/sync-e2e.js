@@ -175,8 +175,10 @@ async function api(method, path, { token, body } = {}) {
       token: syncToken,
       body: { records: [{ externalId: 'p-guid-unassigned', sku: 'SKU-U', name: 'Unassigned first' }] },
     });
-    check('new 1C product without a seller is quarantined instead of assigned to a made-up company', () => {
-      assert.equal(unassignedProduct.body.results[0].status, 'skipped_unmapped_company', JSON.stringify(unassignedProduct.body));
+    // Заводится без владельца, а не пропускается: иначе документ с контрагентом
+    // потом не найдёт карточку, и товар не доедет до продавца никогда.
+    check('new 1C product without a seller is created ownerless, never assigned to a made-up company', () => {
+      assert.equal(unassignedProduct.body.results[0].status, 'created', JSON.stringify(unassignedProduct.body));
     });
 
     const rejectedFallback = await api('POST', '/api/sync/push/products', {
@@ -198,8 +200,9 @@ async function api(method, path, { token, body } = {}) {
         sku: 'SKU-U', name: 'Assigned product',
       }] },
     });
-    check('mapped 1C product is created for the explicit seller', () => {
-      assert.equal(assignedProduct.body.results[0].status, 'created', JSON.stringify(assignedProduct.body));
+    // Та же карточка без владельца получает продавца, как только 1С его назвала.
+    check('ownerless 1C product is assigned to the explicit seller', () => {
+      assert.equal(assignedProduct.body.results[0].status, 'updated', JSON.stringify(assignedProduct.body));
     });
 
     const zeroStock = await api('POST', '/api/sync/push/stock', {

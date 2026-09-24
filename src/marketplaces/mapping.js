@@ -186,4 +186,45 @@ async function remove(client, warehouseId, id) {
   return { removed: r.rowCount };
 }
 
-module.exports = { list, unresolved, searchProducts, save, remove };
+// Связать заказы с товарами самим, по штрихкоду.
+//
+// Заказ WB приезжает со штрихкодом товара. Если у продавца ровно один товар с
+// этим штрихкодом — в карточке или в хвосте названия, как его пишут в 1С
+// («…(70 шт. в коробке) 2043570160956»), — связь однозначна, и ждать, пока
+// человек заведёт матрицу руками, незачем. У нового продавца без матрицы
+// (Авезов, 24.09.2026) все 269 заказов висели «несопоставленными», и
+// «заказано» у него было ноль. Два товара с одним штрихкодом — не угадываем.
+async function autoLink(client, warehouseId, companyId, marketplace = 'wb') {
+  const pending = await client.query(
+    `SELECT ii.mp_barcode, max(ii.mp_article) AS mp_article, max(ii.mp_nm_id::text) AS mp_nm_id
+       FROM invoices i
+       JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.source = $3
+        AND i.direction = 'out' AND i.supply_id IS NULL AND i.status <> 'shipped'
+        AND i.mp_closed_at IS NULL AND NULLIF(btrim(ii.mp_barcode), '') IS NOT NULL
+        AND ${UNMAPPED}
+      GROUP BY ii.mp_barcode`,
+    [warehouseId, companyId, marketplace],
+  );
+  let linked = 0;
+  let fixedOrders = 0;
+  for (const row of pending.rows) {
+    const code = row.mp_barcode.trim();
+    const found = await client.query(
+      `SELECT sku FROM products
+        WHERE warehouse_id = $1 AND company_id = $2 AND active
+          AND (btrim(barcode) = $3 OR substring(name from '([0-9]{8,14})[[:space:]]*$') = $3)`,
+      [warehouseId, companyId, code],
+    );
+    if (found.rows.length !== 1) continue;
+    const saved = await save(client, warehouseId, {
+      companyId, marketplace, sku: found.rows[0].sku,
+      mpSku: row.mp_nm_id, mpArticle: row.mp_article, mpBarcode: code,
+    });
+    linked += 1;
+    fixedOrders += saved.fixedOrders;
+  }
+  return { linked, fixedOrders };
+}
+
+module.exports = { list, unresolved, searchProducts, save, remove, autoLink };

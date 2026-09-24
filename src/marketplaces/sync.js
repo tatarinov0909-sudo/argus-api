@@ -1,6 +1,7 @@
 const wb = require('./wb');
 const credentials = require('./credentials');
 const statuses = require('./statuses');
+const mapping = require('./mapping');
 
 // Забрать заказы с площадки и превратить их в накладные склада.
 //
@@ -93,7 +94,9 @@ async function pullWildberries(client, warehouseId, { companyId }) {
   const orders = await wb.newOrders(token);
   await credentials.markUsed(client, warehouseId, companyId, 'wb');
   const imported = await importOrders(client, warehouseId, { companyId, orders });
-  return { ...imported, statuses: await statuses.reconcile(client, warehouseId, companyId, token) };
+  // Чего нет в матрице, связываем по штрихкоду — и новое, и зависшее раньше.
+  const autoLinked = await mapping.autoLink(client, warehouseId, companyId, 'wb');
+  return { ...imported, autoLinked, statuses: await statuses.reconcile(client, warehouseId, companyId, token) };
 }
 
 // Сохранение заказов отдельно от их получения.

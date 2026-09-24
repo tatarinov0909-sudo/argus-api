@@ -183,6 +183,41 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(missing.status, 404, JSON.stringify(missing.body));
     });
 
+    // ---------- Связь по штрихкоду: без матрицы, для любого продавца ----------
+    // Штрихкод записан в хвосте названия, как у Авезова в 1С; второй товар —
+    // двойник по штрихкоду, его угадывать нельзя.
+    const other = await api('POST', '/api/sellers/companies', { token, body: { name: 'Авезов' } });
+    await api('POST', '/api/products', { token, body: { companyId: other.body.id, sku: 'AV-1',
+      name: 'Набор резинок фиолетовый (70 шт. в коробке)  2043570160956' } });
+    await api('POST', '/api/products', { token, body: { companyId: other.body.id, sku: 'AV-2',
+      name: 'Коврик синий', barcode: '4600000000001' } });
+    await api('POST', '/api/products', { token, body: { companyId: other.body.id, sku: 'AV-3',
+      name: 'Коврик синий, двойник', barcode: '4600000000001' } });
+    const avOrder = async (number, barcode, article) => {
+      const inv = await api('POST', '/api/invoices', { token, body: { companyId: other.body.id, number,
+        direction: 'out', items: [{ name: 'Не сопоставлен с номенклатурой', sku: article, declaredQty: 1 }] } });
+      await withTenantContext({ warehouseId }, async (c) => {
+        await c.query(`UPDATE invoices SET source = 'wb' WHERE id = $1`, [inv.body.id]);
+        await c.query(`UPDATE invoice_items SET mp_rid = $2, mp_article = $4, mp_barcode = $3
+                        WHERE invoice_id = $1`, [inv.body.id, `rid-${number}`, barcode, article]);
+      });
+      return inv.body.id;
+    };
+    const byName = await avOrder(`WB-A1-${stamp}`, '2043570160956', 'purplehipbands');
+    const twin = await avOrder(`WB-A2-${stamp}`, '4600000000001', 'bluemat');
+    const auto = await withTenantContext({ warehouseId },
+      (c) => require('../src/marketplaces/mapping').autoLink(c, warehouseId, other.body.id));
+    const lineOf = (id) => withTenantContext({ warehouseId }, (c) => c.query(
+      'SELECT sku FROM invoice_items WHERE invoice_id = $1', [id]));
+    const [byNameLine, twinLine] = [await lineOf(byName), await lineOf(twin)];
+    check('заказ WB связался с товаром по штрихкоду из названия, без матрицы', () => {
+      assert.equal(auto.linked, 1, JSON.stringify(auto));
+      assert.equal(byNameLine.rows[0].sku, 'AV-1');
+    });
+    check('два товара с одним штрихкодом — не угадываем', () => {
+      assert.equal(twinLine.rows[0].sku, 'bluemat');
+    });
+
     // ---------- Работнику здесь делать нечего ----------
     const key = await api('POST', '/api/staff', { token, body: { name: 'Грузчик' } });
     const workerToken = (await api('POST', '/api/auth/staff/login',
