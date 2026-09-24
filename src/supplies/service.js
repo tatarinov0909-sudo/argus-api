@@ -532,6 +532,49 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
   };
 }
 
+// Хватит ли товара на полках — видно сразу, при составлении поставки, а не
+// когда грузчик дошёл до пустой ячейки (решение владельца 24.09.2026).
+//
+// Годное в ячейках раздаём по очереди: сперва поставкам, которые уже
+// собираются (старшие первыми), потом заказам в очереди (старшие первыми).
+// Заказ, которому не хватило, помечен. Это оценка по учёту Аргуса: если на
+// полке лежит не то, что в учёте, отметка это не поймает.
+async function stockCover(client, warehouseId, companyId = null) {
+  const stock = new Map();
+  const cells = await client.query(
+    `SELECT company_id, sku, SUM(qty)::numeric AS qty FROM cell_stock
+      WHERE warehouse_id = $1 AND quality = 'good' AND qty > 0
+        AND ($2::uuid IS NULL OR company_id = $2::uuid)
+      GROUP BY company_id, sku`,
+    [warehouseId, companyId],
+  );
+  for (const r of cells.rows) stock.set(`${r.company_id}|${r.sku}`, Number(r.qty));
+  const demand = await client.query(
+    `SELECT s.id AS supply_id, i.id AS invoice_id, i.company_id, ii.sku,
+            ii.declared_qty - COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
+                                         WHERE sr.invoice_item_id = ii.id), 0) AS need
+       FROM supplies s
+       JOIN invoices i ON i.supply_id = s.id
+       JOIN invoice_items ii ON ii.invoice_id = i.id
+      WHERE s.warehouse_id = $1 AND s.status = 'collecting'
+        AND ($2::uuid IS NULL OR i.company_id = $2::uuid)
+      ORDER BY s.created_at, i.number`,
+    [warehouseId, companyId],
+  );
+  const shortInvoices = new Set();
+  const take = (key, need) => {
+    const left = stock.get(key) || 0;
+    if (need <= 0) return true;
+    if (left < need) { stock.set(key, 0); return false; }
+    stock.set(key, left - need);
+    return true;
+  };
+  for (const r of demand.rows) {
+    if (!take(`${r.company_id}|${r.sku}`, Number(r.need))) shortInvoices.add(r.invoice_id);
+  }
+  return { shortInvoices, take };
+}
+
 async function list(client, warehouseId, { status = null, showShortages = false } = {}) {
   // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
   // в запросе роняло его целиком, и человек получал «внутреннюю ошибку»
@@ -571,7 +614,18 @@ async function list(client, warehouseId, { status = null, showShortages = false 
       ORDER BY s.created_at DESC`,
     [warehouseId, status, showShortages === true],
   );
-  return r.rows.map((x) => ({ ...x, statusName: STATUS_NAMES[x.status] }));
+  // Сколько заказов поставки, по учёту, собрать не из чего.
+  const { shortInvoices } = await stockCover(client, warehouseId);
+  const shortBySupply = new Map();
+  if (shortInvoices.size) {
+    const owners = await client.query(
+      'SELECT id, supply_id FROM invoices WHERE id = ANY($1::uuid[])', [[...shortInvoices]]);
+    for (const o of owners.rows) shortBySupply.set(o.supply_id, (shortBySupply.get(o.supply_id) || 0) + 1);
+  }
+  return r.rows.map((x) => ({
+    ...x, statusName: STATUS_NAMES[x.status],
+    stockShort: x.status === 'collecting' ? (shortBySupply.get(x.id) || 0) : 0,
+  }));
 }
 
 // Заказы, которые ещё никуда не уехали, — сгруппированные по продавцам.
@@ -644,6 +698,15 @@ async function pendingOrders(client, warehouseId, companyId) {
       ORDER BY i.created_at DESC, i.number`,
     [warehouseId, companyId],
   );
+  // Товара хватит? Сперва — поставкам, что уже собираются, потом очереди,
+  // старшим заказам первыми: так же склад и будет их собирать.
+  const cover = await stockCover(client, warehouseId, companyId);
+  const stockShort = new Set();
+  const byAge = [...r.rows].sort((a, b) => new Date(a.mp_created_at || a.created_at)
+    - new Date(b.mp_created_at || b.created_at));
+  for (const x of byAge) {
+    if (x.sku && !cover.take(`${companyId}|${x.sku}`, Number(x.declared_qty || 0))) stockShort.add(x.id);
+  }
   return r.rows.map((x) => ({
     id: x.id,
     number: x.number,
@@ -671,6 +734,9 @@ async function pendingOrders(client, warehouseId, companyId) {
     // артикул, которого на складе нет.
     wbConfirmed: Boolean(x.wb_confirmed),
     ready: Boolean(x.pickable) && !x.wb_confirmed,
+    // По учёту на полках не хватит — поставку с таким заказом склад
+    // полностью не соберёт. Решать лучше сейчас, а не у пустой ячейки.
+    stockShort: stockShort.has(x.id),
   }));
 }
 
@@ -846,5 +912,5 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
 }
 
 module.exports = {
-  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, moscowToday, STATUS_NAMES,
+  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, moscowToday, stockCover, STATUS_NAMES,
 };
