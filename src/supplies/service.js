@@ -260,7 +260,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
   // больше не останавливается из-за одного заказа.
 
   const lines = await client.query(
-    `SELECT i.number AS order_number, ii.sku, ii.name, ii.declared_qty,
+    `SELECT i.number AS order_number, ii.id AS item_id, ii.sku, ii.name, ii.declared_qty,
             ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id,
             m.photo_url, st.part_a AS sticker_head, st.part_b AS sticker_tail,
             -- Сколько по строке уже снято с полки и закрыта ли она. Лист
@@ -270,7 +270,13 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
             COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
                        WHERE sr.invoice_item_id = ii.id), 0) AS picked,
             EXISTS (SELECT 1 FROM shipping_records sr2
-                     WHERE sr2.invoice_item_id = ii.id AND sr2.is_final) AS picked_closed
+                     WHERE sr2.invoice_item_id = ii.id AND sr2.is_final) AS picked_closed,
+            -- Грузчик отметил «нет товара», руководитель ещё не решил: при
+            -- сборке по товару к этой позиции не возвращаемся.
+            EXISTS (SELECT 1 FROM journal_entries je
+                     WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
+                       AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
+                       AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS missing_marked
        FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
        -- Фото товара с площадки: по нему кладовщик узнаёт товар на полке
        -- быстрее, чем по названию. Нет фото — колонки на листе просто нет.
@@ -314,6 +320,10 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
 
   const packing = lines.rows.map((l) => ({
     orderNumber: l.order_number,
+    // Для сборки по товару: какая это позиция и сколько по ней осталось.
+    itemId: l.item_id,
+    left: remainingOf(l),
+    missing: l.missing_marked,
     sku: l.sku,
     name: l.name,
     article: l.mp_article,

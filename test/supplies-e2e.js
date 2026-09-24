@@ -294,16 +294,30 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.deepEqual(badQty, [400, 400, 400, 409]);
     });
 
-    for (const orderId of [o1, o2, o3]) {
-      const full = await api('GET', `/api/invoices/${orderId}`, { token: ownerToken });
-      const item = full.body.items[0];
-      const from = item.sku === 'PB-A' ? far : near;
-      const picked = await api('POST', '/api/shipping', {
-        token: workerToken,
-        body: { invoiceItemId: item.id, pickedQty: Number(item.declared_qty), cellBlockId: from.id },
-      });
-      assert.equal(picked.status, 201, JSON.stringify(picked.body));
-    }
+    // По товару: PB-A нужен двум заказам — берут сразу две штуки за один
+    // подход к ячейке, Аргус сам раскладывает их по заказам.
+    const tooMuch = await api('POST', '/api/shipping/product', {
+      token: workerToken, body: { supplyId, sku: 'PB-A', cellBlockId: far.id, pickedQty: 3 },
+    });
+    const byProduct = await api('POST', '/api/shipping/product', {
+      token: workerToken, body: { supplyId, sku: 'PB-A', cellBlockId: far.id, pickedQty: 2 },
+    });
+    const afterProduct = await Promise.all([o1, o2].map((id) => api('GET', `/api/invoices/${id}`, { token: ownerToken })));
+    check('по товару нельзя взять больше, чем нужно поставке', () => {
+      assert.equal(tooMuch.status, 409, JSON.stringify(tooMuch.body));
+    });
+    check('по товару: две штуки за раз закрыли оба заказа', () => {
+      assert.equal(byProduct.status, 201, JSON.stringify(byProduct.body));
+      assert.equal(byProduct.body.orders, 2);
+      assert.deepEqual(afterProduct.map((r) => r.body.status), ['ready', 'ready']);
+    });
+
+    const o3Full = await api('GET', `/api/invoices/${o3}`, { token: ownerToken });
+    const o3Picked = await api('POST', '/api/shipping', {
+      token: workerToken,
+      body: { invoiceItemId: o3Full.body.items[0].id, pickedQty: Number(o3Full.body.items[0].declared_qty), cellBlockId: near.id },
+    });
+    assert.equal(o3Picked.status, 201, JSON.stringify(o3Picked.body));
 
     const ready = (await api('GET', '/api/supplies', { token: ownerToken })).body.find((x) => x.id === supplyId);
     check('собран последний заказ — поставка сама стала собранной, со временем', () => {
