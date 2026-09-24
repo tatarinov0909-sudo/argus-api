@@ -50,6 +50,10 @@ async function listEntries(client, warehouseId, {
     `SELECT je.*,
             EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
             i.number AS invoice_number,
+            i.direction AS invoice_direction,
+            -- Кто именно работал: в кабинете работа грузчика — одна строка с
+            -- его именем, а не «Кладовщик» на каждый товар.
+            sk.name AS actor_name,
             -- Заказ сейчас в поставке? Тогда у отметки «нет товара» есть
             -- решение «убрать заказ из поставки», а вся сборка этой поставки
             -- собирается в кабинете в одну запись вместо строки на каждый товар.
@@ -66,6 +70,7 @@ async function listEntries(client, warehouseId, {
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id
      LEFT JOIN supplies s ON s.id = i.supply_id
+     LEFT JOIN staff_keys sk ON sk.id = je.actor_id AND je.actor_type IN ('worker', 'manager')
      LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
      LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE je.warehouse_id = $1
