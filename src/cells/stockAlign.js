@@ -14,8 +14,9 @@
 //      наш товар» заводится сама, и заказы перестают висеть несопоставленными.
 //   3. Ячейки Аргуса выравниваются по документу: в одной ячейке — ставим
 //      число из документа; в нескольких — разницу снимаем с самой полной или
-//      добавляем в неё; товара нет ни в одной — кладём в свободную рядом с
-//      товаром продавца (подсказка Кладовщика), такой адрес надо проверить.
+//      добавляем в неё; товара нет ни в одной — по выбору владельца кладём в
+//      свободную рядом с товаром продавца (подсказка Кладовщика), такой адрес
+//      надо проверить на полке.
 //
 // Сначала всегда показываем, что изменится (apply: false), и только потом
 // пишем. В 1С ничего не уходит: документ и так из неё.
@@ -124,7 +125,12 @@ async function cellsOf(client, companyId, sku) {
   )).rows;
 }
 
-async function run(client, warehouseId, { companyId, grid, apply = false, source = 'документ' }, actor = {}) {
+// placeNew — товар, которого нет ни в одной ячейке, класть в свободную ячейку
+// по подсказке. По умолчанию нет: у продавца, чей товар ещё не разложен по
+// ячейкам Аргуса, выдуманный адрес отправит грузчика к пустой полке.
+async function run(client, warehouseId, {
+  companyId, grid, apply = false, source = 'документ', placeNew = false,
+}, actor = {}) {
   if (!companyId) throw new HttpError(400, 'Выберите продавца');
   const company = (await client.query(
     'SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
@@ -133,13 +139,15 @@ async function run(client, warehouseId, { companyId, grid, apply = false, source
   if (!company) throw new HttpError(404, 'Продавец не найден');
   const records = parseStockSheet(grid);
 
-  // Собранное, но не уехавшее уже снято с полки: выравнивание по документу
-  // задвоило бы его. Сначала «Уехала» или разбор поставки.
-  const staged = (await client.query(
-    `SELECT count(*)::int AS n FROM shipping_records sr
+  // Собранное, но не уехавшее уже снято с полки, а документ 1С его ещё
+  // числит (реализация проводится при отгрузке). Для ячеек цель — документ
+  // минус собранное: иначе штуки задвоятся.
+  const stagedBySku = new Map((await client.query(
+    `SELECT ii.sku, SUM(sr.picked_qty)::numeric AS qty FROM shipping_records sr
        JOIN invoice_items ii ON ii.id = sr.invoice_item_id
        JOIN invoices i ON i.id = ii.invoice_id
-      WHERE sr.company_id = $1 AND i.status NOT IN ('shipped')`, [companyId])).rows[0].n;
+      WHERE sr.company_id = $1 AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
+      GROUP BY ii.sku`, [companyId])).rows.map((r) => [r.sku, Number(r.qty)]));
 
   // Кладовщик и обмен 1С тянут за собой много модулей — берём, когда нужны.
   const kladovshchik = require('../agents/kladovshchik');
@@ -189,9 +197,12 @@ async function run(client, warehouseId, { companyId, grid, apply = false, source
 
     const cells = await cellsOf(client, companyId, product.sku);
     const current = cells.reduce((sum, c) => sum + Number(c.qty), 0);
+    const staged = stagedBySku.get(product.sku) || 0;
+    const target = Math.max(0, rec.qty - staged);
     line.inCells = current;
-    line.change = rec.qty - current;
-    if (line.change === 0 || staged) continue;
+    line.staged = staged;
+    line.change = target - current;
+    if (line.change === 0) continue;
     const label = (c) => formatBlockLabel(c.row_num, c);
     if (line.change > 0) {
       if (cells.length) {
@@ -200,16 +211,20 @@ async function run(client, warehouseId, { companyId, grid, apply = false, source
           await client.query('UPDATE cell_stock SET qty = qty + $2, updated_at = now() WHERE id = $1', [cells[0].id, line.change]);
           touched.add(cells[0].cell_block_id);
         }
+      } else if (!placeNew) {
+        line.note = 'нет ни в одной ячейке — не тронуто: разложите приёмкой или загрузкой по ячейкам';
+        line.change = 0;
+        continue;
       } else {
         const options = await kladovshchik.suggestCells(client, warehouseId, product.sku, companyId, 20);
         const place = options.find((o) => !usedCells.has(o.blockId));
         if (!place) { line.note = 'нет свободной ячейки'; continue; }
         usedCells.add(place.blockId);
-        line.note = `${rec.qty} шт. в свободную ${place.label} — проверьте на полке`;
+        line.note = `${target} шт. в свободную ${place.label} — проверьте на полке`;
         if (apply) {
           await client.query(
             `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty) VALUES ($1, $2, $3, $4, $5)`,
-            [place.blockId, warehouseId, companyId, product.sku, rec.qty]);
+            [place.blockId, warehouseId, companyId, product.sku, target]);
           touched.add(place.blockId);
         }
       }
@@ -236,7 +251,7 @@ async function run(client, warehouseId, { companyId, grid, apply = false, source
         `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, details)
          VALUES ($1, $2, 'document_align', $3, $4, $5)`,
         [warehouseId, companyId, product.sku, Math.abs(line.change),
-          JSON.stringify({ source, before: current, after: rec.qty })]);
+          JSON.stringify({ source, before: current, after: target, document: rec.qty, staged })]);
     }
   }
 
@@ -249,11 +264,8 @@ async function run(client, warehouseId, { companyId, grid, apply = false, source
     added,
     removed,
     notFound: lines.filter((l) => !l.sku).length,
-    // Выравнивать нельзя, пока есть собранное, но не уехавшее.
-    blockedByStaged: staged > 0,
   };
   if (apply) {
-    if (staged) throw new HttpError(409, 'У продавца есть собранное, но не уехавшее — сначала «Уехала» или разберите поставку');
     for (const cell of touched) await refreshCellFill(client, cell);
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик',

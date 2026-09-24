@@ -609,7 +609,7 @@ router.post('/stock-align', requireAuth, requireRole('owner'), async (req, res, 
     const { warehouseId, ownerId } = req.auth;
     const body = req.body || {};
     const out = await withTenantContext({ warehouseId }, (client) => stockAlign.run(client, warehouseId, {
-      companyId: body.companyId, grid: body.grid, apply: body.apply === true,
+      companyId: body.companyId, grid: body.grid, apply: body.apply === true, placeNew: body.placeNew === true,
       source: typeof body.source === 'string' && body.source.trim() ? body.source.trim().slice(0, 120) : 'документ',
     }, { type: 'owner', id: ownerId }));
     res.json(out);
