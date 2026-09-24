@@ -4,16 +4,17 @@
 // напечатанный в листе комплектации, обязаны совпадать буква в букву. Две
 // копии этой логики разъедутся на первой же правке, и работник получит
 // «01-10-015» в одном месте и «1.10.15» в другом.
+//
+// Адрес — «ряд.ярус.ячейка» (решение владельца 24.09.2026): «1.1.2» — первый
+// ряд, первый ярус, вторая ячейка, ровно как на карте склада. Имя ячейки из
+// 1С («01-01-001») не показываем: оно не совпадает с картой, и человек его не
+// понимает. Оно остаётся в базе только для сверки с файлами 1С.
 function formatBlockLabel(rowNum, block) {
-  // Если у ячейки есть собственное имя — оно и есть ответ. На стеллаже висит
-  // «01-10-015», и назвать её «1.15.2» значит заставить работника переводить
-  // наши координаты в то, что он видит глазами.
-  if (block.label) return block.label;
   const rackPart = block.rack_start === block.rack_end
     ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
   const tierPart = block.tier_start === block.tier_end
     ? block.tier_start : `${block.tier_start}–${block.tier_end}`;
-  return `${rowNum}.${rackPart}.${tierPart}`;
+  return `${rowNum}.${tierPart}.${rackPart}`;
 }
 
 module.exports = { formatBlockLabel };

@@ -111,7 +111,7 @@ const { withTenantContext } = require('../src/db/pool');
     const err = (n) => preview.lines.find((l) => l.line === n).error || '';
     check('проверка находит табличку без нулей, наш адрес и штрихкод', () => {
       const l2 = preview.lines.find((l) => l.line === 2);
-      assert.equal(l2.error, null); assert.equal(l2.sku, 'PB-1'); assert.equal(l2.cellLabel, '01-10-015');
+      assert.equal(l2.error, null); assert.equal(l2.sku, 'PB-1'); assert.equal(l2.cellLabel, '1.2.3'); // найдена по табличке, показана адресом «ряд.ярус.ячейка»
       assert.equal(err(3), ''); assert.equal(preview.lines.find((l) => l.line === 3).sku, 'PB-2');
       assert.equal(preview.lines.find((l) => l.line === 4).quality, 'defective');
     });

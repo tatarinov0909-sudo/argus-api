@@ -151,7 +151,7 @@ async function findProducts(client, warehouseId, query) {
       })),
       locations: stock.rows.map((r) => ({
         row: r.row_num,
-        label: r.label || null,
+        label: formatBlockLabel(r.row_num, r),
         rackFrom: r.rack_start, rackTo: r.rack_end,
         tierFrom: r.tier_start, tierTo: r.tier_end,
         qty: Number(r.qty),

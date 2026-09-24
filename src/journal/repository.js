@@ -57,10 +57,11 @@ async function listEntries(client, warehouseId, {
             s.number AS invoice_supply_number,
             CASE WHEN cb.id IS NULL THEN NULL ELSE
               wr.row_num
-              || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
-                             ELSE cb.rack_start || '–' || cb.rack_end END
+              -- «ряд.ярус.ячейка», как на карте склада (см. cells/label.js).
               || '.' || CASE WHEN cb.tier_start = cb.tier_end THEN cb.tier_start::text
                              ELSE cb.tier_start || '–' || cb.tier_end END
+              || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
+                             ELSE cb.rack_start || '–' || cb.rack_end END
             END AS cell_label
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id

@@ -163,6 +163,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       cells.push({
         cellBlockId: r.cell_block_id,
         label: cellLabel(r),
+        route: [Number(r.row_num), Number(r.rack_start), Number(r.tier_start)],
         available: Number(r.available),
         take,
       });
@@ -225,10 +226,12 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
 
   // Порядок строк — по первой ячейке маршрута: лист читается сверху вниз и
   // ведёт работника по складу, а не гоняет туда-обратно.
+  // Ряд, потом ячейка вдоль ряда, потом ярус — порядок шагов по складу.
+  // Строки без ячеек — в конец.
+  const routeOf = (line) => line.cells[0]?.route || [Infinity, 0, 0];
   result.sort((a, b) => {
-    const aFirst = a.cells[0]?.label || 'я';
-    const bFirst = b.cells[0]?.label || 'я';
-    return aFirst.localeCompare(bFirst, 'ru', { numeric: true });
+    const [ra, rb] = [routeOf(a), routeOf(b)];
+    return (ra[0] - rb[0]) || (ra[1] - rb[1]) || (ra[2] - rb[2]);
   });
 
   return {

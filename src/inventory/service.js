@@ -142,7 +142,7 @@ async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
 function cellLabel(r) {
   const rack = r.rack_start === r.rack_end ? r.rack_start : `${r.rack_start}–${r.rack_end}`;
   const tier = r.tier_start === r.tier_end ? r.tier_start : `${r.tier_start}–${r.tier_end}`;
-  return `${r.row_num}.${rack}.${tier}`;
+  return `${r.row_num}.${tier}.${rack}`;
 }
 
 function reasonFor(row) {
