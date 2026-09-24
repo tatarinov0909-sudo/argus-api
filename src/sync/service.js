@@ -691,4 +691,5 @@ module.exports = {
   upsertCounterparties,
   upsertProducts,
   upsertInvoices,
+  claimProductOwnership,
 };

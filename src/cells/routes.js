@@ -8,6 +8,7 @@ const { plural } = require('../journal/plural');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
 const { moveStock } = require('./move');
 const initialStock = require('./initialStock');
+const stockAlign = require('./stockAlign');
 const journal = require('../journal/repository');
 
 const router = express.Router();
@@ -595,6 +596,22 @@ router.post('/initial-stock', requireAuth, requireRole('owner'), async (req, res
     const out = await withTenantContext({ warehouseId }, (client) => (body.apply === true
       ? initialStock.apply(client, warehouseId, body, { ownerId })
       : initialStock.plan(client, warehouseId, body)));
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Сверить остатки продавца с документом (ведомость 1С) и выровнять ячейки.
+// Сначала без записи — что изменится; с apply: true — записать.
+router.post('/stock-align', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId, ownerId } = req.auth;
+    const body = req.body || {};
+    const out = await withTenantContext({ warehouseId }, (client) => stockAlign.run(client, warehouseId, {
+      companyId: body.companyId, grid: body.grid, apply: body.apply === true,
+      source: typeof body.source === 'string' && body.source.trim() ? body.source.trim().slice(0, 120) : 'документ',
+    }, { type: 'owner', id: ownerId }));
     res.json(out);
   } catch (err) {
     next(err);
