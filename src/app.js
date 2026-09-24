@@ -81,6 +81,7 @@ function createApp() {
   app.use('/api/sync', syncRoutes);
   app.use('/api/agents', agentRoutes);
   app.use('/api/alerts', alertRoutes);
+  app.use('/api/acts', require('./acts/routes'));
 
   app.use(errorHandler);
 
