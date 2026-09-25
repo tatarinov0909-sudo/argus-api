@@ -5,6 +5,7 @@ const { randomPart } = require('../middleware/keys');
 const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
+const inbound = require('./inbound');
 
 const { loadStock } = require('./stock');
 const { readPage, loadHistory } = require('./history');
@@ -130,6 +131,34 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
       }));
     });
     res.set('Cache-Control', 'no-store').json(rows);
+  } catch (err) { next(err); }
+});
+
+// Продавец оформляет привоз товара на склад файлом (решение владельца
+// 25.09.2026): без apply — что узнали в файле, с apply — приход «ждёт
+// приёмки» у склада. Продавец — только за себя: компанию берём из его входа.
+// Запись идёт в контексте склада: приход, позиции и запись журнала — это
+// документы склада, а продавцу журнал недоступен по правилам базы.
+router.post('/inbound', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : ((req.body || {}).companyId || req.query.companyId);
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const { warehouseId } = req.auth;
+    const body = req.body || {};
+    const out = await withTenantContext({ warehouseId }, async (c) => {
+      const company = (await c.query(
+        'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL', [companyId, warehouseId],
+      )).rows[0];
+      if (!company) throw new HttpError(404, 'Компания не найдена');
+      return inbound.run(c, {
+        warehouseId, companyId, grid: body.grid, apply: body.apply === true,
+        plannedDate: typeof body.plannedDate === 'string' && body.plannedDate ? body.plannedDate : null,
+        comment: typeof body.comment === 'string' ? body.comment.trim() : '',
+        actor: req.auth.role === 'seller' ? { type: 'seller', id: req.auth.sellerKeyId || null }
+          : { type: req.auth.role, id: req.auth.staffKeyId || req.auth.ownerId || null },
+      });
+    });
+    res.json(out);
   } catch (err) { next(err); }
 });
 

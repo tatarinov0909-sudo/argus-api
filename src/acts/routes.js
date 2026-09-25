@@ -17,16 +17,19 @@ async function warehouseOf(client, warehouseId) {
   return { name: w.name, city: w.city, legalName: w.legal_name };
 }
 
-router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+// Продавец тоже получает акт приёмки — по своему приходу.
+router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     if (!uuid.test(req.params.id)) throw new HttpError(400, 'Некорректный номер прихода');
     const out = await withTenantContext({ warehouseId }, async (c) => {
       const inv = (await c.query(
-        `SELECT i.id, i.number, i.direction, i.status, i.created_at, c.name AS seller
+        `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.company_id, c.name AS seller
            FROM invoices i JOIN companies c ON c.id = i.company_id
           WHERE i.warehouse_id = $1 AND i.id = $2`, [warehouseId, req.params.id])).rows[0];
-      if (!inv) throw new HttpError(404, 'Приход не найден');
+      if (!inv || (req.auth.role === 'seller' && inv.company_id !== req.auth.companyId)) {
+        throw new HttpError(404, 'Приход не найден');
+      }
       if (inv.direction !== 'in') throw new HttpError(400, 'Акт приёмки — только по приходу');
       const items = (await c.query(
         `SELECT ii.sku, ii.name, ii.declared_qty,
