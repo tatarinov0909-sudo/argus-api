@@ -85,7 +85,7 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
       await requireActiveCompany(c, companyId);
       const supplies = (await c.query(
-        `SELECT s.id, s.number, s.status, s.created_at, s.ready_at, s.shipped_at, s.ship_date,
+        `SELECT s.id, s.number, s.status, s.created_at, s.ready_at, s.shipped_at, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_date,
                 s.destination, s.mp_supply_id, s.mp_barcode, s.mp_barcode_file,
                 count(DISTINCT i.id)::int AS orders,
                 COALESCE(sum(ii.declared_qty), 0)::int AS units,

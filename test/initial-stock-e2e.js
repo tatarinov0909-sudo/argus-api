@@ -95,12 +95,12 @@ const { withTenantContext } = require('../src/db/pool');
     const messy = [
       { line: 2, cell: '1-10-15', sku: 'pb-1', qty: '7' },                 // табличка без нулей, артикул строчными
       { line: 3, cell: '1.1.1', sku: '4600000000017', qty: '20' },         // наш адрес, штрихкод
-      { line: 4, cell: '1.1.2', sku: 'PB-2', qty: '3', quality: 'брак' },
-      { line: 5, cell: '1.2.1', sku: 'PB-3', qty: '' },                    // не посчитано — пропуск
-      { line: 6, cell: '1.2.1', sku: 'PB-3', qty: '0' },                   // ноль — пропуск
-      { line: 7, cell: '1.2.1', sku: 'PB-3', qty: '1,5' },
+      { line: 4, cell: '1.2.1', sku: 'PB-2', qty: '3', quality: 'брак' },
+      { line: 5, cell: '1.1.2', sku: 'PB-3', qty: '' },                    // не посчитано — пропуск
+      { line: 6, cell: '1.1.2', sku: 'PB-3', qty: '0' },                   // ноль — пропуск
+      { line: 7, cell: '1.1.2', sku: 'PB-3', qty: '1,5' },
       { line: 8, cell: '09-09-099', sku: 'PB-3', qty: '1' },
-      { line: 9, cell: '1.2.1', sku: 'RIVAL-1', qty: '1' },
+      { line: 9, cell: '1.1.2', sku: 'RIVAL-1', qty: '1' },
       { line: 10, cell: '1.1.1', sku: 'PB-2', qty: '5' },                  // повтор строки 3
       { line: 11, cell: '1.2.2', sku: 'PB-3', qty: '1', seller: 'Чужой продавец' },
       { line: 12, cell: '44927', sku: 'PB-3', qty: '1', cellIsDate: true },
@@ -219,7 +219,7 @@ const { withTenantContext } = require('../src/db/pool');
     check('другой продавец в ту же ячейку — можно', () => assert.equal(rivalLoad.applied, true));
 
     // ---------- Одновременное нажатие ----------
-    const race = [{ cell: '1.2.1', sku: 'PB-3', qty: 5 }];
+    const race = [{ cell: '1.1.2', sku: 'PB-3', qty: 5 }];
     const [a, b] = await Promise.all([
       api('POST', '/api/cells/initial-stock', owner, { companyId: seller, rows: race, apply: true }),
       api('POST', '/api/cells/initial-stock', owner, { companyId: seller, rows: race, apply: true }),
@@ -262,7 +262,7 @@ const { withTenantContext } = require('../src/db/pool');
     // только на свой товар, а не на всю ячейку.
     const raceBatch = [a, b].find((x) => x.body.applied).body.batch;
     must(await api('POST', '/api/cells/initial-stock', owner, {
-      companyId: rival, rows: [{ cell: '1.2.1', sku: 'RIVAL-1', qty: 2 }], apply: true,
+      companyId: rival, rows: [{ cell: '1.1.2', sku: 'RIVAL-1', qty: 2 }], apply: true,
     }));
     const listAfterRival = must(await api('GET', '/api/cells/initial-stock/batches', owner));
     check('чужая загрузка в ту же ячейку не закрывает отмену', () => {
@@ -275,7 +275,7 @@ const { withTenantContext } = require('../src/db/pool');
       [warehouseId, seller, at(2, 1).id],
     ));
     const brakOnTop = must(await api('POST', '/api/cells/initial-stock', owner, {
-      companyId: seller, rows: [{ cell: '1.2.1', sku: 'PB-1', qty: 2, quality: 'брак' }],
+      companyId: seller, rows: [{ cell: '1.1.2', sku: 'PB-1', qty: 2, quality: 'брак' }],
     }));
     check('брак поверх принятого годного того же товара — «уже лежит», а не новые штуки', () => {
       assert.match(brakOnTop.lines[0].error, /уже лежит 10/);
@@ -283,7 +283,7 @@ const { withTenantContext } = require('../src/db/pool');
 
     // Загружается ровно подтверждённое: план поменялся — ничего не пишем.
     const stale = must(await api('POST', '/api/cells/initial-stock', owner, {
-      companyId: seller, rows: [{ cell: '1.3.1', sku: 'PB-3', qty: 1 }], apply: true, expect: { ok: 5, units: 50 },
+      companyId: seller, rows: [{ cell: '1.1.3', sku: 'PB-3', qty: 1 }], apply: true, expect: { ok: 5, units: 50 },
     }));
     const staleStock = (await stockRows()).filter((x) => x.cell_block_id === at(3, 1).id);
     check('если план изменился после проверки — не загружаем, просим посмотреть снова', () => {
@@ -316,7 +316,7 @@ const { withTenantContext } = require('../src/db/pool');
 
     // Сверка частями: уже разложенное учитывается.
     const part2 = must(await api('POST', '/api/cells/initial-stock', owner, {
-      companyId: seller, rows: [{ cell: '1.3.1', sku: 'PB-2', qty: 7 }],
+      companyId: seller, rows: [{ cell: '1.1.3', sku: 'PB-2', qty: 7 }],
     }));
     check('сверка с 1С учитывает уже разложенное: 23 в ячейках + 7 = 30 по 1С', () => {
       assert.equal(part2.summary.ok, 1, JSON.stringify(part2.lines));

@@ -446,6 +446,15 @@ router.post('/product', requireAuth, requireRole('worker'), async (req, res, nex
             AND i.status NOT IN ('shipped') AND i.mp_closed_at IS NULL
             AND NOT EXISTS (SELECT 1 FROM shipping_records sr
                              WHERE sr.invoice_item_id = ii.id AND sr.is_final)
+            -- Позицию с неразобранной отметкой «нет товара» экран грузчика не
+            -- считает, и сюда взятое не кладём: иначе штука уйдёт в заказ,
+            -- который руководитель уберёт из поставки, а тот, ради которого
+            -- её брали, останется несобранным (проверка 25.09.2026). То же
+            -- условие, что у состава поставки (supplies/service.js, missing).
+            AND NOT EXISTS (SELECT 1 FROM journal_entries je
+                             WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
+                               AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
+                               AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id))
           ORDER BY i.number, ii.id`,
         [warehouseId, supplyId, sku],
       )).rows.filter((l) => Number(l.left_qty) > 0);

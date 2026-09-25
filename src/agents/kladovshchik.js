@@ -173,16 +173,19 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
   const options = [];
 
   // 1. Тот же артикул. Не размазывать один товар по складу — работник идёт за
-  //    ним в одно место, а не собирает по всему залу.
+  //    ним в одно место, а не собирает по всему залу. Когда продавец известен —
+  //    только его товар: тот же код у другого продавца — другой товар, и
+  //    класть к нему значит смешать чужое (проверка 25.09.2026).
   const sameSku = await client.query(
     `SELECT DISTINCT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      FROM cell_stock cs
      JOIN cell_blocks cb ON cb.id = cs.cell_block_id
      JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE cs.warehouse_id = $1 AND cs.sku = $2 AND cs.quality = 'good'
+       AND ($4::uuid IS NULL OR cs.company_id = $4)
      ORDER BY wr.row_num, cb.rack_start, cb.tier_start
      LIMIT $3`,
-    [warehouseId, sku, limit],
+    [warehouseId, sku, limit, companyId || null],
   );
   for (const b of sameSku.rows) {
     options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'same_sku' });

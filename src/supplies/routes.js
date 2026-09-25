@@ -58,17 +58,21 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
 // часов и отвечаем на поиск: ?q= — город, адрес или название; без q —
 // сортировочные центры, их и выбирают чаще всего.
 const POINTS_TTL_MS = 6 * 60 * 60 * 1000;
-const pointsCache = new Map(); // companyId → { at, points }
+// Ключ кэша — склад и продавец: по одному продавцу чужой склад получал бы
+// список, взятый ключом этого продавца (проверка 25.09.2026). Пустой ответ
+// WB — сбой, а не «пунктов нет»: его не запоминаем, спросим в следующий раз.
+const pointsCache = new Map(); // `${warehouseId}:${companyId}` → { at, points }
 const POINTS_LIMIT = 40;
 
 async function allPoints(companyId, warehouseId) {
-  const cached = pointsCache.get(companyId);
+  const key = `${warehouseId}:${companyId}`;
+  const cached = pointsCache.get(key);
   if (cached && Date.now() - cached.at < POINTS_TTL_MS) return cached.points;
   const token = await withTenantContext({ warehouseId },
     (client) => credentials.tokenFor(client, warehouseId, companyId, 'wb'));
   const points = await wb.shippingPoints(token, { city: '', cargoType: 1 });
-  pointsCache.set(companyId, { at: Date.now(), points });
-  return points;
+  if (Array.isArray(points) && points.length) pointsCache.set(key, { at: Date.now(), points });
+  return points || [];
 }
 
 router.get('/shipping-points/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {

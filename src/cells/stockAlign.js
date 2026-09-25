@@ -154,25 +154,67 @@ async function run(client, warehouseId, {
   const mapping = require('../marketplaces/mapping');
   const { claimProductOwnership } = require('../sync/service');
 
+  // Артикул, общий у нескольких товаров документа (размеры одной карточки
+  // WB), ни на какой товар однозначно не указывает — по нему не связываем.
+  const productsByArticle = new Map();
+  for (const rec of records) {
+    if (!rec.article) continue;
+    const key = rec.article.toUpperCase();
+    if (!productsByArticle.has(key)) productsByArticle.set(key, new Set());
+    productsByArticle.get(key).add(rec.code || rec.name || '');
+  }
+
+  // Забрать карточку можно только ничью или из архива: у действующего
+  // продавца товар его, даже если штрихкод совпал, — заводской штрихкод у
+  // двух перепродавцов одного товара общий (проверка 25.09.2026).
+  const archived = new Set((await client.query(
+    'SELECT id FROM companies WHERE warehouse_id = $1 AND archived_at IS NOT NULL', [warehouseId],
+  )).rows.map((r) => r.id));
+  const claimable = (p) => !p.company_id || archived.has(p.company_id);
+
+  // Один товар в ведомости бывает несколько раз — по строке на каждый склад
+  // 1С (основной, возвратов). В ячейках он один: складываем строки, иначе
+  // каждая строка выравнивала бы ячейки заново и побеждала последняя.
+  const groups = [];
+  const byProduct = new Map();
+  for (const rec of records) {
+    const found = await findProduct(client, warehouseId, companyId, rec);
+    const id = found.product && found.product.id;
+    if (id && byProduct.has(id)) {
+      const g = byProduct.get(id);
+      g.rec = { ...g.rec, qty: g.rec.qty + rec.qty };
+      g.rows += 1;
+      continue;
+    }
+    const g = { rec, found, rows: 1 };
+    groups.push(g);
+    if (id) byProduct.set(id, g);
+  }
+
   const lines = [];
   const usedCells = new Set();
   const touched = new Set();
   let added = 0;
   let removed = 0;
-  for (const rec of records) {
-    const found = await findProduct(client, warehouseId, companyId, rec);
+  for (const { rec, found, rows } of groups) {
     const line = { ...rec, sku: null, productName: null, by: found.by, owner: null, inCells: 0, change: 0, note: null };
+    if (rows > 1) line.rows = rows;
     lines.push(line);
     if (!found.product) { line.note = 'нет в каталоге Аргуса — придёт с обменом 1С'; continue; }
     let product = found.product;
     line.sku = product.sku;
     line.productName = product.name;
     line.owner = product.company_id === companyId ? 'свой' : product.company_id ? 'другой' : 'без продавца';
+    if (product.company_id !== companyId && !claimable(product)) {
+      line.note = 'товар принадлежит другому продавцу — не тронут';
+      continue;
+    }
 
-    if (apply && (product.company_id !== companyId || found.rows.some((p) => p.company_id !== companyId && p.external_id))) {
+    const copy = found.rows.find((p) => p.company_id !== companyId && p.external_id && claimable(p));
+    if (apply && (product.company_id !== companyId || copy)) {
       // Карточка из обмена 1С — у архива или без владельца — переходит к
       // продавцу, сливаясь с его копией, если она есть.
-      const linked = found.rows.find((p) => p.external_id) || product;
+      const linked = copy || product;
       const claim = await claimProductOwnership(client, warehouseId, companyId,
         { productExternalId: linked.external_id || undefined, sku: linked.sku });
       if (claim.status === 'conflict' || claim.status === 'missing') {
@@ -182,14 +224,19 @@ async function run(client, warehouseId, {
       product = (await client.query('SELECT id, sku, name, company_id, active FROM products WHERE id = $1',
         [claim.productId])).rows[0];
       line.owner = 'привязан';
-    } else if (product.company_id && product.company_id !== companyId) {
-      line.note = 'сейчас у другого продавца — при записи будет проверено';
     }
     if (apply && !product.active) {
       await client.query('UPDATE products SET active = true, updated_at = now() WHERE id = $1', [product.id]);
     }
-    // Артикул документа — артикул продавца на WB: связь заводится сама.
-    if (apply && rec.article && rec.article.toUpperCase() !== product.sku.toUpperCase()) {
+    // Артикул документа — артикул продавца на WB: связь заводится сама, если
+    // он однозначен: не общий у нескольких товаров документа и не связан уже
+    // с другим товаром (чужое решение сверка не переписывает).
+    if (apply && rec.article && rec.article.toUpperCase() !== product.sku.toUpperCase()
+        && productsByArticle.get(rec.article.toUpperCase()).size === 1
+        && (rec.barcode || !(await client.query(
+          `SELECT 1 FROM product_marketplace_skus
+            WHERE company_id = $1 AND marketplace = 'wb' AND upper(mp_article) = upper($2) AND sku <> $3 LIMIT 1`,
+          [companyId, rec.article, product.sku])).rows.length)) {
       await mapping.save(client, warehouseId, {
         companyId, marketplace: 'wb', sku: product.sku, mpArticle: rec.article, mpBarcode: rec.barcode || null,
       }).catch(() => null);
@@ -257,7 +304,8 @@ async function run(client, warehouseId, {
 
   const summary = {
     company: company.name,
-    records: records.length,
+    records: groups.length,
+    documentRows: records.length,
     documentTotal: records.reduce((s, r) => s + r.qty, 0),
     cellsTotal: lines.reduce((s, l) => s + l.inCells, 0),
     changed: lines.filter((l) => l.change !== 0 && l.sku).length,
@@ -269,7 +317,7 @@ async function run(client, warehouseId, {
     for (const cell of touched) await refreshCellFill(client, cell);
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик',
-      actionText: `Остатки «${company.name}» сверены с документом «${source}»: товаров ${records.length}, `
+      actionText: `Остатки «${company.name}» сверены с документом «${source}»: товаров ${groups.length}, `
         + `изменено ${summary.changed} (+${added} / −${removed} шт.), не найдено в каталоге ${summary.notFound}. В 1С ничего не отправлялось.`,
       entityType: 'company', entityId: companyId,
       actorType: actor.type || 'owner', actorId: actor.id || null,

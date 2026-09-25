@@ -125,16 +125,29 @@ async function save(client, warehouseId, {
     throw new HttpError(404, `Артикула «${sku}» нет в номенклатуре этого продавца`);
   }
 
-  // Один артикул площадки ведёт ровно к одному нашему товару. Старую связь
-  // убираем, а не оставляем рядом: две связи на один артикул означают, что
+  // Один ключ площадки ведёт ровно к одному нашему товару. Старую связь
+  // убираем, а не оставляем рядом: две связи на один ключ означают, что
   // собирать заказ придётся угадывая.
+  //
+  // Штрихкод — ключ размера, номер карточки и артикул — ключ всей карточки,
+  // а в карточке WB бывает несколько размеров, и на складе каждый — свой
+  // товар. Связь со штрихкодом заменяет только связь того же штрихкода:
+  // иначе связь размера M стёрла бы связь размера S той же карточки, и
+  // заказ на M собрали бы как S (проверка 25.09.2026). Номер и артикул в
+  // такой связи — справка; две связи с общим номером обмен сам считает
+  // неоднозначными и узнаёт заказ по штрихкоду.
+  const bySize = Boolean(mpBarcode);
   await client.query(
-    `DELETE FROM product_marketplace_skus
-      WHERE warehouse_id = $1 AND marketplace = $2 AND company_id = $5
-        AND ((mp_article IS NOT NULL AND mp_article = $3)
-          OR (mp_sku IS NOT NULL AND mp_sku = $4)
-          OR (mp_barcode IS NOT NULL AND mp_barcode = $6))`,
-    [warehouseId, marketplace, mpArticle || null, mpSku || null, companyId, mpBarcode || null],
+    bySize
+      ? `DELETE FROM product_marketplace_skus
+          WHERE warehouse_id = $1 AND marketplace = $2 AND company_id = $3 AND mp_barcode = $4`
+      : `DELETE FROM product_marketplace_skus
+          WHERE warehouse_id = $1 AND marketplace = $2 AND company_id = $5
+            AND ((mp_article IS NOT NULL AND mp_article = $3)
+              OR (mp_sku IS NOT NULL AND mp_sku = $4))`,
+    bySize
+      ? [warehouseId, marketplace, companyId, mpBarcode]
+      : [warehouseId, marketplace, mpArticle || null, mpSku || null, companyId],
   );
   const ins = await client.query(
     `INSERT INTO product_marketplace_skus
@@ -167,9 +180,10 @@ async function save(client, warehouseId, {
         AND i.status <> 'shipped'
         AND i.mp_closed_at IS NULL
         AND ${UNMAPPED}
-        AND (($5::text IS NOT NULL AND (ii.mp_article = $5 OR ii.sku = $5))
-          OR ($6::text IS NOT NULL AND ii.mp_nm_id::text = $6)
-          OR ($7::text IS NOT NULL AND ii.mp_barcode = $7))`,
+        -- Связь размера чинит только заказы этого размера.
+        AND (CASE WHEN $7::text IS NOT NULL THEN ii.mp_barcode = $7
+             ELSE (($5::text IS NOT NULL AND (ii.mp_article = $5 OR ii.sku = $5))
+                OR ($6::text IS NOT NULL AND ii.mp_nm_id::text = $6)) END)`,
     [warehouseId, companyId, sku, product.rows[0].name || sku,
       mpArticle || null, mpSku || null, mpBarcode || null, marketplace],
   );

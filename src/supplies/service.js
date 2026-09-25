@@ -549,6 +549,15 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
 // собираются (старшие первыми), потом заказам в очереди (старшие первыми).
 // Заказ, которому не хватило, помечен. Это оценка по учёту Аргуса: если на
 // полке лежит не то, что в учёте, отметка это не поймает.
+// Сколько по позиции ещё снимать с полки: заказано минус собрано, а у
+// закрытой позиции — ноль. Закрывают и с нехваткой («взяли 3 из 5»), и
+// собранное уже не на полке: иначе и то и другое «съедало» остаток дважды,
+// и склад видел ложное «не хватит товара» (проверка 25.09.2026).
+const LEFT_TO_PICK_SQL = `CASE WHEN EXISTS (SELECT 1 FROM shipping_records sr
+                                         WHERE sr.invoice_item_id = ii.id AND sr.is_final) THEN 0
+     ELSE ii.declared_qty - COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
+                                       WHERE sr.invoice_item_id = ii.id), 0) END`;
+
 async function stockCover(client, warehouseId, companyId = null) {
   const stock = new Map();
   const cells = await client.query(
@@ -561,8 +570,7 @@ async function stockCover(client, warehouseId, companyId = null) {
   for (const r of cells.rows) stock.set(`${r.company_id}|${r.sku}`, Number(r.qty));
   const demand = await client.query(
     `SELECT s.id AS supply_id, i.id AS invoice_id, i.company_id, ii.sku,
-            ii.declared_qty - COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
-                                         WHERE sr.invoice_item_id = ii.id), 0) AS need
+            ${LEFT_TO_PICK_SQL} AS need
        FROM supplies s
        JOIN invoices i ON i.supply_id = s.id
        JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -695,6 +703,7 @@ async function pendingOrders(client, warehouseId, companyId) {
             i.mp_created_at, i.mp_offices, i.mp_sale_price_kopecks,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
             ii.mp_nm_id, ii.mp_rid,
+            CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
             ${WB_CONFIRMED_SQL} AS wb_confirmed
        FROM invoices i
@@ -715,7 +724,7 @@ async function pendingOrders(client, warehouseId, companyId) {
   const byAge = [...r.rows].sort((a, b) => new Date(a.mp_created_at || a.created_at)
     - new Date(b.mp_created_at || b.created_at));
   for (const x of byAge) {
-    if (x.sku && !cover.take(`${companyId}|${x.sku}`, Number(x.declared_qty || 0))) stockShort.add(x.id);
+    if (x.sku && !cover.take(`${companyId}|${x.sku}`, Number(x.left_to_pick || 0))) stockShort.add(x.id);
   }
   return r.rows.map((x) => ({
     id: x.id,
