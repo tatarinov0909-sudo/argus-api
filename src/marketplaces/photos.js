@@ -72,7 +72,8 @@ async function syncPhotos(client, warehouseId, companyId, { fetchPage = wb.produ
 // ближайшего по номеру уже найденного и идём в обе стороны. 9 сентября
 // перебрали только 23 сервера и решили, что фото так не взять, — у «Слим Тим»
 // есть карточки и на 41-м.
-const BASKETS = 80;
+// Сейчас их за сорок; запас на рост — чтобы не повторить ошибку 9 сентября.
+const BASKETS = 99;
 const knownBaskets = new Map(); // vol → номер сервера, общий на процесс
 
 const publicUrl = (nm, basket) => `https://basket-${String(basket).padStart(2, '0')}.wbbasket.ru`

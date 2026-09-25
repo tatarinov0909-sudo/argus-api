@@ -525,6 +525,23 @@ router.patch('/companies/:companyId/archive', requireAuth, requireGrant('clients
       throw new HttpError(400, 'Передайте archived: true или false');
     }
     const company = await withTenantContext({ warehouseId }, async (client) => {
+      // В архиве продавец пропадает со всех экранов — вместе с его поставками.
+      // Если по поставке товар уже снят с полок, он исчез бы из учёта: ни на
+      // полке, ни в отгрузке. Так висела ПС-0909-01 архивной компании
+      // (разобрана 26.09). Сначала поставку отгружают или разбирают.
+      if (req.body.archived) {
+        const busy = (await client.query(
+          `SELECT DISTINCT s.number FROM supplies s
+             JOIN invoices i ON i.supply_id = s.id
+             JOIN invoice_items ii ON ii.invoice_id = i.id
+             JOIN shipping_records sr ON sr.invoice_item_id = ii.id AND sr.picked_qty > 0
+            WHERE s.warehouse_id = $1 AND s.company_id = $2 AND s.status IN ('collecting', 'ready')
+            ORDER BY s.number`, [warehouseId, companyId])).rows.map((r) => r.number);
+        if (busy.length) {
+          throw new HttpError(409, `У продавца есть поставки, товар по которым уже снят с полок: ${busy.join(', ')}. `
+            + 'Сначала отметьте их «Уехала» или верните товар в ячейки.');
+        }
+      }
       const result = await client.query(
         `UPDATE companies
             SET archived_at = CASE WHEN $3 THEN COALESCE(archived_at, now()) ELSE NULL END,

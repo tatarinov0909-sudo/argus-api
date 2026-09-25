@@ -32,7 +32,7 @@ const { withTenantContext } = require('../src/db/pool');
     const warehouseId = JSON.parse(Buffer.from(owner.split('.')[1], 'base64url')).warehouseId;
     const run = (fn) => withTenantContext({ warehouseId }, fn);
     const company = must(await api('POST', '/api/sellers/companies', owner, { name: 'Слим Тест' }), 201).id;
-    for (const [sku, name] of [['PB-1', 'Батончик'], ['PB-2', 'Паста'], ['PB-3', 'Хлебцы']]) {
+    for (const [sku, name] of [['PB-1', 'Батончик'], ['PB-2', 'Паста'], ['PB-3', 'Хлебцы'], ['PB-4', 'Лимонад']]) {
       must(await api('POST', '/api/products', owner, { sku, name, companyId: company }), 201);
     }
     must(await api('POST', '/api/cells/rows', owner, { configs: [{ rackCount: 3, tierCount: 1 }] }), 201);
@@ -48,9 +48,13 @@ const { withTenantContext } = require('../src/db/pool');
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[1].id, acceptedQty: 2, cellBlockId: cells[1].id }), 201);
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[2].id, acceptedQty: 5, cellBlockId: cells[2].id }), 201);
 
-    // Два заказа WB в одной поставке: батончик 3 (2 + 1), паста 2, хлебцы 1.
+    // Хлебцы — набор из пасты: на полке его нет, пока не собрали.
+    await run((c) => c.query(
+      `INSERT INTO product_kits (warehouse_id, company_id, kit_sku, component_sku, qty) VALUES ($1, $2, 'PB-3', 'PB-2', 1)`,
+      [warehouseId, company]));
+    // Два заказа WB в одной поставке: батончик 3 (2 + 1), паста 2, хлебцы 1, лимонад 1.
     const orders = [];
-    for (const [n, items] of [['WB-1', [['PB-1', 'Батончик', 2], ['PB-2', 'Паста', 2]]], ['WB-2', [['PB-1', 'Батончик', 1], ['PB-3', 'Хлебцы', 1]]]]) {
+    for (const [n, items] of [['WB-1', [['PB-1', 'Батончик', 2], ['PB-2', 'Паста', 2]]], ['WB-2', [['PB-1', 'Батончик', 1], ['PB-3', 'Хлебцы', 1], ['PB-4', 'Лимонад', 1]]]]) {
       const o = must(await api('POST', '/api/invoices', owner, { companyId: company, number: n, direction: 'out',
         items: items.map(([sku, name, declaredQty]) => ({ sku, name, declaredQty })) }), 201);
       await run((c) => c.query(`UPDATE invoices SET source = 'wb', external_id = $2 WHERE id = $1`, [o.id, n]));
@@ -67,7 +71,8 @@ const { withTenantContext } = require('../src/db/pool');
       assert.equal(byOwner.status, 403);
     });
 
-    // Пасту не нашёл вовсе; хлебцы «нашёл», но в ячейках Аргуса их нет.
+    // Пасту не нашёл вовсе; набор хлебцев не собран; лимонад «нашёл», но в
+    // ячейках Аргуса его нет.
     const startedAt = new Date(Date.now() - 12 * 60000).toISOString();
     const done = must(await api('POST', '/api/shipping/paper/finish', worker, {
       supplyId: supply.id, startedAt, pausedMs: 0, notFound: [{ sku: 'PB-2', found: 0 }],
@@ -76,7 +81,8 @@ const { withTenantContext } = require('../src/db/pool');
     check('найденное записано отбором из ячеек по обходу, ненайденное — отметкой', () => {
       assert.equal(bySku['PB-1'].taken, 3);
       assert.equal(bySku['PB-2'].taken, 0); assert.equal(bySku['PB-2'].missing, 2);
-      assert.equal(bySku['PB-3'].taken, 0); assert.equal(bySku['PB-3'].noCells, true);
+      assert.equal(bySku['PB-3'].taken, 0); assert.equal(bySku['PB-3'].kit, true);
+      assert.equal(bySku['PB-4'].taken, 0); assert.equal(bySku['PB-4'].noCells, true); assert.equal(bySku['PB-4'].kit, false);
       assert.equal(done.minutes, 12);
     });
     const stock = await run((c) => c.query(
@@ -90,10 +96,11 @@ const { withTenantContext } = require('../src/db/pool');
       [warehouseId],
     ));
     const journal = must(await api('GET', '/api/journal', owner)).map((e) => e.action_text).join('\n');
-    check('руководителю: «нет товара» по пасте и хлебцам, итог по листу с временем', () => {
-      assert.equal(urgent.rows.length, 2);
+    check('руководителю: «нет товара» по пасте, набору и лимонаду — каждое своими словами; итог с временем', () => {
+      assert.equal(urgent.rows.length, 3);
       assert.ok(urgent.rows.every((r) => /по бумажному листу/.test(r.action_text)));
-      assert.ok(urgent.rows.some((r) => /Хлебцы.*в ячейках Аргуса его нет/.test(r.action_text)));
+      assert.ok(urgent.rows.some((r) => /Хлебцы.*набор не собран из компонентов/.test(r.action_text)));
+      assert.ok(urgent.rows.some((r) => /Лимонад.*в ячейках Аргуса его нет/.test(r.action_text)));
       assert.match(journal, /начал сборку поставки «ПС-\d{6}-\d{2}» по бумажному листу/);
       assert.match(journal, /собрал поставку «ПС-\d{6}-\d{2}» по бумажному листу за 12 мин: взято 3 шт\. Не нашёл: «Паста» — 2 шт\./);
     });
@@ -103,6 +110,14 @@ const { withTenantContext } = require('../src/db/pool');
     check('второй «собрал по листу» — нечего собирать; кривая отметка — 400', () => {
       assert.equal(again.status, 409);
       assert.equal(badMark.status, 400);
+    });
+
+    // Продавца с поставкой, где товар уже снят с полок, в архив не убрать:
+    // товар пропал бы из учёта вместе с невидимой поставкой.
+    const archive = await api('PATCH', `/api/sellers/companies/${company}/archive`, owner, { archived: true });
+    check('в архив не убрать продавца, пока его собранный товар в поставке', () => {
+      assert.equal(archive.status, 409);
+      assert.match(archive.body.error, /ПС-\d{6}-\d{2}/);
     });
 
     console.log(`\n${passed} checks passed`);

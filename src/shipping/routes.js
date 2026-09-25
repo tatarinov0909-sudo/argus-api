@@ -8,6 +8,7 @@ const outbox = require('../sync/outbox');
 const { requireQty } = require('../middleware/qty');
 const { refreshSupplyStatus, lockSupplyOfInvoice } = require('../supplies/state');
 const { buildPickList, parseInvoiceIds } = require('./pickList');
+const { kitSkusAmong } = require('../kits/kits');
 
 const router = express.Router();
 
@@ -568,6 +569,9 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
         bySku.set(l.sku, it);
       }
       if (!bySku.size) throw new HttpError(409, `По поставке «${s.number}» собирать больше нечего`);
+      // Набор, которого нет в ячейках, — не пропажа: его не собрали из
+      // компонентов. Руководителю так и пишем, а не «грузчик нашёл, но нет».
+      const kits = await kitSkusAmong(client, warehouseId, [...bySku.keys()]);
       const report = [];
       let firstPick = true;
       for (const it of bySku.values()) {
@@ -609,11 +613,13 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
           const part = Math.min(short, Number(l.left_qty));
           await markMissing(client, warehouseId, staffKeyId, {
             invoiceItemId: l.id, qty: part, how: 'по бумажному листу',
-            note: noCells ? 'грузчик нашёл товар, но в ячейках Аргуса его нет' : '',
+            note: !noCells ? ''
+              : kits.has(it.sku) ? 'набор не собран из компонентов — собрать можно на экране грузчика'
+                : 'грузчик нашёл товар, но в ячейках Аргуса его нет',
           });
           short -= part;
         }
-        report.push({ sku: it.sku, name: it.name, need: it.need, taken, missing, noCells });
+        report.push({ sku: it.sku, name: it.name, need: it.need, taken, missing, noCells, kit: kits.has(it.sku) });
       }
       const workMs = Number.isNaN(started.getTime()) ? null
         : Date.now() - started.getTime() - pausedMs;
@@ -628,7 +634,7 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
         actionText: `${await workerName(client, staffKeyId)} собрал поставку «${s.number}» по бумажному листу`
           + (minutes ? ` за ${minutes} мин` : '') + `: взято ${takenTotal} шт.`
           + (short.length ? ` Не нашёл: ${short.map((r) => `«${r.name}» — ${r.missing} шт.`
-            + (r.noCells ? ' (нашёл, но в ячейках Аргуса его нет)' : '')).join(', ')}` : ''),
+            + (r.noCells ? (r.kit ? ' (набор не собран из компонентов)' : ' (нашёл, но в ячейках Аргуса его нет)') : '')).join(', ')}` : ''),
         entityType: 'paper_pick',
         entityId: s.id,
         actorType: 'worker',

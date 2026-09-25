@@ -452,6 +452,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
       mpBarcodeFile: head.rows[0].mp_barcode_file,
       destination: head.rows[0].destination,
       shipDate: head.rows[0].ship_day,
+      companyId: head.rows[0].company_id,
       companyName: head.rows[0].company_name,
       createdAt: head.rows[0].created_at,
       readyAt: head.rows[0].ready_at,
