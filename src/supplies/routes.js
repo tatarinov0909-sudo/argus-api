@@ -49,60 +49,42 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
   } catch (err) { next(err); }
 });
 
-// Пункты приёма WB, куда можно везти поставку этого продавца. Только чтение
-// ключом продавца. Москва и Московская область (решения владельца 19.09 и
-// 24.09.2026), товар обычного размера. Станут настройкой склада, когда
-// появится склад в другом регионе.
+// Пункты приёма WB, куда можно везти поставку этого продавца, — все, что WB
+// показывает продавцу в его кабинете (решение владельца 25.09.2026), а не
+// только Москва: без города WB отдаёт весь список, 80 с лишним тысяч пунктов
+// и две сотни сортировочных центров. Только чтение ключом продавца.
 //
-// WB ищет пункты по названию города, а городов в области десятки: запрос
-// «Московская область» отдаёт семь пунктов, «Подольск» — двести с лишним.
-// Поэтому спрашиваем по списку и держим ответ шесть часов: пункты приёма
-// меняются редко, а семьдесят запросов на каждое открытие экрана WB не
-// простит (300 в минуту, всплеск — 20).
-const REGION_CITIES = [
-  'Москва', 'Московская область', 'Балашиха', 'Подольск', 'Химки', 'Мытищи', 'Королёв', 'Люберцы',
-  'Красногорск', 'Электросталь', 'Коломна', 'Одинцово', 'Домодедово', 'Серпухов', 'Щёлково',
-  'Орехово-Зуево', 'Раменское', 'Долгопрудный', 'Жуковский', 'Пушкино', 'Реутов', 'Сергиев Посад',
-  'Воскресенск', 'Лобня', 'Клин', 'Ивантеевка', 'Дубна', 'Егорьевск', 'Чехов', 'Дмитров', 'Видное',
-  'Ступино', 'Павловский Посад', 'Наро-Фоминск', 'Фрязино', 'Лыткарино', 'Дзержинский',
-  'Солнечногорск', 'Истра', 'Котельники', 'Ногинск', 'Электроугли', 'Коледино', 'Белые Столбы',
-  'Апрелевка', 'Бронницы', 'Можайск', 'Волоколамск', 'Кашира', 'Луховицы', 'Зарайск', 'Шатура',
-  'Талдом', 'Руза', 'Звенигород', 'Краснознаменск', 'Старая Купавна', 'Лосино-Петровский',
-  'Черноголовка', 'Электрогорск', 'Куровское', 'Ликино-Дулёво', 'Софрино', 'Красноармейск',
-  'Хотьково', 'Яхрома', 'Кубинка', 'Голицыно', 'Внуково',
-];
+// В браузер весь список не отдаём — это мегабайты. Держим его здесь шесть
+// часов и отвечаем на поиск: ?q= — город, адрес или название; без q —
+// сортировочные центры, их и выбирают чаще всего.
 const POINTS_TTL_MS = 6 * 60 * 60 * 1000;
 const pointsCache = new Map(); // companyId → { at, points }
+const POINTS_LIMIT = 40;
 
-async function regionPoints(token) {
-  const byId = new Map();
-  // По пять городов за раз и секунда паузы: в пределах всплеска WB.
-  for (let i = 0; i < REGION_CITIES.length; i += 5) {
-    const batch = REGION_CITIES.slice(i, i + 5);
-    const lists = await Promise.all(batch.map((city) => wb.shippingPoints(token, { city, cargoType: 1 })
-      .catch((err) => {
-        // Один город не ответил — остальные пункты всё равно нужны. Но ключ
-        // WB не принят — это для всех городов, молчать нельзя.
-        if (err.status === 424 || err.status === 401 || err.status === 403) throw err;
-        return [];
-      })));
-    for (const list of lists) for (const p of list) if (!byId.has(p.id)) byId.set(p.id, p);
-    if (i + 5 < REGION_CITIES.length) await new Promise((r) => setTimeout(r, 1100));
-  }
-  return [...byId.values()];
+async function allPoints(companyId, warehouseId) {
+  const cached = pointsCache.get(companyId);
+  if (cached && Date.now() - cached.at < POINTS_TTL_MS) return cached.points;
+  const token = await withTenantContext({ warehouseId },
+    (client) => credentials.tokenFor(client, warehouseId, companyId, 'wb'));
+  const points = await wb.shippingPoints(token, { city: '', cargoType: 1 });
+  pointsCache.set(companyId, { at: Date.now(), points });
+  return points;
 }
 
 router.get('/shipping-points/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { companyId } = req.params;
-    const cached = pointsCache.get(companyId);
-    if (cached && Date.now() - cached.at < POINTS_TTL_MS) return res.json(cached.points);
-    const token = await withTenantContext({ warehouseId },
-      (client) => credentials.tokenFor(client, warehouseId, companyId, 'wb'));
-    const points = await regionPoints(token);
-    pointsCache.set(companyId, { at: Date.now(), points });
-    res.json(points);
+    const points = await allPoints(req.params.companyId, warehouseId);
+    const words = String(req.query.q || '').toLowerCase().split(/[\s,]+/).filter(Boolean).slice(0, 6);
+    const rank = (p) => (p.officeType === 'sc' ? 0 : p.fulfillment ? 1 : 2);
+    const found = words.length
+      ? points.filter((p) => {
+        const hay = `${p.name || ''} ${p.address || ''} ${p.city || ''}`.toLowerCase();
+        return words.every((w) => hay.includes(w));
+      })
+      : points.filter((p) => p.officeType === 'sc');
+    found.sort((a, b) => rank(a) - rank(b) || String(a.address || '').localeCompare(String(b.address || ''), 'ru'));
+    res.json({ total: found.length, points: found.slice(0, words.length ? POINTS_LIMIT : 300) });
   } catch (err) { next(err); }
 });
 
