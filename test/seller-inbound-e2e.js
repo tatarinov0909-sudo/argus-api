@@ -71,7 +71,7 @@ const { parseInboundSheet } = require('../src/sellers/inbound');
 
     const done = await api('POST', '/api/sellers/inbound', sa, { grid, apply: true, plannedDate: '2026-09-27', comment: 'Газель, 3 короба' });
     assert.equal(done.applied, true);
-    assert.match(done.invoice.number, /^ПР-\d{4}-\d+$/);
+    assert.match(done.invoice.number, /^ПР-\d{6}-\d+$/);
     const again = await api('POST', '/api/sellers/inbound', sa, { grid: [['Артикул', 'Кол-во'], ['ART-3', 4]], apply: true });
     assert.notEqual(again.invoice.number, done.invoice.number);
 

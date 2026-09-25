@@ -85,10 +85,76 @@ async function listEntries(client, warehouseId, {
                        ORDER BY j2.created_at DESC LIMIT $2)
             OR (je.urgent AND je.status = 'pending'
                 AND NOT EXISTS (SELECT 1 FROM journal_entries a2 WHERE a2.related_entry_id = je.id)))
+       -- История ячейки — за последний год: трёхлетний хвост никому не
+       -- нужен на экране (владелец 26.09.2026).
+       AND ($3::uuid IS NULL OR je.created_at > now() - interval '${CELL_HISTORY}')
      ORDER BY je.created_at DESC`,
     [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
-  return result.rows;
+  if (!cellBlockId) return result.rows;
+  const ops = await cellOperations(client, warehouseId, cellBlockId);
+  return [...result.rows, ...ops]
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, limit);
+}
+
+const CELL_HISTORY = '1 year';
+
+// Движения, которые журнал не привязывает к ячейке: загрузка остатков пишет
+// одну запись на весь файл, сборка набора — без места, перестановка —
+// только на ячейку, куда положили. Без них «Что здесь происходило» молчало
+// о том, откуда в ячейке товар и куда он ушёл. Показываем их в истории
+// ячейки такими же строками, как записи журнала.
+async function cellOperations(client, warehouseId, cellBlockId) {
+  const r = await client.query(
+    `SELECT op.id, op.kind, op.sku, op.qty, op.created_at, op.worker_key_id,
+            op.from_cell_block_id, op.to_cell_block_id,
+            p.name, sk.name AS actor_name,
+            wr.row_num || '.' || CASE WHEN cb.tier_start = cb.tier_end THEN cb.tier_start::text
+                                      ELSE cb.tier_start || '–' || cb.tier_end END
+                       || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
+                                      ELSE cb.rack_start || '–' || cb.rack_end END AS to_label
+       FROM stock_operations op
+       LEFT JOIN products p ON p.warehouse_id = op.warehouse_id AND p.company_id = op.company_id AND p.sku = op.sku
+       LEFT JOIN staff_keys sk ON sk.id = op.worker_key_id
+       LEFT JOIN cell_blocks cb ON cb.id = op.to_cell_block_id
+       LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE op.warehouse_id = $1
+        AND op.created_at > now() - interval '${CELL_HISTORY}'
+        AND ((op.kind IN ('initial_load', 'kit_assemble') AND op.to_cell_block_id = $2)
+          OR (op.kind = 'initial_load_undo' AND op.from_cell_block_id = $2)
+          OR (op.kind IN ('move', 'repack') AND op.from_cell_block_id = $2
+              AND op.to_cell_block_id IS DISTINCT FROM $2))
+      ORDER BY op.created_at DESC LIMIT 200`,
+    [warehouseId, cellBlockId],
+  );
+  const qty = (n) => `${Number(n)} шт.`;
+  return r.rows.map((op) => {
+    const what = `«${op.name || op.sku}» (${op.sku})`;
+    const text = {
+      initial_load: `Загрузка остатков: положено ${qty(op.qty)} ${what}.`,
+      initial_load_undo: `Загрузка остатков отменена: снято ${qty(op.qty)} ${what}.`,
+      kit_assemble: `Собран набор ${what} — ${qty(op.qty)}.`,
+      move: `Переложено ${qty(op.qty)} ${what} в ячейку ${op.to_label || '—'}.`,
+      repack: `Перепаковано ${qty(op.qty)} ${what}, положено в ячейку ${op.to_label || '—'}.`,
+    }[op.kind];
+    return {
+      id: `op-${op.id}`,
+      warehouse_id: warehouseId,
+      agent: 'Кладовщик',
+      action_text: text,
+      entity_type: 'stock_operation',
+      entity_id: op.id,
+      actor_type: op.worker_key_id ? 'worker' : 'owner',
+      actor_id: op.worker_key_id,
+      actor_name: op.actor_name,
+      status: 'auto',
+      urgent: false,
+      answered: false,
+      cell_block_id: cellBlockId,
+      created_at: op.created_at,
+    };
+  });
 }
 
 // Сколько позиций поставки уже собрано. Кабинет показывает сборку поставки

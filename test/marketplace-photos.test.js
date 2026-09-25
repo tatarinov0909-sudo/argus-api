@@ -40,3 +40,17 @@ test('incremental bounded cache, rate pacing, 403 backoff, empty catalog and ten
   assert.equal(statements.at(-1).args[1],JSON.stringify({updatedAt:'previous',nmID:1}));assert.equal(statements.at(-1).args[2],30);
   assert.equal((await syncPhotos({query:async()=>({rows:[]})},'w','c')).skipped,true);
 });
+
+test('public WB photo: the server is found by probing, remembered, and nothing is invented', async () => {
+  const { findPublicPhoto } = require('../src/marketplaces/photos');
+  const asked = [];
+  const on41 = async (url) => { asked.push(url); return url.startsWith('https://basket-41.wbbasket.ru/'); };
+  assert.equal(await findPublicPhoto('985393681', { probe: on41 }),
+    'https://basket-41.wbbasket.ru/vol9853/part985393/985393681/images/c246x328/1.webp');
+  // Соседняя карточка того же тома — с первого запроса: сервер запомнен.
+  asked.length = 0;
+  await findPublicPhoto('985393999', { probe: on41 });
+  assert.equal(asked.length, 1);
+  assert.equal(await findPublicPhoto('123', { probe: async () => false }), null);
+  assert.equal(await findPublicPhoto('not-a-number', { probe: async () => true }), null);
+});

@@ -144,79 +144,84 @@ router.post('/missing', requireAuth, requireRole('worker'), async (req, res, nex
     const { invoiceItemId, missingQty, note } = req.body || {};
     if (!invoiceItemId) throw new HttpError(400, 'Нужна позиция заказа');
     const qty = requireQty(missingQty, 'Сколько не хватает', { min: 1 });
-    const comment = typeof note === 'string' ? note.trim().replace(/\s+/g, ' ').slice(0, 300) : '';
-
-    const out = await withTenantContext({ warehouseId }, async (client) => {
-      const pre = await client.query(
-        'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
-        [invoiceItemId, warehouseId],
-      );
-      if (!pre.rows[0]) throw new HttpError(404, 'Позиция заказа не найдена');
-      // Тот же порядок блокировок, что у отбора: поставка, потом заказ.
-      await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
-      const itemResult = await client.query(
-        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.invoice_id,
-                i.number AS invoice_number, i.direction, i.status, i.mp_closed_at, s.number AS supply_number
-           FROM invoice_items ii
-           JOIN invoices i ON i.id = ii.invoice_id
-           JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
-           LEFT JOIN supplies s ON s.id = i.supply_id
-          WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
-        [invoiceItemId, warehouseId],
-      );
-      const item = itemResult.rows[0];
-      if (!item) throw new HttpError(404, 'Позиция заказа не найдена');
-      if (item.direction !== 'out') throw new HttpError(400, 'Это не заказ на отгрузку');
-      if (item.mp_closed_at || item.status === 'shipped') {
-        throw new HttpError(409, 'Заказ уже закрыт — отмечать нечего');
-      }
-      const picked = await client.query(
-        `SELECT COALESCE(SUM(picked_qty), 0) AS picked, COALESCE(BOOL_OR(is_final), false) AS closed
-           FROM shipping_records WHERE invoice_item_id = $1`,
-        [invoiceItemId],
-      );
-      if (picked.rows[0].closed) throw new HttpError(409, 'Эта позиция уже собрана и закрыта');
-      const remaining = Number(item.declared_qty) - Number(picked.rows[0].picked);
-      if (qty > remaining) {
-        throw new HttpError(400, `По позиции осталось собрать ${remaining} шт. — не хватать может не больше`);
-      }
-
-      // Второе нажатие (или та же позиция с другого экрана) — не вторая
-      // тревога: возвращаем уже отправленную, пока по ней не ответили.
-      const open = await client.query(
-        `SELECT je.* FROM journal_entries je
-          WHERE je.warehouse_id = $1 AND je.urgent AND je.status = 'pending'
-            AND je.entity_type = 'invoice_item' AND je.entity_id = $2
-            AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)
-          ORDER BY je.created_at DESC LIMIT 1`,
-        [warehouseId, invoiceItemId],
-      );
-      if (open.rows[0]) return { repeated: true, entry: open.rows[0] };
-
-      const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
-      const entry = await journal.createEntry(client, {
-        warehouseId,
-        agent: 'Кладовщик',
-        actionText: `ОЧЕНЬ ВАЖНО: нет товара «${item.name}» (${item.sku}) — не хватает ${qty} из ${remaining} шт. `
-          + `Заказ «${item.invoice_number}»`
-          + (item.supply_number ? `, поставка «${item.supply_number}»` : '')
-          + `. Отметил ${who.rows[0] ? who.rows[0].name : 'грузчик'} при сборке.`
-          + (comment ? ` Комментарий: ${comment}` : ''),
-        entityType: 'invoice_item',
-        entityId: item.id,
-        invoiceId: item.invoice_id,
-        actorType: 'worker',
-        actorId: staffKeyId,
-        status: 'pending',
-        urgent: true,
-      });
-      return { repeated: false, entry };
-    });
+    const out = await withTenantContext({ warehouseId }, (client) => markMissing(
+      client, warehouseId, staffKeyId, { invoiceItemId, qty, note },
+    ));
     res.status(out.repeated ? 200 : 201).json(out);
   } catch (err) {
     next(err);
   }
 });
+
+// Отметка «нет товара» по одной позиции заказа: уходит «очень важно»
+// руководителю. Общая для кнопки на сборке и для сборки по бумажному листу.
+async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty, note, how = 'при сборке' }) {
+  const comment = typeof note === 'string' ? note.trim().replace(/\s+/g, ' ').slice(0, 300) : '';
+  const pre = await client.query(
+    'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
+    [invoiceItemId, warehouseId],
+  );
+  if (!pre.rows[0]) throw new HttpError(404, 'Позиция заказа не найдена');
+  // Тот же порядок блокировок, что у отбора: поставка, потом заказ.
+  await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
+  const itemResult = await client.query(
+    `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.invoice_id,
+            i.number AS invoice_number, i.direction, i.status, i.mp_closed_at, s.number AS supply_number
+       FROM invoice_items ii
+       JOIN invoices i ON i.id = ii.invoice_id
+       JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
+       LEFT JOIN supplies s ON s.id = i.supply_id
+      WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
+    [invoiceItemId, warehouseId],
+  );
+  const item = itemResult.rows[0];
+  if (!item) throw new HttpError(404, 'Позиция заказа не найдена');
+  if (item.direction !== 'out') throw new HttpError(400, 'Это не заказ на отгрузку');
+  if (item.mp_closed_at || item.status === 'shipped') {
+    throw new HttpError(409, 'Заказ уже закрыт — отмечать нечего');
+  }
+  const picked = await client.query(
+    `SELECT COALESCE(SUM(picked_qty), 0) AS picked, COALESCE(BOOL_OR(is_final), false) AS closed
+       FROM shipping_records WHERE invoice_item_id = $1`,
+    [invoiceItemId],
+  );
+  if (picked.rows[0].closed) throw new HttpError(409, 'Эта позиция уже собрана и закрыта');
+  const remaining = Number(item.declared_qty) - Number(picked.rows[0].picked);
+  if (qty > remaining) {
+    throw new HttpError(400, `По позиции осталось собрать ${remaining} шт. — не хватать может не больше`);
+  }
+
+  // Второе нажатие (или та же позиция с другого экрана) — не вторая
+  // тревога: возвращаем уже отправленную, пока по ней не ответили.
+  const open = await client.query(
+    `SELECT je.* FROM journal_entries je
+      WHERE je.warehouse_id = $1 AND je.urgent AND je.status = 'pending'
+        AND je.entity_type = 'invoice_item' AND je.entity_id = $2
+        AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)
+      ORDER BY je.created_at DESC LIMIT 1`,
+    [warehouseId, invoiceItemId],
+  );
+  if (open.rows[0]) return { repeated: true, entry: open.rows[0] };
+
+  const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
+  const entry = await journal.createEntry(client, {
+    warehouseId,
+    agent: 'Кладовщик',
+    actionText: `ОЧЕНЬ ВАЖНО: нет товара «${item.name}» (${item.sku}) — не хватает ${qty} из ${remaining} шт. `
+      + `Заказ «${item.invoice_number}»`
+      + (item.supply_number ? `, поставка «${item.supply_number}»` : '')
+      + `. Отметил ${who.rows[0] ? who.rows[0].name : 'грузчик'} ${how}.`
+      + (comment ? ` Комментарий: ${comment}` : ''),
+    entityType: 'invoice_item',
+    entityId: item.id,
+    invoiceId: item.invoice_id,
+    actorType: 'worker',
+    actorId: staffKeyId,
+    status: 'pending',
+    urgent: true,
+  });
+  return { repeated: false, entry };
+}
 
 // Одна запись отбора: сколько взяли из какой ячейки по одной позиции заказа.
 // Общая для отбора по заказу и по товару — правила (что можно, откуда
@@ -436,45 +441,200 @@ router.post('/product', requireAuth, requireRole('worker'), async (req, res, nex
       throw new HttpError(400, 'Нужны поставка, товар, ячейка и количество');
     }
     const qty = requireQty(pickedQty, 'Количество', { min: 1 });
+    const out = await withTenantContext({ warehouseId }, (client) => pickProduct(
+      client, warehouseId, staffKeyId, { supplyId, sku, cellBlockId, qty, pausedMs, pauseReasons },
+    ));
+    res.status(201).json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Позиции поставки, которые ещё собирать: по одному товару или по всем.
+async function openSupplyLines(client, warehouseId, supplyId, sku = null) {
+  return (await client.query(
+    `SELECT ii.id, ii.sku, ii.name, i.number AS invoice_number,
+            ii.declared_qty - COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
+                                         WHERE sr.invoice_item_id = ii.id), 0) AS left_qty
+       FROM invoice_items ii
+       JOIN invoices i ON i.id = ii.invoice_id
+      WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND ($3::text IS NULL OR ii.sku = $3)
+        AND i.status NOT IN ('shipped') AND i.mp_closed_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM shipping_records sr
+                         WHERE sr.invoice_item_id = ii.id AND sr.is_final)
+        -- Позицию с неразобранной отметкой «нет товара» экран грузчика не
+        -- считает, и сюда взятое не кладём: иначе штука уйдёт в заказ,
+        -- который руководитель уберёт из поставки, а тот, ради которого
+        -- её брали, останется несобранным (проверка 25.09.2026). То же
+        -- условие, что у состава поставки (supplies/service.js, missing).
+        AND NOT EXISTS (SELECT 1 FROM journal_entries je
+                         WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
+                           AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
+                           AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id))
+      ORDER BY i.number, ii.id`,
+    [warehouseId, supplyId, sku],
+  )).rows.filter((l) => Number(l.left_qty) > 0);
+}
+
+// Взять товар для поставки из одной ячейки: Аргус раскладывает взятое по
+// заказам сам. Общая для сборки по товарам и по бумажному листу.
+async function pickProduct(client, warehouseId, staffKeyId, {
+  supplyId, sku, cellBlockId, qty, pausedMs, pauseReasons,
+}) {
+  const lines = await openSupplyLines(client, warehouseId, supplyId, sku);
+  const need = lines.reduce((sum, l) => sum + Number(l.left_qty), 0);
+  if (!need) throw new HttpError(409, 'По этому товару в поставке больше нечего собирать');
+  if (qty > need) throw new HttpError(409, `Поставке нужно ещё ${need} шт., нельзя записать ${qty}`);
+  let left = qty;
+  const records = [];
+  for (const l of lines) {
+    if (left <= 0) break;
+    const give = Math.min(left, Number(l.left_qty));
+    records.push(await recordPick(client, warehouseId, staffKeyId, {
+      invoiceItemId: l.id, qty: give, cellBlockId,
+      isFinal: give === Number(l.left_qty),
+      // Пауза — у всего отбора одна, пишем её в первую запись.
+      pausedMs: records.length ? 0 : pausedMs, pauseReasons: records.length ? [] : pauseReasons,
+    }));
+    left -= give;
+  }
+  return { picked: qty, orders: records.length, stillNeeded: need - qty };
+}
+
+// Сборка по бумажному листу (владелец 22.09 и 26.09.2026). Бумага остаётся —
+// лист на тележке удобен, — но собранное грузчик отмечает сам, с телефона:
+// сканирует QR на листе — начало сборки и таймер; в конце — «собрал по
+// листу» и чего не нашёл. Взятое записывается теми же правилами, что и
+// сборка по товарам, недостача — теми же отметками «нет товара».
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function paperSupply(client, warehouseId, supplyId) {
+  if (!UUID.test(String(supplyId || ''))) throw new HttpError(400, 'Нужна поставка');
+  const s = (await client.query(
+    'SELECT id, number, status, company_id FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
+    [warehouseId, supplyId],
+  )).rows[0];
+  if (!s) throw new HttpError(404, 'Поставки нет — возможно, её разобрали');
+  if (s.status !== 'collecting') throw new HttpError(409, `Поставка «${s.number}» уже собрана`);
+  return s;
+}
+
+const workerName = async (client, staffKeyId) =>
+  (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0]?.name || 'Грузчик';
+
+router.post('/paper/start', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
     const out = await withTenantContext({ warehouseId }, async (client) => {
-      const lines = (await client.query(
-        `SELECT ii.id, ii.declared_qty - COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
-                                                    WHERE sr.invoice_item_id = ii.id), 0) AS left_qty
-           FROM invoice_items ii
-           JOIN invoices i ON i.id = ii.invoice_id
-          WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND ii.sku = $3
-            AND i.status NOT IN ('shipped') AND i.mp_closed_at IS NULL
-            AND NOT EXISTS (SELECT 1 FROM shipping_records sr
-                             WHERE sr.invoice_item_id = ii.id AND sr.is_final)
-            -- Позицию с неразобранной отметкой «нет товара» экран грузчика не
-            -- считает, и сюда взятое не кладём: иначе штука уйдёт в заказ,
-            -- который руководитель уберёт из поставки, а тот, ради которого
-            -- её брали, останется несобранным (проверка 25.09.2026). То же
-            -- условие, что у состава поставки (supplies/service.js, missing).
-            AND NOT EXISTS (SELECT 1 FROM journal_entries je
-                             WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
-                               AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
-                               AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id))
-          ORDER BY i.number, ii.id`,
-        [warehouseId, supplyId, sku],
-      )).rows.filter((l) => Number(l.left_qty) > 0);
-      const need = lines.reduce((sum, l) => sum + Number(l.left_qty), 0);
-      if (!need) throw new HttpError(409, 'По этому товару в поставке больше нечего собирать');
-      if (qty > need) throw new HttpError(409, `Поставке нужно ещё ${need} шт., нельзя записать ${qty}`);
-      let left = qty;
-      const records = [];
-      for (const l of lines) {
-        if (left <= 0) break;
-        const give = Math.min(left, Number(l.left_qty));
-        records.push(await recordPick(client, warehouseId, staffKeyId, {
-          invoiceItemId: l.id, qty: give, cellBlockId,
-          isFinal: give === Number(l.left_qty),
-          // Пауза — у всего отбора одна, пишем её в первую запись.
-          pausedMs: records.length ? 0 : pausedMs, pauseReasons: records.length ? [] : pauseReasons,
-        }));
-        left -= give;
+      const s = await paperSupply(client, warehouseId, (req.body || {}).supplyId);
+      const entry = await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `${await workerName(client, staffKeyId)} начал сборку поставки «${s.number}» по бумажному листу.`,
+        entityType: 'paper_pick',
+        entityId: s.id,
+        actorType: 'worker',
+        actorId: staffKeyId,
+      });
+      return { supplyId: s.id, number: s.number, startedAt: entry.created_at };
+    });
+    res.status(201).json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const body = req.body || {};
+    // Что грузчик не нашёл: {sku, found} — сколько всё-таки нашёл (0 — ничего).
+    const found = new Map();
+    for (const x of Array.isArray(body.notFound) ? body.notFound : []) {
+      const n = Number(x && x.found);
+      if (!x || typeof x.sku !== 'string' || !Number.isInteger(n) || n < 0) {
+        throw new HttpError(400, 'Отметка «не нашёл» — товар и сколько нашли');
       }
-      return { picked: qty, orders: records.length, stillNeeded: need - qty };
+      found.set(x.sku, n);
+    }
+    const started = new Date(body.startedAt);
+    const pausedMs = Math.max(0, Number(body.pausedMs) || 0);
+    const out = await withTenantContext({ warehouseId }, async (client) => {
+      const s = await paperSupply(client, warehouseId, body.supplyId);
+      const bySku = new Map();
+      for (const l of await openSupplyLines(client, warehouseId, s.id)) {
+        const it = bySku.get(l.sku) || { sku: l.sku, name: l.name, need: 0 };
+        it.need += Number(l.left_qty);
+        bySku.set(l.sku, it);
+      }
+      if (!bySku.size) throw new HttpError(409, `По поставке «${s.number}» собирать больше нечего`);
+      const report = [];
+      let firstPick = true;
+      for (const it of bySku.values()) {
+        const want = found.has(it.sku) ? Math.min(found.get(it.sku), it.need) : it.need;
+        // Берём из ячеек в порядке обхода — тем же правилом, что напечатан лист.
+        // ponytail: если между печатью и отметкой товар переложили, запись
+        // уйдёт по нынешним ячейкам, а не по напечатанным; QR с номерами ячеек
+        // на строках снимет это, когда появится сканирование ячеек.
+        const cells = (await client.query(
+          `SELECT cs.cell_block_id, SUM(cs.qty) AS qty
+             FROM cell_stock cs
+             JOIN cell_blocks cb ON cb.id = cs.cell_block_id
+             JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+            WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3
+              AND cs.qty > 0 AND cs.quality = 'good'
+            GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.tier_start
+            ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
+          [warehouseId, s.company_id, it.sku],
+        )).rows;
+        let taken = 0;
+        for (const c of cells) {
+          const take = Math.min(want - taken, Number(c.qty));
+          if (take <= 0) break;
+          await pickProduct(client, warehouseId, staffKeyId, {
+            supplyId: s.id, sku: it.sku, cellBlockId: c.cell_block_id, qty: take,
+            pausedMs: firstPick ? pausedMs : 0, pauseReasons: [],
+          });
+          firstPick = false;
+          taken += take;
+        }
+        // Нашёл, а в ячейках Аргуса товара нет — записать отбор не из чего:
+        // это расхождение, и руководитель должен его увидеть.
+        const noCells = want > taken;
+        let short = it.need - taken;
+        const missing = short;
+        // Недостача ложится на самые поздние заказы: ранние соберутся тем, что есть.
+        for (const l of (await openSupplyLines(client, warehouseId, s.id, it.sku)).reverse()) {
+          if (short <= 0) break;
+          const part = Math.min(short, Number(l.left_qty));
+          await markMissing(client, warehouseId, staffKeyId, {
+            invoiceItemId: l.id, qty: part, how: 'по бумажному листу',
+            note: noCells ? 'грузчик нашёл товар, но в ячейках Аргуса его нет' : '',
+          });
+          short -= part;
+        }
+        report.push({ sku: it.sku, name: it.name, need: it.need, taken, missing, noCells });
+      }
+      const workMs = Number.isNaN(started.getTime()) ? null
+        : Date.now() - started.getTime() - pausedMs;
+      // Время считаем, только если начало правдоподобное: не из будущего и
+      // не старше суток (лист могли отсканировать вчера и забыть).
+      const minutes = workMs != null && workMs >= 0 && workMs < 86400000 ? Math.max(1, Math.round(workMs / 60000)) : null;
+      const takenTotal = report.reduce((sum, r) => sum + r.taken, 0);
+      const short = report.filter((r) => r.missing > 0);
+      await journal.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `${await workerName(client, staffKeyId)} собрал поставку «${s.number}» по бумажному листу`
+          + (minutes ? ` за ${minutes} мин` : '') + `: взято ${takenTotal} шт.`
+          + (short.length ? ` Не нашёл: ${short.map((r) => `«${r.name}» — ${r.missing} шт.`
+            + (r.noCells ? ' (нашёл, но в ячейках Аргуса его нет)' : '')).join(', ')}` : ''),
+        entityType: 'paper_pick',
+        entityId: s.id,
+        actorType: 'worker',
+        actorId: staffKeyId,
+      });
+      return { number: s.number, taken: takenTotal, minutes, report };
     });
     res.status(201).json(out);
   } catch (err) {

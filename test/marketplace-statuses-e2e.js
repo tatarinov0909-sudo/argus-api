@@ -100,6 +100,16 @@ const { loadStock } = require('../src/sellers/stock');
     check('server rejects picking a cancelled order even from stale UI',()=>assert.equal(cannotPick.status,409));
     const cannotShip=await api('POST',`/api/shipping/${picked.id}/ship`,worker.token,{});
     check('server rejects ordinary shipping of a closed order',()=>assert.equal(cannotShip.status,409));
+    // Продавцу отменённый заказ, товар которого уже в сборке, показывается как
+    // «склад сверяет» — кабинет держит его в «В работе», пока товар не вернут.
+    const sellerOrders=(await must('GET',`/api/sellers/orders?companyId=${company.id}`,owner.token)).rows;
+    const conflictOf=id=>sellerOrders.find(r=>r.id===id)?.stock_conflict;
+    check('seller sees a picked canceled order as still being reconciled, an untouched one as done',()=>{
+      assert.equal(conflictOf(picked.id),true);
+      // Не отобранный заказ уходит из поставки сам — сверять нечего.
+      assert.equal(conflictOf(inSupply.id),false);
+      assert.equal(conflictOf(untouched.id),false);
+    });
     const issues=await must('GET','/api/marketplaces/reconciliation',owner.token);
     check('only orders with local picks or a supply require physical reconciliation',()=>{
       assert.equal(issues.rows.length,3);assert.ok(!issues.rows.some(row=>[noPicks.id,inSupply.id].includes(row.id)));

@@ -86,4 +86,49 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
   }
 });
 
+// Грузчик поставил работу на паузу или вернулся к ней — руководитель видит
+// это в журнале сразу, а не в итоге накладной (владелец 26.09.2026).
+// Работник журнал не читает, он только сообщает.
+router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const body = req.body || {};
+    const { reason, resumed, pausedMs } = body;
+    const uuid = (v) => (typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v) ? v : null);
+    const invoiceId = uuid(body.invoiceId);
+    const supplyId = uuid(body.supplyId);
+    const why = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ').slice(0, 200) : '';
+    if (!why) throw new HttpError(400, 'Нужна причина паузы');
+    const entry = await withTenantContext({ warehouseId }, async (client) => {
+      const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
+      const doc = invoiceId ? (await client.query(
+        `SELECT i.id, i.number, s.number AS supply_number FROM invoices i
+           LEFT JOIN supplies s ON s.id = i.supply_id
+          WHERE i.id = $1 AND i.warehouse_id = $2`, [invoiceId, warehouseId])).rows[0] : null;
+      const sup = !doc && supplyId ? (await client.query(
+        'SELECT number FROM supplies WHERE id = $1 AND warehouse_id = $2', [supplyId, warehouseId])).rows[0] : null;
+      const where = doc
+        ? (doc.supply_number ? ` Поставка «${doc.supply_number}», заказ «${doc.number}».` : ` Документ «${doc.number}».`)
+        : sup ? ` Поставка «${sup.number}».` : '';
+      const name = who.rows[0] ? who.rows[0].name : 'Грузчик';
+      const ms = Number(pausedMs) || 0;
+      const took = ms < 60000 ? 'меньше минуты' : `${Math.round(ms / 60000)} мин`;
+      return repository.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: resumed
+          ? `${name} вернулся к работе после паузы (${took}): ${why}.${where}`
+          : `${name} поставил работу на паузу: ${why}.${where}`,
+        entityType: 'worker_pause',
+        invoiceId: doc ? doc.id : null,
+        actorType: 'worker',
+        actorId: staffKeyId,
+      });
+    });
+    res.status(201).json(entry);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;

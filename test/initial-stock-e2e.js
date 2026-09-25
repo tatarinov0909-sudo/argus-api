@@ -307,6 +307,14 @@ const { withTenantContext } = require('../src/db/pool');
     const reload = must(await api('POST', '/api/cells/initial-stock', owner, {
       companyId: rival, rows: [{ cell: '1.1.1', sku: 'RIVAL-1', qty: 4 }], apply: true,
     }));
+    // «Что здесь происходило» у ячейки знает и загрузку, и её отмену —
+    // раньше журнал писал одну запись на файл без ячейки, и история молчала.
+    const cellHistory = must(await api('GET', `/api/journal?cellBlockId=${at(1, 1).id}`, owner))
+      .map((e) => e.action_text);
+    check('история ячейки показывает загрузку остатков и её отмену', () => {
+      assert.ok(cellHistory.some((t) => /^Загрузка остатков: положено \d+ шт\. .*RIVAL-1/.test(t)), cellHistory.join(' | '));
+      assert.ok(cellHistory.some((t) => /^Загрузка остатков отменена: снято/.test(t)), cellHistory.join(' | '));
+    });
     check('вторая отмена — отказ; после отмены ту же строку можно загрузить заново', () => {
       assert.equal(twice.status, 409);
       assert.equal(reload.applied, true);

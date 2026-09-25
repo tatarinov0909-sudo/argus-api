@@ -39,8 +39,13 @@ const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Eu
 // День берём по Москве — тот же день, что и у даты отгрузки. Раньше число
 // в номере бралось из часового пояса процесса, а счётчик — из пояса базы:
 // на UTC-сервере ночью по Москве это разные сутки.
+//
+// В номере есть год: ПС-ДДММГГ-NN (владелец 26.09.2026). Без года через год
+// номера пошли бы по второму кругу, и ПС-2609-01 этого года не отличить от
+// прошлогодней.
 async function nextNumber(client, warehouseId) {
-  const stamp = moscowToday().slice(5).split('-').reverse().join('');
+  const [y, m, d] = moscowToday().split('-');
+  const stamp = d + m + y.slice(2);
   const prefix = `ПС-${stamp}-`;
   const r = await client.query(
     `SELECT COALESCE(MAX(NULLIF(regexp_replace(number, '^.*-', ''), '')::int), 0) AS last

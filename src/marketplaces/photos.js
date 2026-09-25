@@ -64,4 +64,76 @@ async function syncPhotos(client, warehouseId, companyId, { fetchPage = wb.produ
   }
   return { count, complete };
 }
-module.exports = { syncPhotos, photoUrl };
+// Фото из открытого хранилища картинок WB — без ключа и без категории
+// «Контент» (так их берёт и «Складус»; владелец 26.09.2026). Картинка карточки
+// лежит по адресу basket-NN.wbbasket.ru/vol<nm/1e5>/part<nm/1e3>/<nm>/images/…,
+// где NN растёт вместе с номером карточки. Таблицу «номер → сервер» WB не
+// публикует и расширяет, поэтому сервер не вычисляем, а находим: начинаем с
+// ближайшего по номеру уже найденного и идём в обе стороны. 9 сентября
+// перебрали только 23 сервера и решили, что фото так не взять, — у «Слим Тим»
+// есть карточки и на 41-м.
+const BASKETS = 80;
+const knownBaskets = new Map(); // vol → номер сервера, общий на процесс
+
+const publicUrl = (nm, basket) => `https://basket-${String(basket).padStart(2, '0')}.wbbasket.ru`
+  + `/vol${Math.floor(nm / 1e5)}/part${Math.floor(nm / 1e3)}/${nm}/images/c246x328/1.webp`;
+
+async function headOk(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
+    return res.ok;
+  } catch { return false; }
+}
+
+// Сервер-кандидат по ближайшему известному тому (том — номер карточки / 1e5).
+function guessBasket(vol) {
+  let best = null;
+  for (const [v, b] of knownBaskets) if (!best || Math.abs(v - vol) < Math.abs(best[0] - vol)) best = [v, b];
+  return best ? best[1] : 1;
+}
+
+async function findPublicPhoto(nmId, { probe = headOk } = {}) {
+  const nm = Number(nmId);
+  if (!Number.isSafeInteger(nm) || nm <= 0) return null;
+  const vol = Math.floor(nm / 1e5);
+  const start = guessBasket(vol);
+  for (let step = 0; step <= BASKETS; step += 1) {
+    for (const b of step ? [start + step, start - step] : [start]) {
+      if (b < 1 || b > BASKETS) continue;
+      const url = publicUrl(nm, b);
+      if (await probe(url)) { knownBaskets.set(vol, b); return url; }
+    }
+  }
+  return null;
+}
+
+// Карточки продавца без фото — из заказов и связок артикулов. Ищем порциями,
+// а «не нашлось» запоминаем на неделю, чтобы не стучаться каждые пять минут.
+async function syncPublicPhotos(client, warehouseId, companyId, { probe, limit = 20 } = {}) {
+  const credential = (await client.query(`SELECT id, updated_at::text AS updated_at FROM marketplace_credentials
+    WHERE warehouse_id=$1 AND company_id=$2 AND marketplace='wb'`, [warehouseId, companyId])).rows[0];
+  if (!credential) return { skipped: true };
+  const todo = (await client.query(
+    `WITH ids AS (
+       SELECT mp_nm_id AS nm_id FROM invoice_items WHERE company_id=$1 AND mp_nm_id ~ '^[0-9]+$'
+       UNION SELECT mp_sku FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb' AND mp_sku ~ '^[0-9]+$')
+     SELECT ids.nm_id FROM ids
+      WHERE NOT EXISTS (SELECT 1 FROM marketplace_product_media m
+                         WHERE m.company_id=$1 AND m.nm_id=ids.nm_id
+                           AND (m.photo_url IS NOT NULL OR m.updated_at > now() - interval '7 days'))
+      LIMIT $2`, [companyId, limit])).rows.map((r) => r.nm_id);
+  let found = 0;
+  for (const nmId of todo) {
+    const url = await findPublicPhoto(nmId, { probe });
+    if (url) found += 1;
+    await client.query(`INSERT INTO marketplace_product_media
+        (credential_id, warehouse_id, company_id, nm_id, photo_url, credential_version)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (credential_id, nm_id) DO UPDATE SET photo_url = COALESCE(EXCLUDED.photo_url, marketplace_product_media.photo_url),
+        updated_at = now()`,
+      [credential.id, warehouseId, companyId, nmId, url, credential.updated_at]);
+  }
+  return { checked: todo.length, found };
+}
+
+module.exports = { syncPhotos, syncPublicPhotos, findPublicPhoto, photoUrl };

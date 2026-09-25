@@ -151,7 +151,7 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     check('поставка собирается из заказов одного продавца', () => {
       assert.equal(created.status, 201, JSON.stringify(created.body));
       assert.equal(created.body.orders, 3);
-      assert.ok(/^ПС-\d{4}-\d{2}$/.test(created.body.number), created.body.number);
+      assert.ok(/^ПС-\d{6}-\d{2}$/.test(created.body.number), created.body.number);
     });
     const supplyId = created.body.id;
 
@@ -443,7 +443,7 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     check('после разбора поставки номера продолжают выдаваться', () => {
       assert.equal(afterDisband.status, 201, JSON.stringify(afterDisband.body));
       assert.notEqual(afterDisband.body.number, toDisband.body.number, 'номер повторился');
-      assert.match(afterDisband.body.number, /^ПС-\d{4}-\d{2,}$/, afterDisband.body.number);
+      assert.match(afterDisband.body.number, /^ПС-\d{6}-\d{2,}$/, afterDisband.body.number);
     });
     await api('DELETE', `/api/supplies/${afterDisband.body.id}`, { token: ownerToken });
 

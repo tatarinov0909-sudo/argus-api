@@ -1,7 +1,7 @@
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const sync = require('./sync');
 const credentials = require('./credentials');
-const { syncPhotos } = require('./photos');
+const { syncPhotos, syncPublicPhotos } = require('./photos');
 
 // Опрос площадок по расписанию.
 //
@@ -55,6 +55,9 @@ async function runOnce() {
       for (const pair of pairs.filter(p => p.marketplace === 'wb')) {
         try { await withTenantContext({ warehouseId }, client => syncPhotos(client, warehouseId, pair.companyId)); }
         catch { console.error('маркетплейсы: не удалось обновить кэш фотографий'); }
+        // Без категории «Контент» у ключа — фото из открытого хранилища WB.
+        try { await withTenantContext({ warehouseId }, client => syncPublicPhotos(client, warehouseId, pair.companyId)); }
+        catch { console.error('маркетплейсы: не удалось подобрать открытые фото WB'); }
       }
       done += 1;
     } catch (err) {
