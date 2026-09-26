@@ -60,7 +60,7 @@ function check(name, fn) {
       [r.actOtherWh.status, r.shipActOtherWh.status, r.suppliesOtherWh.status, r.inboundOtherWh.status, r.alignOtherWh.status],
       [404, 404, 404, 404, 404]));
     check('грузчик чужого склада не собирает поставку — отказ', () => assert.ok(r.productOtherWh.status >= 400 && r.productOtherWh.status < 500));
-    check('продавец А не видит поставок Б', () => assert.deepEqual(r.suppliesA.body, []));
+    check('продавец А не видит поставок Б', () => assert.deepEqual(r.suppliesA.body.rows, []));
     check('продавец А не открывает поставку Б', () => assert.equal(r.supplyContentsA.status, 404));
     check('мусорные id и таблицы — 400, не 500', () => assert.deepEqual(
       [r.productBadId.status, r.actBadId.status, r.inboundString.status, r.inboundObj.status, r.alignGarbage.status],

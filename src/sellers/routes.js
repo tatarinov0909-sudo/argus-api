@@ -101,7 +101,7 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
           WHERE s.company_id = $1
           GROUP BY s.id
           ORDER BY s.created_at DESC
-          LIMIT 200`,
+          LIMIT 1001`,
         [companyId],
       )).rows;
       const lines = supplies.length ? (await c.query(
@@ -111,7 +111,10 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
           ORDER BY i.number`,
         [companyId, supplies.map((x) => x.id)],
       )).rows : [];
-      return supplies.map((x) => ({
+      // Список не обрезаем молча: до 1000 поставок, дальше — признак
+      // «показана часть», как у заказов и документов (проверка 26.09.2026).
+      const more = supplies.length > 1000;
+      return { hasMore: more, rows: supplies.slice(0, 1000).map((x) => ({
         id: x.id,
         number: x.number,
         status: x.status,
@@ -133,7 +136,7 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
           order: l.number, sku: l.sku, name: l.name, qty: Number(l.declared_qty),
           status: l.status === 'shipped' ? 'уехал' : l.status === 'ready' ? 'собран' : 'собирается',
         })),
-      }));
+      })) };
     });
     res.set('Cache-Control', 'no-store').json(rows);
   } catch (err) { next(err); }
@@ -560,13 +563,14 @@ router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), a
               AND ((op.kind = 'repack' AND op.details->>'toQuality' IN ('defective', 'packaging_defect'))
                 OR (op.kind = 'inventory' AND op.details->>'quality' IN ('defective', 'packaging_defect')
                     AND (op.details->>'countedQty')::numeric > (op.details->>'expectedQty')::numeric))
-         ) x ORDER BY at DESC LIMIT 500`, [companyId])).rows;
+         ) x ORDER BY at DESC LIMIT 1001`, [companyId])).rows;
       return { now, events };
     });
     const sourceName = { return: 'Возврат', repack: 'Перепаковка на складе', inventory: 'Пересчёт ячейки' };
     res.set('Cache-Control', 'no-store').json({
       now: out.now.map((r) => ({ sku: r.sku, name: r.name, defective: Number(r.defective || 0), packaging: Number(r.packaging || 0) })),
-      events: out.events.map((r) => ({
+      hasMore: out.events.length > 1000,
+      events: out.events.slice(0, 1000).map((r) => ({
         id: r.id, at: r.at, sku: r.sku, name: r.name, qty: Number(r.qty), bucket: r.bucket,
         note: r.note || null, source: sourceName[r.source] || 'Склад', document: r.document || null,
       })),
@@ -622,21 +626,27 @@ router.patch('/companies/:companyId/archive', requireAuth, requireGrant('clients
       throw new HttpError(400, 'Передайте archived: true или false');
     }
     const company = await withTenantContext({ warehouseId }, async (client) => {
-      // В архиве продавец пропадает со всех экранов — вместе с его поставками.
-      // Если по поставке товар уже снят с полок, он исчез бы из учёта: ни на
-      // полке, ни в отгрузке. Так висела ПС-0909-01 архивной компании
-      // (разобрана 26.09). Сначала поставку отгружают или разбирают.
+      // В архиве продавец пропадает со всех экранов — вместе с его заказами
+      // и поставками. Товар, уже снятый с полок под заказ, который ещё не
+      // уехал и не вернулся на полку, выпал бы из учёта: ни на полке, ни в
+      // отгрузке. Так висела ПС-0909-01 архивной компании (разобрана 26.09).
+      // Касается любого заказа — и в поставке WB, и заказа 1С без поставки.
       if (req.body.archived) {
+        // Строку продавца — на запись: одновременный отбор ждёт архив (или
+        // архив ждёт отбор), и проверка ниже видит всё, что успели снять.
+        await client.query('SELECT 1 FROM companies WHERE id = $1 AND warehouse_id = $2 FOR UPDATE', [companyId, warehouseId]);
         const busy = (await client.query(
-          `SELECT DISTINCT s.number FROM supplies s
-             JOIN invoices i ON i.supply_id = s.id
+          `SELECT DISTINCT COALESCE(s.number, i.number) AS label
+             FROM invoices i
              JOIN invoice_items ii ON ii.invoice_id = i.id
              JOIN shipping_records sr ON sr.invoice_item_id = ii.id AND sr.picked_qty > 0
-            WHERE s.warehouse_id = $1 AND s.company_id = $2 AND s.status IN ('collecting', 'ready')
-            ORDER BY s.number`, [warehouseId, companyId])).rows.map((r) => r.number);
+             LEFT JOIN supplies s ON s.id = i.supply_id
+            WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.direction = 'out'
+              AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
+            ORDER BY 1`, [warehouseId, companyId])).rows.map((r) => r.label);
         if (busy.length) {
-          throw new HttpError(409, `У продавца есть поставки, товар по которым уже снят с полок: ${busy.join(', ')}. `
-            + 'Сначала отметьте их «Уехала» или верните товар в ячейки.');
+          throw new HttpError(409, `У продавца есть собранный товар, который ещё не уехал: ${busy.join(', ')}. `
+            + 'Сначала отгрузите его («Уехала») или верните в ячейки.');
         }
       }
       const result = await client.query(

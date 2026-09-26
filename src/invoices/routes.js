@@ -160,6 +160,20 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       return { ...inv, items: itemsResult.rows };
     });
     if (!invoice) throw new HttpError(404, 'Накладная не найдена');
+    // Продавцу — только то, что про его товар: адреса ячеек и паузы грузчиков
+    // остаются внутри склада (правило .business/seller-cabinet.md; найдено
+    // проверкой 26.09.2026). Так же вырезано в /api/sellers/history.
+    if (req.auth.role === 'seller') {
+      invoice.items = invoice.items.map((it) => {
+        const {
+          rack_start: _rs, rack_end: _re, tier_start: _ts, tier_end: _te, row_num: _rn, pause_reasons: _pr, ...rest
+        } = it;
+        if (Array.isArray(rest.picks)) {
+          rest.picks = rest.picks.map((p) => ({ id: p.id, pickedQty: p.pickedQty, finishedAt: p.finishedAt }));
+        }
+        return rest;
+      });
+    }
     res.json(invoice);
   } catch (err) {
     next(err);

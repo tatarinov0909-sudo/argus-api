@@ -54,3 +54,19 @@ test('public WB photo: the server is found by probing, remembered, and nothing i
   assert.equal(await findPublicPhoto('123', { probe: async () => false }), null);
   assert.equal(await findPublicPhoto('not-a-number', { probe: async () => true }), null);
 });
+
+test('public WB photos are probed outside a database transaction', async () => {
+  const { syncPublicPhotos } = require('../src/marketplaces/photos');
+  let inTx = false; const probedInTx = []; const writes = [];
+  const client = { query: async (sql, params) => {
+    if (/FROM marketplace_credentials/.test(sql)) return { rows: [{ id: 'cred', updated_at: 'v1' }] };
+    if (/WITH ids AS/.test(sql)) return { rows: [{ nm_id: '985393681' }] };
+    writes.push(params); return { rows: [] };
+  } };
+  const run = async (fn) => { inTx = true; try { return await fn(client); } finally { inTx = false; } };
+  const probe = async (url) => { probedInTx.push(inTx); return url.startsWith('https://basket-41.'); };
+  const out = await syncPublicPhotos(run, 'wh', 'co', { probe });
+  assert.deepEqual([...new Set(probedInTx)], [false]);
+  assert.equal(out.found, 1);
+  assert.match(writes[0][4], /basket-41/);
+});

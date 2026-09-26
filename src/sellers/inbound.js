@@ -22,10 +22,15 @@ const low = (v) => text(v).toLowerCase().replace(/ё/g, 'е');
 // Количество штук — целое и больше нуля, как на любом другом входе склада.
 // «1 200» и «12 шт» — да; «1,5» и «0x10» — нет: такую строку показываем с
 // причиной, а не округляем и не читаем по-своему. Пусто и ноль — строки нет.
+// Потолок штук в строке и у товара в одном приходе. Больше — почти наверняка
+// ошибка в файле (номер вместо количества), и в базу такое число не влезет:
+// вместо «Внутренней ошибки» — понятный отказ (проверка 26.09.2026).
+const MAX_QTY = 10000000;
 function qtyOf(v) {
   if (typeof v === 'number') {
     if (v === 0) return { empty: true };
-    return Number.isInteger(v) && v > 0 ? { qty: v } : { error: `количество «${v}» — не целое число штук` };
+    if (!Number.isInteger(v) || v < 0) return { error: `количество «${v}» — не целое число штук` };
+    return v <= MAX_QTY ? { qty: v } : { error: `количество «${v}» — больше ${MAX_QTY.toLocaleString('ru-RU')} шт. в строке` };
   }
   const raw = text(v);
   const t = raw.replace(/[\s ]/g, '').replace(/шт\.?$/i, '');
@@ -204,7 +209,19 @@ async function run(client, {
   };
   if (!apply) return { applied: false, summary, lines: found };
   if (!items.length) throw new HttpError(400, 'В файле не нашлось ни одного товара из вашего каталога');
-  if (plannedDate && !/^\d{4}-\d{2}-\d{2}$/.test(plannedDate)) throw new HttpError(400, 'Дата привоза — в виде ГГГГ-ММ-ДД');
+  // Дата — настоящая: «2026-02-31» и «2026-99-99» проходили по образцу и
+  // уходили складу в журнал «Привезёт 99.99.2026».
+  if (plannedDate && (!/^\d{4}-\d{2}-\d{2}$/.test(plannedDate)
+      || Number.isNaN(new Date(plannedDate + 'T00:00:00Z').getTime())
+      || new Date(plannedDate + 'T00:00:00Z').toISOString().slice(0, 10) !== plannedDate
+      || plannedDate < '2020-01-01' || plannedDate > '2100-12-31')) {
+    throw new HttpError(400, 'Дата привоза — настоящая дата в виде ГГГГ-ММ-ДД');
+  }
+  const tooMuch = items.find((i) => i.qty > MAX_QTY);
+  if (tooMuch) {
+    throw new HttpError(400, `«${tooMuch.name}»: ${tooMuch.qty.toLocaleString('ru-RU')} шт. в одном приходе — больше `
+      + `${MAX_QTY.toLocaleString('ru-RU')}. Проверьте количество в файле.`);
+  }
   const company = (await client.query('SELECT name FROM companies WHERE id = $1', [companyId])).rows[0];
   const inv = await insertInvoice(client, warehouseId, companyId, plannedDate);
   // Кто везёт и на чём — пишут, когда готовят документы на выгрузку.

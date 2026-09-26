@@ -56,7 +56,7 @@ async function runOnce() {
         try { await withTenantContext({ warehouseId }, client => syncPhotos(client, warehouseId, pair.companyId)); }
         catch { console.error('маркетплейсы: не удалось обновить кэш фотографий'); }
         // Без категории «Контент» у ключа — фото из открытого хранилища WB.
-        try { await withTenantContext({ warehouseId }, client => syncPublicPhotos(client, warehouseId, pair.companyId)); }
+        try { await syncPublicPhotos((fn) => withTenantContext({ warehouseId }, fn), warehouseId, pair.companyId); }
         catch { console.error('маркетплейсы: не удалось подобрать открытые фото WB'); }
       }
       done += 1;
@@ -68,10 +68,17 @@ async function runOnce() {
   return done;
 }
 
+// Проход не начинается, пока не кончился прошлый: медленная площадка не
+// должна копить одновременные обходы и забирать соединения с базой.
+let running = false;
+
 function start() {
   if (timer) return;
   const tick = () => {
-    runOnce().catch((err) => console.error('маркетплейсы: проход упал целиком:', err.message));
+    if (running) return;
+    running = true;
+    runOnce().catch((err) => console.error('маркетплейсы: проход упал целиком:', err.message))
+      .finally(() => { running = false; });
   };
   timer = setInterval(tick, INTERVAL_MS);
   // Не сразу на старте: дать приложению подняться.

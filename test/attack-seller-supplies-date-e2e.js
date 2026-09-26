@@ -27,7 +27,7 @@ function check(name, fn) {
     await ok('POST', '/api/supplies', w.token, { invoiceIds: [inv.id], shipDate }, 201);
 
     const mine = await ok('GET', '/api/sellers/supplies', st);
-    const r = mine[0];
+    const r = mine.rows[0];
     // Ровно то, что делает seller-cabinet.js в renderSupplies(), у продавца в Калининграде.
     const shown = new Date(r.shipDate).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', timeZone: 'Europe/Kaliningrad' });
     const expected = new Date(`${shipDate}T12:00:00Z`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', timeZone: 'UTC' });

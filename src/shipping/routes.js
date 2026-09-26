@@ -245,9 +245,12 @@ async function recordPick(client, warehouseId, staffKeyId, {
      FROM invoice_items ii
      JOIN invoices i ON i.id = ii.invoice_id
      JOIN companies c ON c.id = ii.company_id AND c.archived_at IS NULL
-     WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
+     WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i FOR SHARE OF c`,
     [invoiceItemId, warehouseId],
   );
+  // FOR SHARE OF c — отбор и уход продавца в архив не проходят одновременно:
+  // архив берёт строку продавца на запись и ждёт отбор, отбор после архива
+  // видит продавца в архиве и отказывает (проверка 26.09.2026).
   const item = itemResult.rows[0];
   if (!item) throw new HttpError(404, 'Позиция накладной не найдена');
   if ((item.supply_id || null) !== supplyId) {

@@ -110,31 +110,39 @@ async function findPublicPhoto(nmId, { probe = headOk } = {}) {
 
 // Карточки продавца без фото — из заказов и связок артикулов. Ищем порциями,
 // а «не нашлось» запоминаем на неделю, чтобы не стучаться каждые пять минут.
-async function syncPublicPhotos(client, warehouseId, companyId, { probe, limit = 20 } = {}) {
-  const credential = (await client.query(`SELECT id, updated_at::text AS updated_at FROM marketplace_credentials
-    WHERE warehouse_id=$1 AND company_id=$2 AND marketplace='wb'`, [warehouseId, companyId])).rows[0];
-  if (!credential) return { skipped: true };
-  const todo = (await client.query(
-    `WITH ids AS (
-       SELECT mp_nm_id AS nm_id FROM invoice_items WHERE company_id=$1 AND mp_nm_id ~ '^[0-9]+$'
-       UNION SELECT mp_sku FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb' AND mp_sku ~ '^[0-9]+$')
-     SELECT ids.nm_id FROM ids
-      WHERE NOT EXISTS (SELECT 1 FROM marketplace_product_media m
-                         WHERE m.company_id=$1 AND m.nm_id=ids.nm_id
-                           AND (m.photo_url IS NOT NULL OR m.updated_at > now() - interval '7 days'))
-      LIMIT $2`, [companyId, limit])).rows.map((r) => r.nm_id);
-  let found = 0;
-  for (const nmId of todo) {
-    const url = await findPublicPhoto(nmId, { probe });
-    if (url) found += 1;
-    await client.query(`INSERT INTO marketplace_product_media
+// Поиск ходит в сеть — поэтому вне транзакции базы: сначала короткое чтение
+// «что искать», потом запросы к хранилищу WB, потом короткая запись. Иначе
+// медленное хранилище держало бы соединения с базой (проверка 26.09.2026).
+// run(fn) — выполнить fn(client) в контексте склада (withTenantContext).
+async function syncPublicPhotos(run, warehouseId, companyId, { probe, limit = 20 } = {}) {
+  const todo = await run(async (client) => {
+    const credential = (await client.query(`SELECT id, updated_at::text AS updated_at FROM marketplace_credentials
+      WHERE warehouse_id=$1 AND company_id=$2 AND marketplace='wb'`, [warehouseId, companyId])).rows[0];
+    if (!credential) return null;
+    const ids = (await client.query(
+      `WITH ids AS (
+         SELECT mp_nm_id AS nm_id FROM invoice_items WHERE company_id=$1 AND mp_nm_id ~ '^[0-9]+$'
+         UNION SELECT mp_sku FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb' AND mp_sku ~ '^[0-9]+$')
+       SELECT ids.nm_id FROM ids
+        WHERE NOT EXISTS (SELECT 1 FROM marketplace_product_media m
+                           WHERE m.company_id=$1 AND m.nm_id=ids.nm_id
+                             AND (m.photo_url IS NOT NULL OR m.updated_at > now() - interval '7 days'))
+        LIMIT $2`, [companyId, limit])).rows.map((r) => r.nm_id);
+    return { credential, ids };
+  });
+  if (!todo) return { skipped: true };
+  const found = [];
+  for (const nmId of todo.ids) found.push({ nmId, url: await findPublicPhoto(nmId, { probe }) });
+  if (found.length) {
+    await run((client) => client.query(`INSERT INTO marketplace_product_media
         (credential_id, warehouse_id, company_id, nm_id, photo_url, credential_version)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      SELECT $1, $2, $3, r.nm_id, r.url, $4 FROM jsonb_to_recordset($5::jsonb) AS r(nm_id text, url text)
       ON CONFLICT (credential_id, nm_id) DO UPDATE SET photo_url = COALESCE(EXCLUDED.photo_url, marketplace_product_media.photo_url),
         updated_at = now()`,
-      [credential.id, warehouseId, companyId, nmId, url, credential.updated_at]);
+    [todo.credential.id, warehouseId, companyId, todo.credential.updated_at,
+      JSON.stringify(found.map((f) => ({ nm_id: f.nmId, url: f.url })))]));
   }
-  return { checked: todo.length, found };
+  return { checked: found.length, found: found.filter((f) => f.url).length };
 }
 
 module.exports = { syncPhotos, syncPublicPhotos, findPublicPhoto, photoUrl };
