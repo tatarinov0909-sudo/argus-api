@@ -178,7 +178,9 @@ async function insertInvoice(client, warehouseId, companyId, plannedDate) {
   throw new HttpError(409, 'Не удалось выдать номер прихода — попробуйте ещё раз');
 }
 
-async function run(client, { warehouseId, companyId, grid, apply = false, plannedDate = null, comment = '', actor = {} }) {
+async function run(client, {
+  warehouseId, companyId, grid, apply = false, plannedDate = null, comment = '', carrier = '', vehicle = '', actor = {},
+}) {
   const lines = parseInboundSheet(grid);
   const find = await loadCatalog(client, companyId);
   const found = [];
@@ -205,6 +207,10 @@ async function run(client, { warehouseId, companyId, grid, apply = false, planne
   if (plannedDate && !/^\d{4}-\d{2}-\d{2}$/.test(plannedDate)) throw new HttpError(400, 'Дата привоза — в виде ГГГГ-ММ-ДД');
   const company = (await client.query('SELECT name FROM companies WHERE id = $1', [companyId])).rows[0];
   const inv = await insertInvoice(client, warehouseId, companyId, plannedDate);
+  // Кто везёт и на чём — пишут, когда готовят документы на выгрузку.
+  const clean = (v, max) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : '') || null;
+  await client.query('UPDATE invoices SET carrier = $2, vehicle = $3, inbound_comment = $4 WHERE id = $1',
+    [inv.id, clean(carrier, 120), clean(vehicle, 20), clean(comment, 300)]);
   await client.query(
     `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
      SELECT $1, $2, $3, x.name, x.sku, x.qty
@@ -214,6 +220,7 @@ async function run(client, { warehouseId, companyId, grid, apply = false, planne
     warehouseId, agent: 'Кладовщик',
     actionText: `Продавец «${company.name}» оформил привоз ${inv.number}: ${items.length} товаров, ${summary.units} шт.`
       + (plannedDate ? ` Привезёт ${plannedDate.split('-').reverse().join('.')}.` : '')
+      + (clean(carrier, 120) ? ` Везёт: ${clean(carrier, 120)}${clean(vehicle, 20) ? `, машина ${clean(vehicle, 20)}` : ''}.` : '')
       + (comment ? ` Комментарий: ${String(comment).slice(0, 300)}` : ''),
     entityType: 'invoice', entityId: inv.id, invoiceId: inv.id,
     actorType: actor.type || 'seller', actorId: actor.id || null,

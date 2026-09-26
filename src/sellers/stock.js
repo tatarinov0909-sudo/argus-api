@@ -99,6 +99,16 @@ async function loadStock(client, companyId) {
            WHERE sr.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped'
              AND i.mp_stock_returned_at IS NULL
            GROUP BY ii.sku
+         ), in_transit AS (
+           -- «В пути» (владелец 26.09.2026): уехало со склада поставкой на WB,
+           -- а WB его ещё не принял. Принятый WB заказ обмен статусов
+           -- закрывает (mp_closed_at), отменённый — тоже.
+           SELECT ii.sku, SUM(ii.declared_qty) AS qty
+           FROM invoices i
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+           WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
+             AND i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.mp_closed_at IS NULL
+           GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
            UNION SELECT sku FROM cells
@@ -116,7 +126,8 @@ async function loadStock(client, companyId) {
                 p.barcode, p.stock_qty_1c, p.stock_at, st.qty AS staged_qty,
                 a.quantity AS accepted_qty,a.snapshot_id,a.snapshot_at,
                 o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders,
-                o.assembly_qty, o.queued_qty, o.queued_orders, o.assembly_orders
+                o.assembly_qty, o.queued_qty, o.queued_orders, o.assembly_orders,
+                tr.qty AS transit_qty
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
@@ -124,6 +135,7 @@ async function loadStock(client, companyId) {
          LEFT JOIN staged st ON st.sku = s.sku
          LEFT JOIN observed obs ON obs.sku = s.sku
          LEFT JOIN accepted a ON a.sku = s.sku
+         LEFT JOIN in_transit tr ON tr.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
@@ -189,6 +201,7 @@ async function loadStock(client, companyId) {
       totalUpdatedAt: accountingTotal === null ? null : (r.stock_at || null),
       inAssembly,
       orderedNotInSupply,
+      inTransit: Number(r.transit_qty || 0),
       sellerAvailable,
       // Сколько заказов стоит за каждым числом — для подписей в кабинете.
       queuedOrders: Number(r.queued_orders || 0),

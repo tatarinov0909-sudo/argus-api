@@ -80,7 +80,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const sellerSame = sellerView.rows.find(r=>r.sku==='SAME-SKU');
     // Договор с кабинетом продавца: четыре количества и сколько заказов за
     // каждым из обещанных чисел. Ничего про ячейки, 1С и сверку.
-    assert.deepEqual(Object.keys(sellerSame).sort(), ['assemblyOrders','available','barcode','inAssembly','name','ordered','orderedOrders','sku','total','totalKnown','updatedAt'].sort());
+    assert.deepEqual(Object.keys(sellerSame).sort(), ['assemblyOrders','available','barcode','defective','inAssembly','inTransit','name','ordered','orderedOrders','sku','total','totalKnown','updatedAt'].sort());
     assert.equal(sellerSame.total,0); assert.equal(sellerSame.ordered,0); assert.equal(sellerSame.inAssembly,0);
     assert.equal(sellerSame.available,0); assert.equal(sellerSame.totalKnown,true);
     assert.equal(JSON.stringify(sellerSame).includes('cell'),false); assert.equal(JSON.stringify(sellerSame).includes('1c'),false);
@@ -199,15 +199,10 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const catalog=await api('GET','/api/sellers/catalog?companyId='+a.id,sb);
     assert.equal(catalog.products[0].cards[0].nmId,'987654321');
     assert.ok(!JSON.stringify(catalog).includes('123456789'));
-    await api('GET','/api/sellers/source-documents',sa,undefined,403);
-    await withTenantContext({warehouseId},c=>c.query("UPDATE invoices SET external_id='TEST-1C-'||id::text WHERE warehouse_id=$1 AND direction='in'",[warehouseId]));
-    await invoice(a,'in',1,'MANUAL-ONLY');
-    const source=await api('GET','/api/sellers/source-documents',token);
-    assert.equal(source.rows.length,2);assert.ok(source.rows.every(r=>r.direction==='in'&&r.source==='1c'));
     await withTenantContext({warehouseId},c=>c.query('UPDATE invoice_items SET mp_nm_id=$2,mp_article=$3 WHERE invoice_id=$1',[order.id,'123456789','SELLER-A']));
     const enriched=await api('GET','/api/sellers/orders',sa);
     assert.equal(enriched.rows.find(r=>r.id===order.id).mp_nm_id,'123456789');
-    console.log('PASS real marketplace IDs; catalog company isolation; source documents denied to sellers and available to owner');
+    console.log('PASS real marketplace IDs; catalog company isolation');
   } finally {
     await new Promise(r=>server.close(r)); await pool.end();
   }

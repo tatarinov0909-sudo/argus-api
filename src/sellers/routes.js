@@ -27,7 +27,11 @@ function sellerStockView(row) {
     // уменьшают доступное: этот товар обещан покупателям.
     ordered: row.orderedNotInSupply,
     inAssembly: row.inAssembly,
+    // Уехало на WB, WB ещё не принял — в «доступно» уже не входит.
+    inTransit: row.inTransit,
     available: row.sellerAvailable,
+    // Брак на складе — его товар, решение по нему за продавцом.
+    defective: row.defective + row.packagingDefect,
     orderedOrders: row.queuedOrders,
     assemblyOrders: row.assemblyOrders,
     updatedAt: row.totalUpdatedAt,
@@ -58,6 +62,7 @@ function sellerStockResponse(rows) {
       total: unknownRows.length ? null : sum(inventoryRows, 'total'),
       ordered: sum(inventoryRows, 'orderedNotInSupply'),
       inAssembly: sum(inventoryRows, 'inAssembly'),
+      inTransit: sum(inventoryRows, 'inTransit'),
       available: unknownRows.length ? null : sum(inventoryRows, 'sellerAvailable'),
       updatedAt,
     },
@@ -154,6 +159,7 @@ router.post('/inbound', requireAuth, requireRole('seller', 'owner', 'manager'), 
         warehouseId, companyId, grid: body.grid, apply: body.apply === true,
         plannedDate: typeof body.plannedDate === 'string' && body.plannedDate ? body.plannedDate : null,
         comment: typeof body.comment === 'string' ? body.comment.trim() : '',
+        carrier: body.carrier, vehicle: body.vehicle,
         actor: req.auth.role === 'seller' ? { type: 'seller', id: req.auth.sellerKeyId || null }
           : { type: req.auth.role, id: req.auth.staffKeyId || req.auth.ownerId || null },
       });
@@ -191,18 +197,6 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
 });
 
 // Explicit owner-only view of source documents, without rebinding them to a seller.
-router.get('/source-documents', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
-  try {
-    const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => (await c.query(
-      `SELECT i.id,i.number,i.direction,i.status,i.source,i.created_at,i.source_document_type,i.source_document_date,i.company_id,c.name AS company_name,
-              count(ii.id)::int AS item_count,COALESCE(SUM(ii.declared_qty),0) AS declared_qty
-       FROM invoices i JOIN companies c ON c.id=i.company_id AND c.archived_at IS NULL LEFT JOIN invoice_items ii ON ii.invoice_id=i.id
-       WHERE i.warehouse_id=$1 AND i.source='1c' AND i.external_id IS NOT NULL AND i.direction='in'
-       GROUP BY i.id,c.name ORDER BY i.created_at DESC,i.id LIMIT 1001`, [req.auth.warehouseId])).rows);
-    res.set('Cache-Control','no-store').json({rows:rows.slice(0,1000),hasMore:rows.length>1000});
-  } catch (err) { next(err); }
-});
-
 router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
@@ -212,6 +206,11 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
       // Warehouse identity is non-secret. Seller context cannot read warehouse rows.
       return { id: company.id, name: company.name, warehouseId: company.warehouse_id };
     });
+    // Название склада — в шапке кабинета продавца («Восход · фулфилмент»).
+    // Строку склада продавцу читать нельзя, поэтому берём её в контексте склада.
+    const wh = await withTenantContext({ warehouseId: profile.warehouseId },
+      (c) => c.query('SELECT name FROM warehouses WHERE id = $1', [profile.warehouseId]));
+    profile.warehouseName = wh.rows[0]?.name || null;
     res.set('Cache-Control','no-store').json(profile);
   } catch (err) { next(err); }
 });
@@ -355,14 +354,57 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
     if (!companyId) throw new HttpError(400,'Укажите продавца');
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
       await requireActiveCompany(c, companyId);
+      // Приход рассказывает, как он прошёл (владелец 26.09.2026): когда
+      // начали выгружать (первая принятая строка), кто вёз и на чём, сколько
+      // принято, кто принимал и когда закончили. Возврат — сколько годного
+      // и сколько брака.
       return (await c.query(
-        `SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type, i.source_document_date,
-              count(ii.id)::int AS item_count, COALESCE(SUM(ii.declared_qty),0) AS declared_qty
-       FROM invoices i LEFT JOIN invoice_items ii ON ii.invoice_id=i.id AND ii.company_id=$1
-       WHERE i.company_id=$1 AND i.direction IN ('in','return')
-       GROUP BY i.id ORDER BY i.created_at DESC,i.id LIMIT 1001`, [companyId])).rows;
+        `WITH docs AS (
+           SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type,
+                  i.source_document_date, i.carrier, i.vehicle, i.inbound_comment
+             FROM invoices i
+            WHERE i.company_id=$1 AND i.direction IN ('in','return')
+            ORDER BY i.created_at DESC, i.id LIMIT 1001
+         ), items AS (
+           SELECT ii.invoice_id, count(*)::int AS item_count, SUM(ii.declared_qty) AS declared_qty
+             FROM invoice_items ii JOIN docs d ON d.id=ii.invoice_id
+            WHERE ii.company_id=$1 GROUP BY ii.invoice_id
+         ), rec AS (
+           SELECT ii.invoice_id, SUM(rr.accepted_qty) AS done_qty, MIN(rr.finished_at) AS first_at,
+                  MAX(rr.finished_at) AS last_at,
+                  array_agg(DISTINCT rr.worker_key_id) FILTER (WHERE rr.worker_key_id IS NOT NULL) AS workers,
+                  NULL::numeric AS good_qty, NULL::numeric AS bad_qty
+             FROM receiving_records rr JOIN invoice_items ii ON ii.id=rr.invoice_item_id
+             JOIN docs d ON d.id=ii.invoice_id
+            WHERE rr.company_id=$1 GROUP BY ii.invoice_id
+           UNION ALL
+           SELECT ii.invoice_id, SUM(rt.qty), MIN(rt.finished_at), MAX(rt.finished_at),
+                  array_agg(DISTINCT rt.worker_key_id) FILTER (WHERE rt.worker_key_id IS NOT NULL),
+                  SUM(rt.qty) FILTER (WHERE rt.quality_bucket='good'),
+                  SUM(rt.qty) FILTER (WHERE rt.quality_bucket<>'good')
+             FROM return_records rt JOIN invoice_items ii ON ii.id=rt.invoice_item_id
+             JOIN docs d ON d.id=ii.invoice_id
+            WHERE rt.company_id=$1 GROUP BY ii.invoice_id
+         )
+         SELECT d.*, COALESCE(it.item_count,0) AS item_count, COALESCE(it.declared_qty,0) AS declared_qty,
+                r.done_qty, r.first_at, r.last_at, r.workers, r.good_qty, r.bad_qty
+           FROM docs d LEFT JOIN items it ON it.invoice_id=d.id LEFT JOIN rec r ON r.invoice_id=d.id
+          ORDER BY d.created_at DESC, d.id`, [companyId])).rows;
     });
-    res.set('Cache-Control','no-store').json({ rows:rows.slice(0,1000),hasMore:rows.length>1000 });
+    // Имена работников — в контексте склада: продавцу таблица сотрудников
+    // закрыта, а «кто принимал» он видеть вправе.
+    const workerIds = [...new Set(rows.flatMap((r) => r.workers || []))];
+    const names = new Map();
+    if (workerIds.length) {
+      const got = await withTenantContext({ warehouseId: req.auth.warehouseId },
+        (c) => c.query('SELECT id, name FROM staff_keys WHERE id = ANY($1::uuid[])', [workerIds]));
+      got.rows.forEach((w) => names.set(w.id, w.name));
+    }
+    const list = rows.slice(0, 1000).map((r) => {
+      const { workers, ...rest } = r;
+      return { ...rest, received_by: (workers || []).map((id) => names.get(id)).filter(Boolean) };
+    });
+    res.set('Cache-Control','no-store').json({ rows: list, hasMore: rows.length > 1000 });
   } catch (err) { next(err); }
 });
 
@@ -379,8 +421,12 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
                 (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
                         WHERE si.invoice_id=i.id AND sr.company_id=$1 AND si.company_id=$1 AND sr.picked_qty>0))
                   AND i.mp_closed_at IS NOT NULL AND i.mp_stock_returned_at IS NULL AND i.status<>'shipped' AS stock_conflict,
-                ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article
+                ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article,
+                ii.mp_barcode, i.mp_created_at,
+                -- Поставка заказа — по ней продавец ищет и фильтрует заказы.
+                s.number AS supply_number, s.destination AS supply_destination
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+         LEFT JOIN supplies s ON s.id = i.supply_id AND s.company_id = $1
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
          ORDER BY (i.status = 'shipped' OR i.mp_closed_at IS NOT NULL), i.created_at DESC, i.id, ii.id
          LIMIT 1001`, [companyId])).rows;
@@ -401,7 +447,8 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
     // rows from unresolved order lines that have neither a product nor stock.
     const visibleRows = rows.filter(row => row.listed || row.stockKnown);
     res.set('Cache-Control', 'no-store').json(
-      req.auth.role === 'seller' ? sellerStockResponse(rows) : visibleRows,
+      // ?view=seller — владелец смотрит кабинет продавца его глазами.
+      req.auth.role === 'seller' || req.query.view === 'seller' ? sellerStockResponse(rows) : visibleRows,
     );
   } catch (err) { next(err); }
 });
@@ -475,6 +522,56 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
   } catch (err) {
     next(err);
   }
+});
+
+// Брак продавца (владелец 26.09.2026): что склад признал браком, откуда он
+// взялся и с каким описанием, и сколько брака лежит на складе сейчас. По этому
+// продавец связывается со складом и решает, что делать. Фото появятся, когда
+// склад начнёт их прикладывать (хранилище файлов — в «Отложено»).
+router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const out = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
+      await requireActiveCompany(c, companyId);
+      const now = (await c.query(
+        `SELECT cs.sku, COALESCE(MAX(p.name), cs.sku) AS name,
+                SUM(cs.qty) FILTER (WHERE cs.quality = 'defective') AS defective,
+                SUM(cs.qty) FILTER (WHERE cs.quality = 'packaging_defect') AS packaging
+           FROM cell_stock cs
+           LEFT JOIN products p ON p.company_id = cs.company_id AND p.sku = cs.sku
+          WHERE cs.company_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
+          GROUP BY cs.sku ORDER BY 2`, [companyId])).rows;
+      const events = (await c.query(
+        `SELECT * FROM (
+           SELECT rr.id::text AS id, rr.finished_at AS at, ii.sku, ii.name, rr.qty, rr.quality_bucket::text AS bucket,
+                  rr.defect_note AS note, 'return' AS source, i.number AS document
+             FROM return_records rr
+             JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+             JOIN invoices i ON i.id = ii.invoice_id
+            WHERE rr.company_id = $1 AND rr.quality_bucket <> 'good'
+           UNION ALL
+           SELECT op.id::text, op.created_at, op.sku, COALESCE(p.name, op.sku), op.qty,
+                  COALESCE(op.details->>'toQuality', op.details->>'quality'), NULL,
+                  op.kind, NULL
+             FROM stock_operations op
+             LEFT JOIN products p ON p.company_id = op.company_id AND p.sku = op.sku
+            WHERE op.company_id = $1
+              AND ((op.kind = 'repack' AND op.details->>'toQuality' IN ('defective', 'packaging_defect'))
+                OR (op.kind = 'inventory' AND op.details->>'quality' IN ('defective', 'packaging_defect')
+                    AND (op.details->>'countedQty')::numeric > (op.details->>'expectedQty')::numeric))
+         ) x ORDER BY at DESC LIMIT 500`, [companyId])).rows;
+      return { now, events };
+    });
+    const sourceName = { return: 'Возврат', repack: 'Перепаковка на складе', inventory: 'Пересчёт ячейки' };
+    res.set('Cache-Control', 'no-store').json({
+      now: out.now.map((r) => ({ sku: r.sku, name: r.name, defective: Number(r.defective || 0), packaging: Number(r.packaging || 0) })),
+      events: out.events.map((r) => ({
+        id: r.id, at: r.at, sku: r.sku, name: r.name, qty: Number(r.qty), bucket: r.bucket,
+        note: r.note || null, source: sourceName[r.source] || 'Склад', document: r.document || null,
+      })),
+    });
+  } catch (err) { next(err); }
 });
 
 // History remains under seller RLS, including every page requested by its cursor.
