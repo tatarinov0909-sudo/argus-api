@@ -64,6 +64,9 @@ const { loadStock } = require('../src/sellers/stock');
     const foreign=await order(90201,2,0,foreignCompany.id);
     const inSupply=await order(90109);
     const supply=await must('POST','/api/supplies',owner.token,{invoiceIds:[inSupply.id]},201);
+    // Поставка из двух заказов, один из которых WB отменил, остаётся.
+    const kept=await order(90110), keptGone=await order(90111);
+    const keptSupply=await must('POST','/api/supplies',owner.token,{invoiceIds:[kept.id,keptGone.id]},201);
     const physical=()=>run(q=>q.query(`SELECT company_id,sum(qty)::numeric AS qty FROM cell_stock WHERE warehouse_id=$1 GROUP BY company_id ORDER BY company_id`,[warehouseId]));
     const before=await physical();
     const response=[
@@ -76,13 +79,14 @@ const { loadStock } = require('../src/sellers/stock');
       {id:90108,supplierStatus:'cancel',wbStatus:'canceled'},
       {id:90108,supplierStatus:'new',wbStatus:'waiting'},
       {id:90109,supplierStatus:'cancel',wbStatus:'canceled'},
+      {id:90111,supplierStatus:'cancel',wbStatus:'canceled'},
       {id:90201,supplierStatus:'cancel',wbStatus:'canceled'},
     ];
     const result=await run(q=>reconcile(q,warehouseId,company.id,'synthetic-token',{fetchStatuses:async()=>response}));
-    check('explicit statuses close six; missing, unknown, duplicate and foreign IDs do not',()=>{
+    check('explicit statuses close seven; missing, unknown, duplicate and foreign IDs do not',()=>{
       // Conflicts are only orders with recorded picks: nobody has to undo anything
       // for an order that was merely listed in a supply.
-      assert.equal(result.closed,6);assert.equal(result.missing,2);assert.equal(result.conflicts,3);
+      assert.equal(result.closed,7);assert.equal(result.missing,3);assert.equal(result.conflicts,3);
     });
     const detached=await run(q=>q.query(`SELECT count(*)::int AS n FROM invoices WHERE id=ANY($1::uuid[]) AND supply_id IS NOT NULL`,[[picked.id,fulfilled.id,partial.id,inSupply.id]]));
     check('every order that WB closed has left its local supply in the same transaction',()=>assert.equal(detached.rows[0].n,0));
@@ -92,7 +96,7 @@ const { loadStock } = require('../src/sellers/stock');
     check('unknown and other company orders stay untouched',()=>assert.ok(unchanged.rows.every(r=>!r.mp_closed_at&&r.status==='open')));
     const stock=await run(q=>loadStock(q,company.id));
     check('untouched cancellation releases demand but picked and delivered orders remain reserved',()=>{
-      assert.equal(stock[0].onHand,20);assert.equal(stock[0].ordered,12);
+      assert.equal(stock[0].onHand,20);assert.equal(stock[0].ordered,14); // +2 — открытый заказ 90110
     });
     const jobs=await must('GET','/api/invoices?direction=out',worker.token);
     check('closed WB orders are absent from worker task queue',()=>assert.ok(!jobs.some(r=>[untouched.id,picked.id,fulfilled.id].includes(r.id))));
@@ -137,7 +141,7 @@ const { loadStock } = require('../src/sellers/stock');
     });
     const stockAfter=await run(q=>loadStock(q,company.id));
     check('return does not inflate on-hand while releasing canceled reservation',()=>{
-      assert.equal(stockAfter[0].onHand,20);assert.equal(stockAfter[0].ordered,10);
+      assert.equal(stockAfter[0].onHand,20);assert.equal(stockAfter[0].ordered,12);
     });
     const trace=await run(q=>q.query(`SELECT kind,qty,to_cell_block_id,details FROM stock_operations WHERE company_id=$1 AND kind='canceled_pick_return'`,[company.id]));
     check('returned picks leave exactly one immutable stock operation',()=>{
@@ -160,8 +164,14 @@ const { loadStock } = require('../src/sellers/stock');
     check('WB delivery with absent/partial local picking is conservatively blocked',()=>{});
     const supplyPreview=await must('GET',`/api/marketplaces/reconciliation/${inSupply.id}`,owner.token);
     check('an unpicked canceled order leaves its supply by itself — nothing is left to reconcile',()=>assert.equal(supplyPreview.action,null));
-    const s=await run(q=>q.query(`SELECT i.supply_id, sp.status FROM invoices i JOIN supplies sp ON sp.id=$2 WHERE i.id=$1`,[inSupply.id,supply.id]));
+    const s=await run(q=>q.query(`SELECT supply_id FROM invoices WHERE id=$1`,[inSupply.id]));
     check('canceled order leaves local supply without any stock movement',()=>assert.equal(s.rows[0].supply_id,null));
+    const left=await run(q=>q.query(`SELECT id FROM supplies WHERE id=ANY($1::uuid[])`,[[supply.id,keptSupply.id]]));
+    const note=await run(q=>q.query(`SELECT action_text FROM journal_entries WHERE entity_id=$1 AND action_text LIKE '%разобрана сама%'`,[supply.id]));
+    check('a supply left without orders is disbanded by itself; one with orders stays',()=>{
+      assert.deepEqual(left.rows.map(r=>r.id),[keptSupply.id]);
+      assert.equal(note.rows.length,1);assert.match(note.rows[0].action_text,new RegExp(supply.number));
+    });
     const forbidden=await api('GET','/api/marketplaces/reconciliation',worker.token);
     check('workers cannot perform owner reconciliation',()=>assert.equal(forbidden.status,403));
     const sellerKey=await must('POST',`/api/sellers/companies/${foreignCompany.id}/keys`,owner.token,{},201);

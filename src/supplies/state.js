@@ -1,3 +1,5 @@
+const journal = require('../journal/repository');
+
 // Состояние поставки следует за её заказами, а не за кнопкой.
 //
 // «Собрана» — это когда собран каждый заказ в ней, и узнать это можно
@@ -14,6 +16,23 @@ async function refreshSupplyStatus(client, warehouseId, supplyId) {
       WHERE s.warehouse_id = $1 AND s.id = $2 AND s.status <> 'shipped'`,
     [warehouseId, supplyId],
   );
+  // Из поставки ушли все заказы (WB закрыл или отменил их, сверка исключила)
+  // — пустая строка висела «собирается» навсегда, а разбирать её руками
+  // было некому (владелец 26.09.2026: «разбирай автоматически»). Поставку,
+  // уже заведённую на WB, не трогаем: её номер там живой.
+  const dropped = await client.query(
+    `DELETE FROM supplies s
+      WHERE s.warehouse_id = $1 AND s.id = $2 AND s.status = 'collecting' AND s.mp_supply_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.warehouse_id = $1 AND i.supply_id = s.id)
+      RETURNING s.number`,
+    [warehouseId, supplyId],
+  );
+  if (dropped.rowCount) {
+    await journal.createEntry(client, {
+      warehouseId, agent: 'Кладовщик', actorType: 'system', entityType: 'supply', entityId: supplyId,
+      actionText: `Поставка «${dropped.rows[0].number}» разобрана сама: в ней не осталось заказов — собирать нечего.`,
+    });
+  }
 }
 
 // Порядок блокировок один на всё приложение: сначала поставка, потом её
