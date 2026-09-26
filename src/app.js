@@ -82,6 +82,7 @@ function createApp() {
   app.use('/api/agents', agentRoutes);
   app.use('/api/alerts', alertRoutes);
   app.use('/api/acts', require('./acts/routes'));
+  app.use('/api/inbound', require('./inbound/routes'));
 
   app.use(errorHandler);
 

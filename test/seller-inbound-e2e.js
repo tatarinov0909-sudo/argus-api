@@ -58,7 +58,7 @@ const { parseInboundSheet } = require('../src/sellers/inbound');
     const grid = [['Баркод', 'Количество'], ['4600000000011', 10], ['4600000000028', '5'], ['4600000000011', 2], ['9999999999999', 3]];
     const preview = await api('POST', '/api/sellers/inbound', sa, { grid });
     assert.equal(preview.applied, false);
-    assert.deepEqual(preview.summary, { lines: 4, matched: 3, notMatched: 1, products: 2, units: 17 });
+    assert.deepEqual(preview.summary, { lines: 4, matched: 3, notMatched: 1, products: 2, units: 17, newProducts: 0, newUnits: 0 });
     assert.equal(preview.lines.find((l) => l.barcode === '9999999999999').sku, null);
     const byArticle = await api('POST', '/api/sellers/inbound', sa, { grid: [['Артикул', 'Кол-во'], ['art-3', 4]] });
     assert.equal(byArticle.lines[0].sku, 'IN-3');

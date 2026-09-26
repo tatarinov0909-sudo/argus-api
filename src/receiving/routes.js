@@ -58,6 +58,12 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         throw new HttpError(400, `«${item.invoice_number}» — это заказ на отгрузку, его не принимают`);
       }
 
+      // Начали выгружать — значит, машина приехала, даже если у ворот это
+      // забыли отметить.
+      if (item.direction === 'in') {
+        await client.query('UPDATE invoices SET arrived_at = COALESCE(arrived_at, now()) WHERE id = $1', [item.invoice_id]);
+      }
+
       const existing = await client.query(
         `SELECT id FROM receiving_records WHERE invoice_item_id = $1`,
         [invoiceItemId],

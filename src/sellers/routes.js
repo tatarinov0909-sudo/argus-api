@@ -160,9 +160,9 @@ router.post('/inbound', requireAuth, requireRole('seller', 'owner', 'manager'), 
       if (!company) throw new HttpError(404, 'Компания не найдена');
       return inbound.run(c, {
         warehouseId, companyId, grid: body.grid, apply: body.apply === true,
-        plannedDate: typeof body.plannedDate === 'string' && body.plannedDate ? body.plannedDate : null,
-        comment: typeof body.comment === 'string' ? body.comment.trim() : '',
-        carrier: body.carrier, vehicle: body.vehicle,
+        createNew: body.createNew === true, details: body,
+        // Замена списка товаров в уже оформленном привозе (до приезда машины).
+        replaceId: typeof body.invoiceId === 'string' && /^[0-9a-f-]{36}$/i.test(body.invoiceId) ? body.invoiceId : null,
         actor: req.auth.role === 'seller' ? { type: 'seller', id: req.auth.sellerKeyId || null }
           : { type: req.auth.role, id: req.auth.staffKeyId || req.auth.ownerId || null },
       });
@@ -364,7 +364,11 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
       return (await c.query(
         `WITH docs AS (
            SELECT i.id, i.number, i.direction, i.status, i.source, i.created_at, i.source_document_type,
-                  i.source_document_date, i.carrier, i.vehicle, i.inbound_comment
+                  i.source_document_date, i.carrier, i.vehicle, i.inbound_comment,
+                  i.planned_from, i.planned_to, i.boxes, i.pallets, i.weight_kg,
+                  i.arrived_at, i.arrived_boxes, i.arrived_pallets, i.seller_verdict,
+                  (SELECT count(*)::int FROM invoice_comments ic WHERE ic.invoice_id = i.id) AS comment_count,
+                  (SELECT count(*)::int FROM invoice_documents idc WHERE idc.invoice_id = i.id) AS document_count
              FROM invoices i
             WHERE i.company_id=$1 AND i.direction IN ('in','return')
             ORDER BY i.created_at DESC, i.id LIMIT 1001
@@ -375,13 +379,15 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
          ), rec AS (
            SELECT ii.invoice_id, SUM(rr.accepted_qty) AS done_qty, MIN(rr.finished_at) AS first_at,
                   MAX(rr.finished_at) AS last_at,
+                  -- Принято без ячейки («своё место»): ещё не размещено.
+                  SUM(rr.accepted_qty) FILTER (WHERE rr.cell_block_id IS NULL) AS unplaced_qty,
                   array_agg(DISTINCT rr.worker_key_id) FILTER (WHERE rr.worker_key_id IS NOT NULL) AS workers,
                   NULL::numeric AS good_qty, NULL::numeric AS bad_qty
              FROM receiving_records rr JOIN invoice_items ii ON ii.id=rr.invoice_item_id
              JOIN docs d ON d.id=ii.invoice_id
             WHERE rr.company_id=$1 GROUP BY ii.invoice_id
            UNION ALL
-           SELECT ii.invoice_id, SUM(rt.qty), MIN(rt.finished_at), MAX(rt.finished_at),
+           SELECT ii.invoice_id, SUM(rt.qty), MIN(rt.finished_at), MAX(rt.finished_at), NULL::numeric,
                   array_agg(DISTINCT rt.worker_key_id) FILTER (WHERE rt.worker_key_id IS NOT NULL),
                   SUM(rt.qty) FILTER (WHERE rt.quality_bucket='good'),
                   SUM(rt.qty) FILTER (WHERE rt.quality_bucket<>'good')
@@ -390,7 +396,7 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
             WHERE rt.company_id=$1 GROUP BY ii.invoice_id
          )
          SELECT d.*, COALESCE(it.item_count,0) AS item_count, COALESCE(it.declared_qty,0) AS declared_qty,
-                r.done_qty, r.first_at, r.last_at, r.workers, r.good_qty, r.bad_qty
+                r.done_qty, r.first_at, r.last_at, r.unplaced_qty, r.workers, r.good_qty, r.bad_qty
            FROM docs d LEFT JOIN items it ON it.invoice_id=d.id LEFT JOIN rec r ON r.invoice_id=d.id
           ORDER BY d.created_at DESC, d.id`, [companyId])).rows;
     });

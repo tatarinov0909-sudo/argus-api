@@ -5,8 +5,8 @@ const { HttpError } = require('../middleware/errorHandler');
 
 // Акты по шаблонам владельца (24.09.2026): «Акт приёмки на хранение» — по
 // приходу, «Акт отгрузки с хранения» — по поставке. Здесь только данные;
-// бумагу рисует act_print.html. Короба и паллеты Аргус не считает — в акте
-// эти клетки заполняют руками.
+// бумагу рисует act_print.html. Короба и паллеты по строкам Аргус не считает —
+// эти клетки заполняют руками; места привоза целиком — из «Привезти товар».
 const router = express.Router();
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -24,7 +24,9 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
     if (!uuid.test(req.params.id)) throw new HttpError(400, 'Некорректный номер прихода');
     const out = await withTenantContext({ warehouseId }, async (c) => {
       const inv = (await c.query(
-        `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.company_id, c.name AS seller
+        `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.company_id, c.name AS seller,
+                i.boxes, i.pallets, i.arrived_boxes, i.arrived_pallets,
+                i.seller_verdict, i.seller_verdict_at, i.seller_verdict_note
            FROM invoices i JOIN companies c ON c.id = i.company_id
           WHERE i.warehouse_id = $1 AND i.id = $2`, [warehouseId, req.params.id])).rows[0];
       if (!inv || (req.auth.role === 'seller' && inv.company_id !== req.auth.companyId)) {
@@ -46,6 +48,11 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
       // как текст раньше «Wed Sep 30» (проверка 25.09.2026).
       const acceptedAt = items.map((i) => i.accepted_at).filter(Boolean)
         .reduce((last, d) => (!last || new Date(d) > new Date(last) ? d : last), null);
+      // Переписка по приходу — в акт расхождений (владелец 26.09.2026: «в
+      // документе не хватает кода товара» должно быть видно в самом акте).
+      const comments = (await c.query(
+        `SELECT sku, author_name, body, created_at FROM invoice_comments WHERE invoice_id = $1 ORDER BY created_at, id`,
+        [inv.id])).rows;
       return {
         kind: 'receipt',
         number: inv.number,
@@ -63,6 +70,9 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
           declared: Number(i.declared_qty),
           accepted: i.accepted !== null,
         })),
+        places: { boxes: inv.boxes, pallets: inv.pallets, arrivedBoxes: inv.arrived_boxes, arrivedPallets: inv.arrived_pallets },
+        verdict: inv.seller_verdict ? { value: inv.seller_verdict, at: inv.seller_verdict_at, note: inv.seller_verdict_note } : null,
+        comments: comments.map((m) => ({ sku: m.sku, author: m.author_name, body: m.body, at: m.created_at })),
       };
     });
     res.json(out);

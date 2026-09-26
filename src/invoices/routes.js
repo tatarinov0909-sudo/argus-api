@@ -31,7 +31,13 @@ router.get('/', requireAuth, async (req, res, next) => {
                 c.name AS company_name,
                 -- Поставка заказа: экран грузчика собирает заказы по поставкам
                 -- и показывает, куда она едет.
-                i.supply_id, s.number AS supply_number, s.destination AS supply_destination
+                i.supply_id, s.number AS supply_number, s.destination AS supply_destination,
+                -- Привоз (владелец 26.09.2026): когда и в какое окно, сколько
+                -- мест, кто везёт, приехала ли машина, ответ продавца на акт.
+                i.source_document_type, i.source_document_date, i.planned_from, i.planned_to,
+                i.boxes, i.pallets, i.weight_kg, i.carrier, i.vehicle, i.inbound_comment,
+                i.arrived_at, i.arrived_boxes, i.arrived_pallets, i.seller_verdict,
+                CASE WHEN i.direction = 'in' THEN (SELECT count(*)::int FROM invoice_comments ic WHERE ic.invoice_id = i.id) END AS comment_count
          FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
          LEFT JOIN supplies s ON s.id = i.supply_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)

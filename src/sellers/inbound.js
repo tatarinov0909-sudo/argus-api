@@ -144,6 +144,90 @@ async function loadCatalog(client, companyId) {
   };
 }
 
+// Детали привоза (владелец 26.09.2026): дата и окно выгрузки, грузоместа,
+// кто везёт. Одна проверка — для оформления и для правки до приезда машины.
+const clean = (v, max) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : '') || null;
+function readDate(v) {
+  if (v == null || v === '') return null;
+  // Дата — настоящая: «2026-02-31» и «2026-99-99» проходили по образцу и
+  // уходили складу в журнал «Привезёт 99.99.2026».
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)
+      || Number.isNaN(new Date(v + 'T00:00:00Z').getTime())
+      || new Date(v + 'T00:00:00Z').toISOString().slice(0, 10) !== v
+      || v < '2020-01-01' || v > '2100-12-31') {
+    throw new HttpError(400, 'Дата привоза — настоящая дата в виде ГГГГ-ММ-ДД');
+  }
+  return v;
+}
+function readTime(v, what) {
+  if (v == null || v === '') return null;
+  if (typeof v !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) throw new HttpError(400, `${what} — время в виде ЧЧ:ММ`);
+  return v;
+}
+function readCount(v, what, max = 100000) {
+  if (v == null || v === '') return null;
+  const x = Number(v);
+  if (!Number.isInteger(x) || x < 0 || x > max) throw new HttpError(400, `${what} — целое число от 0 до ${max.toLocaleString('ru-RU')}`);
+  return x;
+}
+function readDetails(b = {}) {
+  const from = readTime(b.plannedFrom, 'Начало окна выгрузки');
+  const to = readTime(b.plannedTo, 'Конец окна выгрузки');
+  if (from && to && from >= to) throw new HttpError(400, 'Окно выгрузки: «с» должно быть раньше «до»');
+  const weight = b.weightKg == null || b.weightKg === '' ? null : Number(b.weightKg);
+  if (weight !== null && (!Number.isFinite(weight) || weight < 0 || weight > 1000000)) {
+    throw new HttpError(400, 'Вес — число килограммов от 0 до 1 000 000');
+  }
+  return {
+    plannedDate: readDate(b.plannedDate), plannedFrom: from, plannedTo: to,
+    boxes: readCount(b.boxes, 'Коробов'), pallets: readCount(b.pallets, 'Паллет'),
+    weightKg: weight === null ? null : Math.round(weight * 1000) / 1000,
+    carrier: clean(b.carrier, 120), vehicle: clean(b.vehicle, 20), comment: clean(b.comment, 300),
+  };
+}
+async function saveDetails(client, invoiceId, d) {
+  await client.query(
+    `UPDATE invoices SET source_document_date = $2, planned_from = $3, planned_to = $4, boxes = $5, pallets = $6,
+            weight_kg = $7, carrier = $8, vehicle = $9, inbound_comment = $10 WHERE id = $1`,
+    [invoiceId, d.plannedDate, d.plannedFrom, d.plannedTo, d.boxes, d.pallets, d.weightKg, d.carrier, d.vehicle, d.comment]);
+}
+// «Привезёт 27.09.2026 с 10:00 до 12:00. Грузомест: 5 коробов, 1 паллета, 120 кг.»
+const plural = (n, one, few, many) => {
+  const m10 = n % 10; const m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+};
+function placesText(boxes, pallets) {
+  return [boxes > 0 && `${boxes} ${plural(boxes, 'короб', 'короба', 'коробов')}`,
+    pallets > 0 && `${pallets} ${plural(pallets, 'паллета', 'паллеты', 'паллет')}`].filter(Boolean).join(', ');
+}
+function describe(d) {
+  const window = d.plannedFrom && d.plannedTo ? ` с ${d.plannedFrom} до ${d.plannedTo}`
+    : d.plannedFrom ? ` с ${d.plannedFrom}` : d.plannedTo ? ` до ${d.plannedTo}` : '';
+  const when = d.plannedDate ? `Привезёт ${d.plannedDate.split('-').reverse().join('.')}${window}.` : '';
+  const places = placesText(d.boxes, d.pallets);
+  return [when,
+    places || d.weightKg != null ? `Грузомест: ${places || '—'}${d.weightKg != null ? `, ${d.weightKg} кг` : ''}.` : '',
+    d.carrier ? `Везёт: ${d.carrier}${d.vehicle ? `, машина ${d.vehicle}` : ''}.` : '',
+    d.comment ? `Комментарий: ${d.comment}` : ''].filter(Boolean).join(' ');
+}
+
+// Привоз можно изменить или отменить, пока машина не приехала и ничего не
+// принято (владелец 26.09.2026). Только привоз, оформленный продавцом:
+// приход из 1С правится в 1С.
+async function lockEditable(client, warehouseId, invoiceId, companyId) {
+  const inv = (await client.query(
+    `SELECT i.id, i.number, i.company_id, i.status, i.direction, i.source_document_type, i.arrived_at,
+            EXISTS (SELECT 1 FROM receiving_records rr JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+                     WHERE ii.invoice_id = i.id) AS started
+       FROM invoices i WHERE i.warehouse_id = $1 AND i.id = $2 FOR UPDATE OF i`, [warehouseId, invoiceId])).rows[0];
+  if (!inv || inv.direction !== 'in' || (companyId && inv.company_id !== companyId)) throw new HttpError(404, 'Приход не найден');
+  if (inv.source_document_type !== 'seller_inbound') throw new HttpError(409, `Приход «${inv.number}» заведён складом — менять его может только склад`);
+  if (inv.arrived_at || inv.started || inv.status !== 'open') {
+    throw new HttpError(409, `Машина по приходу «${inv.number}» уже приехала — менять и отменять привоз поздно. Напишите складу в комментарии.`);
+  }
+  return inv;
+}
+
 // Следующий свободный номер прихода за сегодня — как у прихода, заведённого
 // складом: ПР-ДДММГГ-N. Год — чтобы через год номера не пошли по кругу.
 async function nextNumber(client, warehouseId) {
@@ -151,7 +235,9 @@ async function nextNumber(client, warehouseId) {
   const prefix = `ПР-${String(d.getDate()).padStart(2, '0')}${String(d.getMonth() + 1).padStart(2, '0')}`
     + `${String(d.getFullYear()).slice(2)}-`;
   const taken = new Set((await client.query(
-    'SELECT number FROM invoices WHERE warehouse_id = $1 AND number LIKE $2', [warehouseId, `${prefix}%`],
+    `SELECT number FROM invoices WHERE warehouse_id = $1 AND number LIKE $2
+     UNION SELECT number FROM inbound_canceled_numbers WHERE warehouse_id = $1 AND number LIKE $2`,
+    [warehouseId, `${prefix}%`],
   )).rows.map((r) => r.number));
   let n = 1;
   while (taken.has(prefix + n)) n += 1;
@@ -183,66 +269,102 @@ async function insertInvoice(client, warehouseId, companyId, plannedDate) {
   throw new HttpError(409, 'Не удалось выдать номер прихода — попробуйте ещё раз');
 }
 
+// Строка, которой нет в каталоге, может быть новым товаром (владелец
+// 26.09.2026: иначе «товар приедет незаявленным»). Заводим, только если есть
+// название и артикул или штрихкод: артикул становится артикулом карточки —
+// по нему обмен с 1С потом сам свяжет карточку с 1С.
+const newSku = (l) => (l.article || l.barcode || '').trim();
+const canBeNew = (l) => !l.error && !!l.name && l.name.length <= 300 && !!newSku(l) && newSku(l).length <= 100;
+
 async function run(client, {
-  warehouseId, companyId, grid, apply = false, plannedDate = null, comment = '', carrier = '', vehicle = '', actor = {},
+  warehouseId, companyId, grid, apply = false, createNew = false, replaceId = null, details = {}, actor = {},
 }) {
   const lines = parseInboundSheet(grid);
   const find = await loadCatalog(client, companyId);
   const found = [];
   const bySku = new Map();
+  const fresh = new Map(); // артикул в верхнем регистре → новая карточка
   for (const line of lines) {
     const { product, by } = line.error ? { product: null, by: null } : find(line);
     const item = { ...line, qty: line.qty || 0, sku: product ? product.sku : null, productName: product ? product.name : null, by };
+    if (!product && canBeNew(line)) {
+      item.isNew = true;
+      const key = newSku(line).toUpperCase();
+      const agg = fresh.get(key) || { sku: newSku(line), name: line.name, barcode: line.barcode, qty: 0 };
+      agg.qty += item.qty;
+      fresh.set(key, agg);
+    }
     found.push(item);
     if (!product) continue;
     const agg = bySku.get(product.sku) || { sku: product.sku, name: product.name, qty: 0 };
     agg.qty += item.qty;
     bySku.set(product.sku, agg);
   }
-  const items = [...bySku.values()];
   const summary = {
     lines: found.length,
     matched: found.filter((l) => l.sku).length,
-    notMatched: found.filter((l) => !l.sku).length,
-    products: items.length,
-    units: items.reduce((s, i) => s + i.qty, 0),
+    notMatched: found.filter((l) => !l.sku && !l.isNew).length,
+    products: bySku.size,
+    units: [...bySku.values()].reduce((s, i) => s + i.qty, 0),
+    newProducts: fresh.size,
+    newUnits: [...fresh.values()].reduce((s, i) => s + i.qty, 0),
   };
   if (!apply) return { applied: false, summary, lines: found };
-  if (!items.length) throw new HttpError(400, 'В файле не нашлось ни одного товара из вашего каталога');
-  // Дата — настоящая: «2026-02-31» и «2026-99-99» проходили по образцу и
-  // уходили складу в журнал «Привезёт 99.99.2026».
-  if (plannedDate && (!/^\d{4}-\d{2}-\d{2}$/.test(plannedDate)
-      || Number.isNaN(new Date(plannedDate + 'T00:00:00Z').getTime())
-      || new Date(plannedDate + 'T00:00:00Z').toISOString().slice(0, 10) !== plannedDate
-      || plannedDate < '2020-01-01' || plannedDate > '2100-12-31')) {
-    throw new HttpError(400, 'Дата привоза — настоящая дата в виде ГГГГ-ММ-ДД');
+  const d = readDetails(details);
+  const created = [];
+  if (createNew) {
+    for (const p of fresh.values()) {
+      const code = p.barcode && /^[0-9A-Za-z-]{4,64}$/.test(p.barcode) ? p.barcode : null;
+      // Такой артикул уже есть (без учёта регистра) — это он, а не новый.
+      const existing = (await client.query(
+        'SELECT sku, name FROM products WHERE warehouse_id = $1 AND company_id = $2 AND lower(sku) = lower($3)',
+        [warehouseId, companyId, p.sku])).rows[0];
+      if (!existing) {
+        await client.query(
+          'INSERT INTO products (warehouse_id, company_id, sku, name, barcode) VALUES ($1, $2, $3, $4, $5)',
+          [warehouseId, companyId, p.sku, p.name, code]);
+        created.push(p);
+      }
+      const sku = existing ? existing.sku : p.sku;
+      const agg = bySku.get(sku) || { sku, name: existing ? existing.name : p.name, qty: 0 };
+      agg.qty += p.qty;
+      bySku.set(sku, agg);
+    }
   }
+  const items = [...bySku.values()];
+  if (!items.length) throw new HttpError(400, 'В файле не нашлось ни одного товара из вашего каталога');
   const tooMuch = items.find((i) => i.qty > MAX_QTY);
   if (tooMuch) {
     throw new HttpError(400, `«${tooMuch.name}»: ${tooMuch.qty.toLocaleString('ru-RU')} шт. в одном приходе — больше `
       + `${MAX_QTY.toLocaleString('ru-RU')}. Проверьте количество в файле.`);
   }
   const company = (await client.query('SELECT name FROM companies WHERE id = $1', [companyId])).rows[0];
-  const inv = await insertInvoice(client, warehouseId, companyId, plannedDate);
-  // Кто везёт и на чём — пишут, когда готовят документы на выгрузку.
-  const clean = (v, max) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : '') || null;
-  await client.query('UPDATE invoices SET carrier = $2, vehicle = $3, inbound_comment = $4 WHERE id = $1',
-    [inv.id, clean(carrier, 120), clean(vehicle, 20), clean(comment, 300)]);
+  let inv;
+  if (replaceId) {
+    // Замена списка товаров до приезда машины: номер тот же, строки новые.
+    inv = await lockEditable(client, warehouseId, replaceId, companyId);
+    await client.query('DELETE FROM invoice_items WHERE invoice_id = $1', [inv.id]);
+  } else {
+    inv = await insertInvoice(client, warehouseId, companyId, d.plannedDate);
+  }
+  await saveDetails(client, inv.id, d);
   await client.query(
     `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
      SELECT $1, $2, $3, x.name, x.sku, x.qty
        FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
     [inv.id, warehouseId, companyId, JSON.stringify(items)]);
+  const units = items.reduce((sum, i) => sum + i.qty, 0);
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик',
-    actionText: `Продавец «${company.name}» оформил привоз ${inv.number}: ${items.length} товаров, ${summary.units} шт.`
-      + (plannedDate ? ` Привезёт ${plannedDate.split('-').reverse().join('.')}.` : '')
-      + (clean(carrier, 120) ? ` Везёт: ${clean(carrier, 120)}${clean(vehicle, 20) ? `, машина ${clean(vehicle, 20)}` : ''}.` : '')
-      + (comment ? ` Комментарий: ${String(comment).slice(0, 300)}` : ''),
+    actionText: `Продавец «${company.name}» ${replaceId ? 'заменил список товаров в привозе' : 'оформил привоз'} ${inv.number}: `
+      + `${items.length} товаров, ${units} шт. ${describe(d)}`.trim()
+      + (created.length ? ` Новые товары заведены в каталог из его файла (${created.length}): `
+        + created.slice(0, 5).map((p) => `«${p.name}» (${p.sku})`).join(', ') + (created.length > 5 ? ' и другие' : '')
+        + ' — проверьте карточки при приёмке.' : ''),
     entityType: 'invoice', entityId: inv.id, invoiceId: inv.id,
     actorType: actor.type || 'seller', actorId: actor.id || null,
   });
-  return { applied: true, summary, lines: found, invoice: inv };
+  return { applied: true, summary, lines: found, invoice: { id: inv.id, number: inv.number }, created: created.length };
 }
 
-module.exports = { parseInboundSheet, run };
+module.exports = { parseInboundSheet, run, readDetails, saveDetails, describe, placesText, lockEditable };

@@ -45,6 +45,8 @@ cat > /etc/nginx/sites-available/argus-api <<NGINX
 server {
     listen 80;
     server_name ${DOMAIN};
+    # Скан УПД к приходу — до 10 МБ (src/inbound/routes.js); по умолчанию nginx пускает 1 МБ.
+    client_max_body_size 12m;
 
     location / {
         proxy_pass http://127.0.0.1:3000;
