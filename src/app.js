@@ -35,6 +35,13 @@ function createApp() {
   // X-Argus-Token — продлённый вход (см. renewIfOld): без expose браузер
   // спрячет заголовок от страницы.
   app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') ?? true, exposedHeaders: ['X-Argus-Token'] }));
+  // Ответы API браузер не хранит (27.09.2026). Раньше он отвечал «не
+  // изменилось» (304) из своего кэша и отдавал странице вместе с телом старые
+  // заголовки — в том числе продлённый вход ДРУГОГО человека, работавшего в
+  // этом же браузере. Грузчик получал токен владельца и на каждом отборе
+  // упирался в «Недостаточно прав»; хуже — мог действовать правами владельца.
+  app.set('etag', false);
+  app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   // Default body-parser limit is 100kb — a 500-record 1C sync batch
   // (companies/products/invoices) routinely exceeds that.
   app.use(express.json({ limit: '5mb' }));

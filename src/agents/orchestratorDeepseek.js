@@ -8,6 +8,7 @@
 // добавлено вручную ниже.
 const { HttpError } = require('../middleware/errorHandler');
 const { SYSTEM_PROMPT, ALL_TOOLS, AGENT_BY_TOOL } = require('./orchestratorPrompt');
+const { parseCellAddress } = require('./kladovshchik');
 
 
 const API_URL = 'https://api.deepseek.com/chat/completions';
@@ -25,7 +26,7 @@ const TOOLS = ALL_TOOLS.map((t) => ({
 // «состояние склада»» было бы неправдой.
 function taskLabel(name, args) {
   switch (name) {
-    case 'find_products': return `найти «${args.query}»`;
+    case 'find_products': return parseCellAddress(args.query) ? `посмотреть ячейку ${args.query}` : `найти «${args.query}»`;
     case 'suggest_cell': return `подобрать ячейку для «${args.sku}»`;
     case 'invoice_details': return `посмотреть накладную «${args.number}»`;
     case 'warehouse_summary': return 'проверить состояние склада';

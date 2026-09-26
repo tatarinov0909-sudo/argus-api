@@ -185,6 +185,28 @@ function warehouseIdOf(token) {
       assert.equal(foundByName[0].name, 'Лимонад Лайм');
     });
 
+    // «Что лежит в 1.5.4?» — адрес ячейки в том же поиске (владелец 27.09.2026).
+    const addr = foundBySku[0].locations[0].label;
+    const inCell = await run((c) => kladovshchik.findProducts(c, warehouseId, addr));
+    check('по адресу ячейки называет, что в ней лежит', () => {
+      assert.equal(inCell.exists, true, JSON.stringify(inCell));
+      assert.equal(inCell.empty, false);
+      assert.ok(inCell.items.some((i) => i.sku === 'PB-LIME'), JSON.stringify(inCell));
+    });
+    const emptyLabel = await run(async (c) => {
+      const b = (await c.query(`SELECT wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+        FROM cell_blocks cb JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+        WHERE cb.warehouse_id = $1 AND NOT EXISTS (SELECT 1 FROM cell_stock cs WHERE cs.cell_block_id = cb.id AND cs.qty > 0)
+        LIMIT 1`, [warehouseId])).rows[0];
+      return require('../src/cells/label').formatBlockLabel(b.row_num, b);
+    });
+    const emptyCell = await run((c) => kladovshchik.findProducts(c, warehouseId, emptyLabel));
+    check('пустая ячейка — «пусто», а не «не умею искать»', () => {
+      assert.equal(emptyCell.exists, true); assert.equal(emptyCell.empty, true);
+    });
+    const noCell = await run((c) => kladovshchik.findProducts(c, warehouseId, '99.99.99'));
+    check('ячейки нет на карте — так и сказано', () => assert.equal(noCell.exists, false));
+
     await run(async (c) => {
       await c.query(
         `INSERT INTO products (warehouse_id, company_id, sku, name, barcode)

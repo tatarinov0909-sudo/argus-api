@@ -11,7 +11,48 @@
 const { kitInfo } = require('../kits/kits');
 const { formatBlockLabel } = require('../cells/label');
 
+// «Что лежит в 1.5.4?» (владелец 27.09.2026): Оркестратор искал адрес как
+// артикул, находил ноль и отвечал, что по ячейке искать не умеет. Отдельным
+// инструментом не делаем — каждый дорожает каждый вопрос; адрес «ряд.ярус.
+// ячейка» узнаём в том же поиске.
+function parseCellAddress(query) {
+  const m = String(query || '').trim().match(/^(\d{1,3})[.\-,/ ]+(\d{1,3})[.\-,/ ]+(\d{1,4})$/);
+  return m ? { row: Number(m[1]), tier: Number(m[2]), rack: Number(m[3]) } : null;
+}
+
+async function cellContents(client, warehouseId, { row, tier, rack }) {
+  const asked = `${row}.${tier}.${rack}`;
+  const block = (await client.query(
+    `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       FROM cell_blocks cb JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE cb.warehouse_id = $1 AND wr.row_num = $2
+        AND $3 BETWEEN cb.tier_start AND cb.tier_end AND $4 BETWEEN cb.rack_start AND cb.rack_end
+      LIMIT 1`, [warehouseId, row, tier, rack])).rows[0];
+  if (!block) return { cell: asked, exists: false, note: 'Такой ячейки на карте склада нет.' };
+  const items = (await client.query(
+    `SELECT cs.sku, c.name AS seller, cs.quality, SUM(cs.qty) AS qty,
+            COALESCE((SELECT p.name FROM products p WHERE p.warehouse_id = cs.warehouse_id
+                        AND p.company_id = cs.company_id AND p.sku = cs.sku LIMIT 1), cs.sku) AS name
+       FROM cell_stock cs JOIN companies c ON c.id = cs.company_id
+      WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2 AND cs.qty > 0
+      GROUP BY cs.warehouse_id, cs.company_id, cs.sku, c.name, cs.quality
+      ORDER BY name`, [warehouseId, block.id])).rows;
+  const qualityName = { good: 'годный', defective: 'брак', packaging_defect: 'брак упаковки' };
+  const label = formatBlockLabel(block.row_num, block);
+  return {
+    cell: label,
+    // Объединённая ячейка: спросили 1.5.4, а она 1.5.3–5 — говорим как есть.
+    merged: label !== asked,
+    exists: true,
+    empty: items.length === 0,
+    totalUnits: items.reduce((s, i) => s + Number(i.qty), 0),
+    items: items.map((i) => ({ sku: i.sku, name: i.name, seller: i.seller, qty: Number(i.qty), state: qualityName[i.quality] || i.quality })),
+  };
+}
+
 async function findProducts(client, warehouseId, query) {
+  const address = parseCellAddress(query);
+  if (address) return cellContents(client, warehouseId, address);
   const products = await client.query(
     `WITH product_catalog AS (
        SELECT p.sku, p.company_id, p.name, p.category, p.weight_g,
@@ -501,6 +542,7 @@ function runTool(client, warehouseId, name, args = {}) {
 }
 
 module.exports = {
+  parseCellAddress, cellContents,
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary,
   listDiscrepancies, pickList, runTool, recordSuggestion, recordSuggestionOutcome,
 };
