@@ -49,7 +49,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
       ($1, $2, 'LG-1', 'Футболка', '4600000000011'), ($1, $2, 'LG-2', 'Шорты', '4600000000028')`, [warehouseId, a.id]);
     const journalOf = async (invoiceId) => (await db('SELECT action_text, status FROM journal_entries WHERE invoice_id = $1 ORDER BY created_at, id', [invoiceId])).rows;
 
-    // 1 и 5. Окно выгрузки и грузоместа.
+    // 1 и 5. Время выгрузки (раньше — «окно выгрузки») и грузоместа.
     const grid = [['Баркод', 'Количество'], ['4600000000011', 10], ['4600000000028', 4]];
     const details = { plannedDate: '2026-10-01', plannedFrom: '10:00', plannedTo: '12:00', boxes: 5, pallets: 1, weightKg: 120.5, carrier: 'ТК', vehicle: 'А123ВС' };
     await api('POST', '/api/sellers/inbound', sa, { grid, apply: true, ...details, plannedFrom: '12:00', plannedTo: '10:00' }, 400);
@@ -59,7 +59,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     let card = await api('GET', `/api/inbound/${one.id}`, sa);
     assert.deepEqual([card.plannedDate, card.plannedFrom, card.plannedTo, card.boxes, card.pallets, card.weightKg], ['2026-10-01', '10:00', '12:00', 5, 1, 120.5]);
     assert.equal(card.editable, true);
-    assert.match((await journalOf(one.id))[0].action_text, /01\.10\.2026 с 10:00 до 12:00.*5 коробов, 1 паллета, 120\.5 кг/);
+    assert.match((await journalOf(one.id))[0].action_text, /01\.10\.2026, время выгрузки с 10:00 до 12:00.*5 коробов, 1 паллета, 120\.5 кг/);
     const listed = (await api('GET', '/api/invoices?direction=in', worker)).find((r) => r.id === one.id);
     assert.equal(listed.boxes, 5); assert.equal(String(listed.planned_from).slice(0, 5), '10:00');
     check('window and places are saved, validated, shown to worker and journal');

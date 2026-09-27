@@ -26,6 +26,8 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
       const inv = (await c.query(
         `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.company_id, c.name AS seller,
                 i.boxes, i.pallets, i.arrived_boxes, i.arrived_pallets,
+                i.source_document_type, i.source_document_date AS planned_date,
+                to_char(i.planned_from, 'HH24:MI') AS planned_from, to_char(i.planned_to, 'HH24:MI') AS planned_to, i.arrived_at,
                 i.seller_verdict, i.seller_verdict_at, i.seller_verdict_note
            FROM invoices i JOIN companies c ON c.id = i.company_id
           WHERE i.warehouse_id = $1 AND i.id = $2`, [warehouseId, req.params.id])).rows[0];
@@ -71,6 +73,12 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
           accepted: i.accepted !== null,
         })),
         places: { boxes: inv.boxes, pallets: inv.pallets, arrivedBoxes: inv.arrived_boxes, arrivedPallets: inv.arrived_pallets },
+        // Когда привоз ждали у ворот («время выгрузки», владелец 27.09.2026)
+        // и когда машина приехала на самом деле.
+        delivery: {
+          plannedDate: inv.source_document_type === 'seller_inbound' && inv.planned_date ? String(inv.planned_date).slice(0, 10) : null,
+          from: inv.planned_from, to: inv.planned_to, arrivedAt: inv.arrived_at,
+        },
         verdict: inv.seller_verdict ? { value: inv.seller_verdict, at: inv.seller_verdict_at, note: inv.seller_verdict_note } : null,
         comments: comments.map((m) => ({ sku: m.sku, author: m.author_name, body: m.body, at: m.created_at })),
       };

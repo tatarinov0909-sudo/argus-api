@@ -144,7 +144,7 @@ async function loadCatalog(client, companyId) {
   };
 }
 
-// Детали привоза (владелец 26.09.2026): дата и окно выгрузки, грузоместа,
+// Детали привоза (владелец 26.09.2026): дата и время выгрузки, грузоместа,
 // кто везёт. Одна проверка — для оформления и для правки до приезда машины.
 const clean = (v, max) => (typeof v === 'string' ? v.trim().replace(/\s+/g, ' ').slice(0, max) : '') || null;
 function readDate(v) {
@@ -171,9 +171,9 @@ function readCount(v, what, max = 100000) {
   return x;
 }
 function readDetails(b = {}) {
-  const from = readTime(b.plannedFrom, 'Начало окна выгрузки');
-  const to = readTime(b.plannedTo, 'Конец окна выгрузки');
-  if (from && to && from >= to) throw new HttpError(400, 'Окно выгрузки: «с» должно быть раньше «до»');
+  const from = readTime(b.plannedFrom, 'Время выгрузки «с»');
+  const to = readTime(b.plannedTo, 'Время выгрузки «до»');
+  if (from && to && from >= to) throw new HttpError(400, 'Время выгрузки: «с» должно быть раньше «до»');
   const weight = b.weightKg == null || b.weightKg === '' ? null : Number(b.weightKg);
   if (weight !== null && (!Number.isFinite(weight) || weight < 0 || weight > 1000000)) {
     throw new HttpError(400, 'Вес — число килограммов от 0 до 1 000 000');
@@ -191,7 +191,9 @@ async function saveDetails(client, invoiceId, d) {
             weight_kg = $7, carrier = $8, vehicle = $9, inbound_comment = $10 WHERE id = $1`,
     [invoiceId, d.plannedDate, d.plannedFrom, d.plannedTo, d.boxes, d.pallets, d.weightKg, d.carrier, d.vehicle, d.comment]);
 }
-// «Привезёт 27.09.2026 с 10:00 до 12:00. Грузомест: 5 коробов, 1 паллета, 120 кг.»
+// «Привезёт 27.09.2026, время выгрузки с 10:00 до 12:00. Грузомест: 5 коробов,
+// 1 паллета, 120 кг.» «Время выгрузки» — время у ворот склада (владелец
+// 27.09.2026; раньше — «окно выгрузки»).
 const plural = (n, one, few, many) => {
   const m10 = n % 10; const m100 = n % 100;
   return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
@@ -201,8 +203,8 @@ function placesText(boxes, pallets) {
     pallets > 0 && `${pallets} ${plural(pallets, 'паллета', 'паллеты', 'паллет')}`].filter(Boolean).join(', ');
 }
 function describe(d) {
-  const window = d.plannedFrom && d.plannedTo ? ` с ${d.plannedFrom} до ${d.plannedTo}`
-    : d.plannedFrom ? ` с ${d.plannedFrom}` : d.plannedTo ? ` до ${d.plannedTo}` : '';
+  const window = d.plannedFrom && d.plannedTo ? `, время выгрузки с ${d.plannedFrom} до ${d.plannedTo}`
+    : d.plannedFrom ? `, время выгрузки с ${d.plannedFrom}` : d.plannedTo ? `, время выгрузки до ${d.plannedTo}` : '';
   const when = d.plannedDate ? `Привезёт ${d.plannedDate.split('-').reverse().join('.')}${window}.` : '';
   const places = placesText(d.boxes, d.pallets);
   return [when,

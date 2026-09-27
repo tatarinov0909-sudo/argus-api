@@ -96,7 +96,7 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
   } catch (err) { next(err); }
 });
 
-// Изменить привоз до приезда машины: дата, окно, грузоместа, кто везёт.
+// Изменить привоз до приезда машины: дата, время выгрузки, грузоместа, кто везёт.
 // Список товаров меняется повторной загрузкой файла (POST /api/sellers/inbound
 // с invoiceId).
 router.patch('/:id', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
@@ -109,7 +109,7 @@ router.patch('/:id', requireAuth, requireRole('seller', 'owner', 'manager'), asy
       await journal.createEntry(c, {
         warehouseId: req.auth.warehouseId, agent: 'Кладовщик',
         actionText: `${req.auth.role === 'seller' ? `Продавец «${found.company_name}»` : 'Склад'} изменил привоз ${inv.number}. `
-          + (inbound.describe(d) || 'Дата, окно и грузоместа не указаны.'),
+          + (inbound.describe(d) || 'Дата, время выгрузки и грузоместа не указаны.'),
         entityType: 'invoice', entityId: inv.id, invoiceId: inv.id, ...actorFields(req.auth),
       });
       return { ok: true };
