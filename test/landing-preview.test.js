@@ -1,0 +1,72 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { randomBytes } = require('node:crypto');
+const { mkdtemp, writeFile, rm } = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { createLandingPreviewRouter } = require('../src/landing-preview/routes');
+
+test('private landing: files, password, cookies, role isolation, limiter and logout', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'argus-preview-test-'));
+  const password = randomBytes(24).toString('base64url');
+  const passwordHash = await bcrypt.hash(password, 4);
+  await writeFile(path.join(directory, 'landing.html'), '<h1>Private preview</h1>');
+  await writeFile(path.join(directory, 'scene.js'), 'const preview = true;');
+  await writeFile(path.join(directory, '.hidden'), 'not public');
+  const app = express();
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  app.use('/landing-preview', createLandingPreviewRouter({ passwordHash, directory, origin }));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true }); });
+  const request = (url, options) => fetch(origin + '/landing-preview' + url, { redirect: 'manual', ...options });
+  const login = (value, requestOrigin = origin) => request('/login', { method: 'POST',
+    headers: { origin: requestOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ password: value }) });
+  assert.equal((await request('/')).status, 303);
+  assert.equal((await request('/landing.html')).status, 303);
+  assert.equal((await request('/scene.js')).status, 401);
+  const form = await request('/login');
+  assert.equal(form.status, 200);
+  assert.match(form.headers.get('cache-control'), /no-store/);
+  assert.match(form.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.equal((await login(password, 'https://unrelated.invalid')).status, 403);
+  assert.equal((await login(randomBytes(24).toString('hex'))).status, 401);
+  const success = await login(password);
+  assert.equal(success.status, 303);
+  const setCookie = success.headers.get('set-cookie');
+  for (const flag of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/landing-preview/']) assert.ok(setCookie.includes(flag));
+  const cookie = setCookie.split(';')[0];
+  const html = await request('/', { headers: { cookie } });
+  assert.equal(html.status, 200);
+  assert.match(await html.text(), /Private preview/);
+  assert.match(html.headers.get('cache-control'), /no-store/);
+  assert.equal((await request('/scene.js', { headers: { cookie } })).status, 200);
+  assert.equal((await request('/.hidden', { headers: { cookie } })).status, 404);
+  assert.equal((await request('/%2e%2e%2f.env', { headers: { cookie } })).status, 404);
+  const fakeRoleToken = jwt.sign({ role: 'owner' }, randomBytes(32));
+  assert.equal((await request('/scene.js', { headers: { cookie: 'argus_landing_preview=' + fakeRoleToken } })).status, 401);
+  assert.equal((await request('/scene.js', { headers: { cookie: cookie + 'tampered' } })).status, 401);
+  assert.throws(() => jwt.verify(cookie.split('=')[1], randomBytes(32)));
+  const logout = await request('/logout', { method: 'POST', headers: { origin, cookie } });
+  assert.equal(logout.status, 303);
+  assert.match(logout.headers.get('set-cookie'), /Expires=Thu, 01 Jan 1970/);
+  for (let i = 0; i < 9; i++) assert.equal((await login(randomBytes(24).toString('hex'))).status, 401);
+  const blocked = await login(password);
+  assert.equal(blocked.status, 429);
+  assert.match(blocked.headers.get('content-type'), /text\/html/);
+  assert.ok(Number(blocked.headers.get('retry-after')) > 0);
+});
+
+test('without a password hash, preview fails closed', async t => {
+  const app = express();
+  app.use('/landing-preview', createLandingPreviewRouter({ passwordHash: '' }));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/landing-preview/scene.js`);
+  assert.equal(response.status, 503);
+});

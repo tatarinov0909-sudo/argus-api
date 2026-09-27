@@ -67,6 +67,8 @@ function createApp() {
 
   app.get('/health', (req, res) => res.json({ ok: true }));
 
+  app.use('/landing-preview', require('./landing-preview/routes').createLandingPreviewRouter());
+
   app.use('/api/auth', authRoutes);
   app.use('/api/warehouses', warehouseRoutes);
   app.use('/api/staff', staffRoutes);
