@@ -7,7 +7,7 @@ const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const inbound = require('./inbound');
 
-const { loadStock } = require('./stock');
+const { loadStock, BUCKET_SQL } = require('./stock');
 const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
@@ -417,14 +417,19 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
   } catch (err) { next(err); }
 });
 
+// ?sku= — заказы одного товара: список за числами «Заказано», «В сборке»,
+// «В пути» в карточке товара (владелец 27.09.2026). bucket — под каким из
+// этих чисел стоит строка; правило то же, что у самих чисел (stock.js).
 router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const sku = req.query.sku == null ? null : String(req.query.sku).trim();
+    if (sku !== null && (!sku || sku.length > 200)) throw new HttpError(400, 'Некорректный артикул');
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
       return (await client.query(
-        `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at,
+        `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at, ${BUCKET_SQL} AS bucket,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
                 i.mp_close_reason, i.mp_stock_returned_at, (i.supply_id IS NOT NULL) AS in_supply,
                 (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id
@@ -437,8 +442,9 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          LEFT JOIN supplies s ON s.id = i.supply_id AND s.company_id = $1
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
+           AND ($2::text IS NULL OR ii.sku = $2)
          ORDER BY (i.status = 'shipped' OR i.mp_closed_at IS NOT NULL), i.created_at DESC, i.id, ii.id
-         LIMIT 1001`, [companyId])).rows;
+         LIMIT 1001`, [companyId, sku])).rows;
     });
     res.json({ rows: rows.slice(0, 1000), hasMore: rows.length > 1000 });
   } catch (err) { next(err); }

@@ -1,3 +1,21 @@
+// Одно правило для четырёх чисел продавца и для списка заказов за ними
+// (задание 27.09.2026: список под числом обязан совпадать с числом).
+// $1 — продавец. «В сборке» — заказ в поставке или по нему уже отбирали.
+const IN_ASSEMBLY_SQL = `(i.supply_id IS NOT NULL OR EXISTS (
+                     SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
+                      WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
+                   ))`;
+// Заказ ещё обещан покупателю: не уехал и не закрыт WB — или закрыт, но
+// товар уже в работе и на полку не вернулся (склад сверяет).
+const DEMAND_SQL = `(i.status <> 'shipped'
+             AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND ${IN_ASSEMBLY_SQL})))`;
+// «В пути» (владелец 26.09.2026): уехало поставкой на WB, WB ещё не принял.
+const TRANSIT_SQL = `(i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.mp_closed_at IS NULL)`;
+// Под каким числом у продавца стоит строка заказа: ordered | assembly | transit | null.
+const BUCKET_SQL = `CASE WHEN ${TRANSIT_SQL} THEN 'transit'
+                         WHEN ${DEMAND_SQL} THEN CASE WHEN ${IN_ASSEMBLY_SQL} THEN 'assembly' ELSE 'ordered' END
+                    END`;
+
 async function loadStock(client, companyId) {
       const result = await client.query(
         `WITH cells AS (
@@ -65,19 +83,12 @@ async function loadStock(client, companyId) {
            -- списан, а из учёта 1С ещё нет — реализация проводится при
            -- отгрузке. Не вычти их, и продавцу обещано то, что уже уезжает.
            SELECT ii.sku, ii.declared_qty, i.id AS invoice_id, i.status,
-                  (i.supply_id IS NOT NULL OR EXISTS (
-                     SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
-                      WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
-                   )) AS in_assembly,
+                  ${IN_ASSEMBLY_SQL} AS in_assembly,
                   (i.mp_closed_at IS NOT NULL) AS closed
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
            WHERE i.company_id = $1 AND ii.company_id = $1
-             AND i.direction = 'out' AND i.status <> 'shipped'
-             AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND (i.supply_id IS NOT NULL OR EXISTS (
-               SELECT 1 FROM shipping_records sx JOIN invoice_items ix ON ix.id=sx.invoice_item_id
-               WHERE ix.invoice_id=i.id AND ix.company_id=$1 AND sx.company_id=$1 AND sx.picked_qty>0
-             ))))
+             AND i.direction = 'out' AND ${DEMAND_SQL}
          ), ordered AS (
            SELECT sku,
                   SUM(declared_qty) AS qty,
@@ -107,7 +118,7 @@ async function loadStock(client, companyId) {
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.mp_closed_at IS NULL
+             AND ${TRANSIT_SQL}
            GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
@@ -220,4 +231,4 @@ async function loadStock(client, companyId) {
     });
 }
 
-module.exports = { loadStock };
+module.exports = { loadStock, BUCKET_SQL };
