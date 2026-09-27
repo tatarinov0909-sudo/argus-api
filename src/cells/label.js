@@ -5,16 +5,30 @@
 // копии этой логики разъедутся на первой же правке, и работник получит
 // «01-10-015» в одном месте и «1.10.15» в другом.
 //
-// Адрес — «ряд.ярус.ячейка» (решение владельца 24.09.2026): «1.1.2» — первый
-// ряд, первый ярус, вторая ячейка, ровно как на карте склада. Имя ячейки из
-// 1С («01-01-001») не показываем: оно не совпадает с картой, и человек его не
-// понимает. Оно остаётся в базе только для сверки с файлами 1С.
+// Адрес — «ряд.стеллаж.ярус» (решение владельца 27.09.2026, рисунок: по
+// горизонтали стеллажи 1, 2, 3…, по вертикали ярусы 1…6, ячейка — их
+// пересечение). «1.7.3» — ряд 1, стеллаж 7, ярус 3. До 27.09 адрес писался
+// «ряд.ярус.ячейка», и та же ячейка была подписана «1.3.7».
+//
+// Имя ячейки из 1С («01-01-001») не показываем: оно не совпадает с картой, и
+// человек его не понимает. Оно остаётся в базе только для сверки с файлами 1С.
 function formatBlockLabel(rowNum, block) {
   const rackPart = block.rack_start === block.rack_end
     ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
   const tierPart = block.tier_start === block.tier_end
     ? block.tier_start : `${block.tier_start}–${block.tier_end}`;
-  return `${rowNum}.${tierPart}.${rackPart}`;
+  return `${rowNum}.${rackPart}.${tierPart}`;
 }
 
-module.exports = { formatBlockLabel };
+// То же самое в SQL — для запросов, которые отдают адрес строкой (журнал,
+// история ячейки): собирать его в JS ради подписи значило бы тянуть карту.
+// cb — cell_blocks, wr — warehouse_rows.
+function blockLabelSql(cb = 'cb', wr = 'wr') {
+  return `(${wr}.row_num
+      || '.' || CASE WHEN ${cb}.rack_start = ${cb}.rack_end THEN ${cb}.rack_start::text
+                     ELSE ${cb}.rack_start || '–' || ${cb}.rack_end END
+      || '.' || CASE WHEN ${cb}.tier_start = ${cb}.tier_end THEN ${cb}.tier_start::text
+                     ELSE ${cb}.tier_start || '–' || ${cb}.tier_end END)`;
+}
+
+module.exports = { formatBlockLabel, blockLabelSql };

@@ -22,10 +22,14 @@ router.get('/kladovshchik/find', requireAuth, requireRole('owner', 'worker'), as
     if (!q) throw new HttpError(400, 'Укажите ?q= — что искать');
 
     const { warehouseId } = req.auth;
-    const results = await withTenantContext({ warehouseId }, (client) => (
-      kladovshchik.findProducts(client, warehouseId, q)
+    const found = await withTenantContext({ warehouseId }, (client) => (
+      kladovshchik.findProducts(client, warehouseId, q, { withId: true })
     ));
-    res.json({ results });
+    // Адрес ячейки («1.7.3») Кладовщик отвечает её содержимым, а не списком
+    // товаров. results остаётся списком всегда: поиск по карте склада ждал
+    // массив и падал на адресе.
+    if (!Array.isArray(found)) return res.json({ results: [], cell: found });
+    res.json({ results: found });
   } catch (err) {
     next(err);
   }

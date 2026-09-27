@@ -1,3 +1,5 @@
+const { blockLabelSql } = require('../cells/label');
+
 // Append-only by construction: this module exports no update/delete
 // function, the DB grants for the argus_app role REVOKE UPDATE/DELETE on
 // journal_entries (see setup-app-role.sql), and confirm()/rollback() below
@@ -59,14 +61,8 @@ async function listEntries(client, warehouseId, {
             -- собирается в кабинете в одну запись вместо строки на каждый товар.
             i.supply_id AS invoice_supply_id,
             s.number AS invoice_supply_number,
-            CASE WHEN cb.id IS NULL THEN NULL ELSE
-              wr.row_num
-              -- «ряд.ярус.ячейка», как на карте склада (см. cells/label.js).
-              || '.' || CASE WHEN cb.tier_start = cb.tier_end THEN cb.tier_start::text
-                             ELSE cb.tier_start || '–' || cb.tier_end END
-              || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
-                             ELSE cb.rack_start || '–' || cb.rack_end END
-            END AS cell_label
+            -- «ряд.стеллаж.ярус», как на карте склада (см. cells/label.js).
+            CASE WHEN cb.id IS NULL THEN NULL ELSE ${blockLabelSql('cb', 'wr')} END AS cell_label
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id
      LEFT JOIN supplies s ON s.id = i.supply_id
@@ -110,10 +106,7 @@ async function cellOperations(client, warehouseId, cellBlockId) {
     `SELECT op.id, op.kind, op.sku, op.qty, op.created_at, op.worker_key_id,
             op.from_cell_block_id, op.to_cell_block_id,
             p.name, sk.name AS actor_name,
-            wr.row_num || '.' || CASE WHEN cb.tier_start = cb.tier_end THEN cb.tier_start::text
-                                      ELSE cb.tier_start || '–' || cb.tier_end END
-                       || '.' || CASE WHEN cb.rack_start = cb.rack_end THEN cb.rack_start::text
-                                      ELSE cb.rack_start || '–' || cb.rack_end END AS to_label
+            ${blockLabelSql('cb', 'wr')} AS to_label
        FROM stock_operations op
        LEFT JOIN products p ON p.warehouse_id = op.warehouse_id AND p.company_id = op.company_id AND p.sku = op.sku
        LEFT JOIN staff_keys sk ON sk.id = op.worker_key_id

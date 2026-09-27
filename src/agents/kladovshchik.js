@@ -13,15 +13,18 @@ const { formatBlockLabel } = require('../cells/label');
 
 // «Что лежит в 1.5.4?» (владелец 27.09.2026): Оркестратор искал адрес как
 // артикул, находил ноль и отвечал, что по ячейке искать не умеет. Отдельным
-// инструментом не делаем — каждый дорожает каждый вопрос; адрес «ряд.ярус.
-// ячейка» узнаём в том же поиске.
+// инструментом не делаем — каждый дорожает каждый вопрос; адрес «ряд.стеллаж.
+// ярус» (cells/label.js) узнаём в том же поиске: 1.7.3 — ряд 1, стеллаж 7,
+// ярус 3.
 function parseCellAddress(query) {
-  const m = String(query || '').trim().match(/^(\d{1,3})[.\-,/ ]+(\d{1,3})[.\-,/ ]+(\d{1,4})$/);
-  return m ? { row: Number(m[1]), tier: Number(m[2]), rack: Number(m[3]) } : null;
+  const m = String(query || '').trim().match(/^(\d{1,3})[.\-,/ ]+(\d{1,4})[.\-,/ ]+(\d{1,3})$/);
+  return m ? { row: Number(m[1]), rack: Number(m[2]), tier: Number(m[3]) } : null;
 }
 
-async function cellContents(client, warehouseId, { row, tier, rack }) {
-  const asked = `${row}.${tier}.${rack}`;
+// withId — отдать и id ячейки: поиску на карте склада надо на неё перейти.
+// Агенту id не нужен — лишнее слово в каждом ответе стоит денег.
+async function cellContents(client, warehouseId, { row, rack, tier }, { withId = false } = {}) {
+  const asked = `${row}.${rack}.${tier}`;
   const block = (await client.query(
     `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_blocks cb JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
@@ -41,6 +44,7 @@ async function cellContents(client, warehouseId, { row, tier, rack }) {
   const label = formatBlockLabel(block.row_num, block);
   return {
     cell: label,
+    ...(withId ? { cellBlockId: block.id } : {}),
     // Объединённая ячейка: спросили 1.5.4, а она 1.5.3–5 — говорим как есть.
     merged: label !== asked,
     exists: true,
@@ -50,9 +54,9 @@ async function cellContents(client, warehouseId, { row, tier, rack }) {
   };
 }
 
-async function findProducts(client, warehouseId, query) {
+async function findProducts(client, warehouseId, query, { withId = false } = {}) {
   const address = parseCellAddress(query);
-  if (address) return cellContents(client, warehouseId, address);
+  if (address) return cellContents(client, warehouseId, address, { withId });
   const products = await client.query(
     `WITH product_catalog AS (
        SELECT p.sku, p.company_id, p.name, p.category, p.weight_g,

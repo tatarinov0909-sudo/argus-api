@@ -23,7 +23,7 @@ function check(name, fn) {
     await ok('POST', '/api/products', w.token, { companyId: sellerA, sku: 'SAME-1', name: 'Товар А' });
     await ok('POST', '/api/products', w.token, { companyId: sellerB, sku: 'SAME-1', name: 'Товар Б' });
     const blocks = await w.cells([{ rackCount: 4, tierCount: 1 }]);
-    // Ячейка 1.1.3 занята товаром продавца Б.
+    // Ячейка 1.3.1 (стеллаж 3) занята товаром продавца Б.
     const busy = blocks.find((b) => b.rack_start === 3);
     await w.run((c) => c.query(
       `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty) VALUES ($1, $2, $3, 'SAME-1', 20)`,

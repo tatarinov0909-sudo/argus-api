@@ -48,7 +48,7 @@ const QUALITY_WORDS = new Map([
 
 // Имя ячейки для сравнения: без регистра, пробелов и ведущих нулей.
 // «1-3-11» и «01-03-011» — одна табличка. Разделители при этом значимы:
-// «1.3.11» — наш адрес «ряд.ярус.ячейка», это другое место, и совпасть
+// «1.3.11» — наш адрес «ряд.стеллаж.ярус», это другое место, и совпасть
 // с табличкой «01-03-011» оно не должно.
 function cellKey(text) {
   return String(text).trim().toUpperCase().replace(/\s+/g, '')
@@ -68,8 +68,8 @@ function parseQty(value) {
 }
 
 // Все ячейки склада по всем именам, под которыми их знают люди: табличка
-// со стеллажа (label) и наш адрес «ряд.ярус.ячейка» — его показывают карта,
-// экран грузчика и выгрузка остатков (formatBlockLabel, решение 24.09.2026).
+// со стеллажа (label) и наш адрес «ряд.стеллаж.ярус» — его показывают карта,
+// экран грузчика и выгрузка остатков (formatBlockLabel, решение 27.09.2026).
 // У объединённой ячейки наш адрес — любое место внутри неё.
 async function cellIndex(client, warehouseId) {
   const r = await client.query(
@@ -90,9 +90,9 @@ async function cellIndex(client, warehouseId) {
     if (b.label) add(cellKey(b.label), b.id);
     for (let rack = b.rack_start; rack <= b.rack_end; rack += 1) {
       for (let tier = b.tier_start; tier <= b.tier_end; tier += 1) {
-        add(cellKey(`${b.row_num}.${tier}.${rack}`), b.id);
+        add(cellKey(`${b.row_num}.${rack}.${tier}`), b.id);
         // Имя ряда, которое владелец дал сам («А»), — так адрес пишет кабинет.
-        if (b.row_label) add(cellKey(`${b.row_label}.${tier}.${rack}`), b.id);
+        if (b.row_label) add(cellKey(`${b.row_label}.${rack}.${tier}`), b.id);
       }
     }
   }
@@ -173,7 +173,7 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
     }
     if (!line.cell) { line.error = 'не указана ячейка'; return; }
     // «01.02.005» — табличка, записанная через точки. Без нулей это наш адрес
-    // «1.2.5», то есть совсем другая полка (ярус 10 на карте стоит вторым).
+    // «1.2.5» (ряд 1, стеллаж 2, ярус 5), то есть совсем другая полка.
     // Молча положить товар туда хуже, чем переспросить.
     if (line.cell.includes('.') && /(^|\D)0\d/.test(line.cell)) {
       line.error = 'похоже на табличку со стеллажа, записанную через точки, — впишите через дефис, как на табличке (например 01-03-011)';

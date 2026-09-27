@@ -3,6 +3,7 @@ const { refreshCellFill } = require('../cells/fill');
 const outbox = require('../sync/outbox');
 const { validateCountLines, keyOf } = require('./count');
 const { plural } = require('../journal/plural');
+const { formatBlockLabel } = require('../cells/label');
 
 // Пересчёт ячейки: назначение, счёт, решение владельца.
 //
@@ -139,11 +140,9 @@ async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
   }));
 }
 
-function cellLabel(r) {
-  const rack = r.rack_start === r.rack_end ? r.rack_start : `${r.rack_start}–${r.rack_end}`;
-  const tier = r.tier_start === r.tier_end ? r.tier_start : `${r.tier_start}–${r.tier_end}`;
-  return `${r.row_num}.${tier}.${rack}`;
-}
+// Адрес — одной функцией на весь Аргус (cells/label.js): своя копия здесь
+// разошлась бы с картой при первой же смене формата.
+const cellLabel = (r) => formatBlockLabel(r.row_num, r);
 
 function reasonFor(row) {
   if (Number(row.shortfalls) > 0) return 'на отборе отсюда уже не хватало';
