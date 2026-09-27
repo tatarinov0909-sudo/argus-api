@@ -10,6 +10,7 @@ const { moveStock } = require('./move');
 const initialStock = require('./initialStock');
 const stockAlign = require('./stockAlign');
 const journal = require('../journal/repository');
+const { blockContents } = require('./contents');
 
 const router = express.Router();
 
@@ -90,6 +91,19 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
       return rowsResult.rows.map((row) => ({ ...row, blocks: blocksByRow.get(row.id) || [] }));
     });
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Что лежит в одной ячейке — полностью, по нажатию на неё (владелец
+// 27.09.2026). Смотреть склад может тот же, кто видит карту: владелец,
+// грузчик и менеджер с правом «склад»; продавцу раскладка склада закрыта.
+router.get('/blocks/:id/contents', requireAuth, allowWarehouseView, async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => blockContents(client, warehouseId, req.params.id));
+    res.set('Cache-Control', 'no-store').json(out);
   } catch (err) {
     next(err);
   }

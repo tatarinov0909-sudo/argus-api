@@ -352,7 +352,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
   // и лист не должен посылать к полке с чужим.
   const skus = [...bySku.keys()];
   const places = skus.length === 0 ? { rows: [] } : await client.query(
-    `SELECT cs.sku, SUM(cs.qty) AS qty, wr.row_num, cb.label,
+    `SELECT cs.sku, SUM(cs.qty) AS qty, wr.row_num, cb.label, cb.id AS cell_block_id,
             cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
@@ -369,6 +369,8 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
     if (!item) continue;
     item.cells.push({
       label: formatBlockLabel(row.row_num, row),
+      // По id грузчик открывает, что ещё лежит в этой ячейке (владелец 27.09.2026).
+      cellBlockId: row.cell_block_id,
       qty: Number(row.qty),
       rowNum: row.row_num,
       rack: row.rack_start,
