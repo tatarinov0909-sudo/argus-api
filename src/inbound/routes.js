@@ -51,7 +51,11 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
       const items = (await c.query(
         `SELECT ii.sku, ii.name, ii.declared_qty,
                 (SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS accepted,
-                (SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id AND rr.cell_block_id IS NULL) AS unplaced,
+                -- Не разложено по ячейкам: принятое минус все укладки (их
+                -- может быть несколько — приёмка в несколько ячеек).
+                (SELECT SUM(rr.accepted_qty - COALESCE((SELECT SUM(rp.qty) FROM receiving_placements rp
+                                                         WHERE rp.receiving_record_id = rr.id), 0))
+                   FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS unplaced,
                 (SELECT MIN(rr.finished_at) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS first_at,
                 (SELECT MAX(rr.finished_at) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS last_at
            FROM invoice_items ii WHERE ii.invoice_id = $1 ORDER BY ii.name`, [inv.id])).rows;
@@ -90,6 +94,10 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
           supplier: d.supplier, fileName: d.file_name, fileType: d.file_type, fileSize: d.file_size, addedBy: d.added_by, createdAt: d.created_at })),
         comments: comments.map((m) => ({ id: m.id, sku: m.sku, productName: m.sku ? names.get(m.sku) || m.sku : null,
           authorRole: m.author_role, authorName: m.author_name, body: m.body, createdAt: m.created_at })),
+        // Записки грузчиков о товаре — руководителю и менеджеру (продавцу и
+        // самим грузчикам — нет: это разговор внутри склада).
+        notes: ['owner', 'manager'].includes(req.auth.role)
+          ? await journal.itemNotes(c, req.auth.warehouseId, { invoiceId: inv.id }) : [],
       };
     });
     res.set('Cache-Control', 'no-store').json(out);

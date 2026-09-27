@@ -73,6 +73,10 @@ router.get('/', requireAuth, async (req, res, next) => {
       // из 8 позиций» видят все грузчики и склад (владелец 27.09.2026).
       // Продавцу имена грузчиков и их заметки не нужны.
       if (req.auth.role !== 'seller') {
+        // Заход на уже принятом приходе закрывается здесь же (см. settle):
+        // список — «следующее обращение», и строка «На паузе · Джоник»
+        // у принятого прихода не повиснет.
+        await receiving.settle(client, req.auth.warehouseId);
         const open = result.rows.filter((r) => r.direction === 'in' && r.status !== 'completed').map((r) => r.id);
         const states = await receiving.statesFor(client, req.auth.warehouseId, open, req.auth.staffKeyId || null);
         for (const r of result.rows) {
@@ -184,7 +188,18 @@ router.get('/:id', requireAuth, async (req, res, next) => {
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
                 codes.barcode, codes.wb_article,
                 rr.id AS receiving_id, rr.accepted_qty, rr.finished_at, rr.pause_reasons,
-                cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end, wr.row_num
+                cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end, wr.row_num,
+                -- Все укладки позиции по порядку: товар мог лечь в несколько
+                -- ячеек (третье задание 27.09.2026). Ячейка выше — первая.
+                COALESCE((SELECT json_agg(json_build_object(
+                                   'id', rp.id, 'step', rp.step, 'qty', rp.qty, 'cellBlockId', rp.cell_block_id,
+                                   'rowNum', pwr.row_num, 'rackStart', pcb.rack_start, 'rackEnd', pcb.rack_end,
+                                   'tierStart', pcb.tier_start, 'tierEnd', pcb.tier_end,
+                                   'placedAt', rp.placed_at, 'confirmedAt', rp.confirmed_at) ORDER BY rp.step)
+                            FROM receiving_placements rp
+                            LEFT JOIN cell_blocks pcb ON pcb.id = rp.cell_block_id
+                            LEFT JOIN warehouse_rows pwr ON pwr.id = pcb.warehouse_row_id
+                           WHERE rp.receiving_record_id = rr.id), '[]') AS placements
          FROM invoice_items ii
          ${productCodesJoin('ii.warehouse_id', 'ii.company_id', 'ii.sku')}
          LEFT JOIN receiving_records rr ON rr.invoice_item_id = ii.id
@@ -203,7 +218,8 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     if (req.auth.role === 'seller') {
       invoice.items = invoice.items.map((it) => {
         const {
-          rack_start: _rs, rack_end: _re, tier_start: _ts, tier_end: _te, row_num: _rn, pause_reasons: _pr, ...rest
+          rack_start: _rs, rack_end: _re, tier_start: _ts, tier_end: _te, row_num: _rn, pause_reasons: _pr,
+          placements: _pl, ...rest
         } = it;
         if (Array.isArray(rest.picks)) {
           rest.picks = rest.picks.map((p) => ({ id: p.id, pickedQty: p.pickedQty, finishedAt: p.finishedAt }));

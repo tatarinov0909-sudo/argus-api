@@ -252,7 +252,7 @@ async function create(client, warehouseId, {
 // их в один список нельзя: упаковщику нужна строка на каждое отправление со
 // своим стикером, кладовщику — сумма по артикулу, чтобы идти за товаром один
 // раз, а не столько раз, сколько заказов.
-async function contents(client, warehouseId, supplyId, { showShortages = false } = {}) {
+async function contents(client, warehouseId, supplyId, { showShortages = false, showNotes = false } = {}) {
   const head = await client.query(
     `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
@@ -436,7 +436,11 @@ async function contents(client, warehouseId, supplyId, { showShortages = false }
     [warehouseId, supplyId],
   );
 
+  // Записки грузчиков о товаре этой поставки — руководителю и менеджеру.
+  const notes = showNotes ? await journal.itemNotes(client, warehouseId, { supplyId }) : [];
+
   return {
+    notes,
     shortages: shortages.rows.map((x) => ({
       entryId: x.id, text: x.action_text, at: x.created_at, orderNumber: x.order_number,
       invoiceId: x.invoice_id, orderPicked: x.order_picked,

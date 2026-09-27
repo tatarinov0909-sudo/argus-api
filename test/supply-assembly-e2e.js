@@ -202,8 +202,17 @@ const { withTenantContext } = require('../src/db/pool');
       assert.equal(done.supply.status, 'ready');
       assert.ok(finishedTexts.some((t) => new RegExp(`^Иван закончил сборку поставки «${num}» за \\d+ мин: взято 7 из 7 шт\\. Комментарий: коробы у ворот 3$`).test(t)));
     });
+    // Второе нажатие (двойной тап, окно открылось снова) — тот же итог, без
+    // второй записи в журнале: застрять на «Закончить» нельзя (задание 27.09-3).
     const doneAgain = await api('POST', `/api/shipping/assembly/${supply.id}/finish`, ivan, {});
-    check('второй раз закончить нечего — 409', () => assert.equal(doneAgain.status, 409));
+    const againTexts = await journalTexts();
+    const dimaAgain = await api('POST', `/api/shipping/assembly/${supply.id}/finish`, dima, {});
+    check('второй раз «Закончить» — тот же итог без второй записи; чужому — 409', () => {
+      assert.equal(doneAgain.status, 200);
+      assert.equal(doneAgain.body.assembly.id, done.assembly.id);
+      assert.equal(againTexts.filter((t) => t.startsWith(`Иван закончил сборку поставки «${num}»`)).length, 1);
+      assert.equal(dimaAgain.status, 409);
+    });
 
     // Лист всей собранной поставки — для печати «с отметками» и «пустого».
     const fullList = must(await api('GET', `/api/shipping/pick-list?supplyId=${supply.id}&full=1`, ivan));

@@ -126,6 +126,8 @@ router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller')
       // Ход сборки — строкой у поставки: «На паузе · Дима · взято 3 из 7».
       // Складу, не продавцу: имена грузчиков и их заметки — внутреннее дело.
       if (req.auth.role === 'seller') return list;
+      // Собранная или уехавшая поставка не держит сборку «на паузе».
+      await assembly.settle(client, req.auth.warehouseId);
       const states = await assembly.statesFor(client, req.auth.warehouseId,
         list.filter((s) => s.status !== 'shipped').map((s) => s.id), req.auth.staffKeyId || null);
       return list.map((s) => ({ ...s, assembly: states.get(s.id) || null }));
@@ -141,7 +143,8 @@ router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'selle
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const data = await withTenantContext(ctx, (client) => service.contents(
-      client, req.auth.warehouseId, req.params.id, { showShortages: seesShortages(req.auth) },
+      client, req.auth.warehouseId, req.params.id,
+      { showShortages: seesShortages(req.auth), showNotes: ['owner', 'manager'].includes(req.auth.role) },
     ));
     if (req.auth.role === 'seller') {
       // Продавцу — что и сколько уезжает, без адресов ячеек: раскладка склада

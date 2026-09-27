@@ -88,7 +88,8 @@ async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
      ),
      moves AS (
        SELECT cell_block_id, count(*)::int AS n FROM (
-         SELECT cell_block_id, finished_at AS at FROM receiving_records WHERE warehouse_id = $1
+         -- Приёмка — по укладкам: товар одной позиции мог лечь в несколько ячеек.
+         SELECT cell_block_id, placed_at AS at FROM receiving_placements WHERE warehouse_id = $1
          UNION ALL
          SELECT cell_block_id, finished_at FROM shipping_records WHERE warehouse_id = $1
          UNION ALL

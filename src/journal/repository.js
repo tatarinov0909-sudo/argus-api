@@ -62,10 +62,25 @@ async function listEntries(client, warehouseId, {
             i.supply_id AS invoice_supply_id,
             s.number AS invoice_supply_number,
             -- «ряд.стеллаж.ярус», как на карте склада (см. cells/label.js).
-            CASE WHEN cb.id IS NULL THEN NULL ELSE ${blockLabelSql('cb', 'wr')} END AS cell_label
+            CASE WHEN cb.id IS NULL THEN NULL ELSE ${blockLabelSql('cb', 'wr')} END AS cell_label,
+            -- Чья это работа (третье задание 27.09.2026): всё, что грузчик
+            -- сделал по одному приходу или одной поставке, — и ответы
+            -- руководителя на его записи — кабинет собирает в одну строку.
+            -- «supply:…» — сборка поставки (у заказов поставки и у записей
+            -- самого захода), «in:…» — приёмка прихода, «return:…»/«out:…» —
+            -- возврат и заказ без поставки.
+            CASE WHEN COALESCE(o.actor_type, je.actor_type) <> 'worker' THEN NULL
+                 WHEN COALESCE(wsup.id, wi.supply_id) IS NOT NULL THEN 'supply:' || COALESCE(wsup.id, wi.supply_id)
+                 WHEN wi.id IS NOT NULL THEN wi.direction || ':' || wi.id END AS work_key
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id
      LEFT JOIN supplies s ON s.id = i.supply_id
+     LEFT JOIN journal_entries o ON o.id = je.related_entry_id
+     LEFT JOIN invoices wi ON wi.id = COALESCE(je.invoice_id, o.invoice_id)
+     LEFT JOIN supplies wsup ON wsup.warehouse_id = je.warehouse_id
+      AND COALESCE(je.invoice_id, o.invoice_id) IS NULL
+      AND COALESCE(o.entity_type, je.entity_type) IN ('supply_assembly', 'paper_pick', 'worker_pause')
+      AND wsup.id = COALESCE(o.entity_id, je.entity_id)
      LEFT JOIN staff_keys sk ON sk.id = je.actor_id AND je.actor_type IN ('worker', 'manager')
      LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
      LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
@@ -84,7 +99,10 @@ async function listEntries(client, warehouseId, {
        -- История ячейки — за последний год: трёхлетний хвост никому не
        -- нужен на экране (владелец 26.09.2026).
        AND ($3::uuid IS NULL OR je.created_at > now() - interval '${CELL_HISTORY}')
-     ORDER BY je.created_at DESC`,
+     -- Записи одной транзакции до 27.09.2026 имели одно время (now()); из
+     -- них «закончил приёмку» — последний шаг работы, а не первый.
+     ORDER BY je.created_at DESC,
+              (je.entity_type IN ('receiving_session', 'supply_assembly', 'paper_pick')) DESC`,
     [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
   if (!cellBlockId) return result.rows;
@@ -122,7 +140,45 @@ async function cellOperations(client, warehouseId, cellBlockId) {
     [warehouseId, cellBlockId],
   );
   const qty = (n) => `${Number(n)} шт.`;
-  return r.rows.map((op) => {
+  // Приёмка в несколько ячеек: запись журнала о позиции ведёт на ячейку
+  // первой укладки, а в остальные товар тоже лёг — и их история должна это
+  // показывать (владелец 27.09.2026, третье задание).
+  const placed = await client.query(
+    `SELECT rp.id, rp.qty, rp.placed_at, rp.placed_by, rp.sku, ii.name, i.id AS invoice_id, i.number,
+            rr.accepted_qty, sk.name AS actor_name,
+            (SELECT count(*)::int FROM receiving_placements x WHERE x.receiving_record_id = rp.receiving_record_id) AS cells
+       FROM receiving_placements rp
+       JOIN receiving_records rr ON rr.id = rp.receiving_record_id
+       JOIN invoice_items ii ON ii.id = rp.invoice_item_id
+       JOIN invoices i ON i.id = ii.invoice_id
+       LEFT JOIN staff_keys sk ON sk.id = rp.placed_by
+      WHERE rp.warehouse_id = $1 AND rp.cell_block_id = $2
+        AND rr.cell_block_id IS DISTINCT FROM $2
+        AND rp.placed_at > now() - interval '${CELL_HISTORY}'
+      ORDER BY rp.placed_at DESC LIMIT 200`,
+    [warehouseId, cellBlockId],
+  );
+  const placements = placed.rows.map((p) => ({
+    id: `rp-${p.id}`,
+    warehouse_id: warehouseId,
+    agent: 'Кладовщик',
+    action_text: `Приёмка «${p.number}»: положено ${qty(p.qty)} «${p.name}» (${p.sku}) — часть принятых `
+      + `${qty(p.accepted_qty)}, разложенных по ${p.cells} ячейкам.`,
+    entity_type: 'receiving_placement',
+    entity_id: p.id,
+    actor_type: p.placed_by ? 'worker' : 'owner',
+    actor_id: p.placed_by,
+    actor_name: p.actor_name,
+    status: 'auto',
+    urgent: false,
+    answered: false,
+    invoice_id: p.invoice_id,
+    invoice_number: p.number,
+    invoice_direction: 'in',
+    cell_block_id: cellBlockId,
+    created_at: p.placed_at,
+  }));
+  return placements.concat(r.rows.map((op) => {
     const what = `«${op.name || op.sku}» (${op.sku})`;
     const text = {
       initial_load: `Загрузка остатков: положено ${qty(op.qty)} ${what}.`,
@@ -147,7 +203,7 @@ async function cellOperations(client, warehouseId, cellBlockId) {
       cell_block_id: cellBlockId,
       created_at: op.created_at,
     };
-  });
+  }));
 }
 
 // Сколько позиций поставки уже собрано. Кабинет показывает сборку поставки
@@ -171,6 +227,63 @@ async function supplyPickProgress(client, warehouseId, supplyIds) {
   return new Map(result.rows.map((row) => [row.supply_id, row]));
 }
 
+// Состояние работ, на которые ссылаются записи журнала (work_key выше), —
+// для строки «Джоник принимает ПР-… · принято 5 из 8» → «Джоник принял
+// ПР-… · 8 из 8, расхождений нет». receiving и assembly — ход работы из
+// work/sessions.js (receiving/session.js и shipping/assembly.js).
+async function workStates(client, warehouseId, keys, { receiving, assembly }) {
+  const ids = (prefix) => [...new Set(keys.filter((k) => k && k.startsWith(prefix)).map((k) => k.slice(prefix.length)))];
+  const invoiceIds = ids('in:');
+  const supplyIds = ids('supply:');
+  const out = new Map();
+  const workers = async (col, list) => new Map((await client.query(
+    `SELECT ${col} AS id, array_agg(worker_name ORDER BY started_at) AS names FROM work_sessions
+      WHERE warehouse_id = $1 AND ${col} = ANY($2::uuid[]) GROUP BY ${col}`, [warehouseId, list],
+  )).rows.map((r) => [r.id, [...new Set(r.names)]]));
+  const session = (a) => (a ? {
+    status: a.status, workerName: a.workerName, startedAt: a.startedAt, pausedAt: a.pausedAt,
+    pauseReason: a.pauseReason, endedAt: a.endedAt,
+  } : null);
+  if (invoiceIds.length) {
+    const docs = await client.query(
+      `SELECT i.id, i.number, i.status,
+              count(*) FILTER (WHERE rr.id IS NOT NULL AND rr.accepted_qty <> ii.declared_qty)::int AS diffs
+         FROM invoices i
+         JOIN invoice_items ii ON ii.invoice_id = i.id
+         LEFT JOIN receiving_records rr ON rr.invoice_item_id = ii.id
+        WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[])
+        GROUP BY i.id`,
+      [warehouseId, invoiceIds],
+    );
+    const st = await receiving.statesFor(client, warehouseId, invoiceIds);
+    const names = await workers('invoice_id', invoiceIds);
+    for (const d of docs.rows) {
+      const w = st.get(d.id) || {};
+      out.set(`in:${d.id}`, {
+        kind: 'receiving', id: d.id, number: d.number, status: d.status, done: d.status === 'completed',
+        taken: w.taken || 0, total: w.total || 0, diffs: d.diffs,
+        session: session(w.assembly), workers: names.get(d.id) || [],
+      });
+    }
+  }
+  if (supplyIds.length) {
+    const docs = await client.query(
+      'SELECT id, number, status FROM supplies WHERE warehouse_id = $1 AND id = ANY($2::uuid[])', [warehouseId, supplyIds],
+    );
+    const st = await assembly.statesFor(client, warehouseId, supplyIds);
+    const names = await workers('supply_id', supplyIds);
+    for (const d of docs.rows) {
+      const w = st.get(d.id) || {};
+      out.set(`supply:${d.id}`, {
+        kind: 'assembly', id: d.id, number: d.number, status: d.status, done: d.status !== 'collecting',
+        taken: w.taken || 0, total: w.total || 0,
+        session: session(w.assembly), workers: names.get(d.id) || [],
+      });
+    }
+  }
+  return out;
+}
+
 // Кто закрыл расхождение — владелец или менеджер. Журнал неизменяем и служит
 // следом действий: записывать решение менеджера как решение владельца значит
 // терять автора ровно там, где он и нужен — в споре о недостаче.
@@ -185,11 +298,14 @@ async function resolveEntry(client, {
   const original = originalResult.rows[0];
   if (!original) return null;
 
-  const status = resolution === 'confirm' ? 'confirmed' : 'rolled_back';
+  // 'ack' — «Принял к сведению» записку грузчика о товаре.
+  const status = resolution === 'rollback' ? 'rolled_back' : 'confirmed';
   const who = actorType === 'manager' ? 'менеджером' : 'владельцем';
-  const actionText = resolution === 'confirm'
-    ? `Подтверждено ${who}: ${note || original.action_text}`
-    : `Отклонено ${who}: ${note || original.action_text}`;
+  const actionText = resolution === 'ack'
+    ? `Принято к сведению ${who}: ${note || original.action_text}`
+    : resolution === 'confirm'
+      ? `Подтверждено ${who}: ${note || original.action_text}`
+      : `Отклонено ${who}: ${note || original.action_text}`;
 
   const result = await client.query(
     `INSERT INTO journal_entries
@@ -206,4 +322,39 @@ async function resolveEntry(client, {
   return result.rows[0];
 }
 
-module.exports = { createEntry, listEntries, supplyPickProgress, resolveEntry };
+// Записки грузчиков о товаре (entity_type 'item_note') — для карточки
+// прихода (invoiceId) или поставки (supplyId): и ждущие ответа, и уже
+// отмеченные «Принял к сведению» — кем и когда.
+async function itemNotes(client, warehouseId, { invoiceId = null, supplyId = null }) {
+  const r = await client.query(
+    `SELECT je.id, je.action_text, je.created_at, sk.name AS worker_name, ii.sku, ii.name AS product_name,
+            i.number AS doc_number, a.created_at AS answered_at, a.actor_type AS answered_type,
+            ask.name AS answered_name
+       FROM journal_entries je
+       JOIN invoices i ON i.id = je.invoice_id
+       LEFT JOIN invoice_items ii ON ii.id = je.entity_id
+       LEFT JOIN staff_keys sk ON sk.id = je.actor_id
+       LEFT JOIN LATERAL (SELECT x.created_at, x.actor_type, x.actor_id FROM journal_entries x
+                           WHERE x.related_entry_id = je.id ORDER BY x.created_at LIMIT 1) a ON true
+       LEFT JOIN staff_keys ask ON ask.id = a.actor_id AND a.actor_type = 'manager'
+      WHERE je.warehouse_id = $1 AND je.entity_type = 'item_note'
+        AND (($2::uuid IS NOT NULL AND je.invoice_id = $2::uuid) OR ($3::uuid IS NOT NULL AND i.supply_id = $3::uuid))
+      ORDER BY je.created_at DESC LIMIT 100`,
+    [warehouseId, invoiceId, supplyId],
+  );
+  return r.rows.map((n) => ({
+    entryId: n.id,
+    text: (/: «([\s\S]*)»$/.exec(n.action_text) || [])[1] || n.action_text,
+    actionText: n.action_text,
+    at: n.created_at,
+    workerName: n.worker_name,
+    sku: n.sku,
+    productName: n.product_name,
+    docNumber: n.doc_number,
+    answered: n.answered_at
+      ? { at: n.answered_at, by: n.answered_type === 'manager' ? (n.answered_name || 'менеджер') : 'руководитель' }
+      : null,
+  }));
+}
+
+module.exports = { createEntry, listEntries, supplyPickProgress, resolveEntry, itemNotes, workStates };

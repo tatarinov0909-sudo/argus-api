@@ -606,6 +606,23 @@ async function finishAssembly(client, warehouseId, staffKeyId, supplyId, { comme
   const supply = await assembly.lockSupply(client, warehouseId, supplyId);
   const cur = await assembly.liveOf(client, warehouseId, supply.id, staffKeyId);
   if (!cur) {
+    // Поставка уже собрана, и заход этого грузчика закрылся сам (защита от
+    // зависшей сборки, work/sessions.js — settle): «Закончить» показывает
+    // итог того же захода и дописывает комментарий, а не ругается.
+    const last = await assembly.latest(client, warehouseId, supply.id);
+    if (supply.status !== 'collecting' && last && last.worker_key_id === staffKeyId && last.status === 'finished') {
+      if (note) {
+        await client.query(
+          'UPDATE work_sessions SET comment = $2, comment_at = now(), updated_at = now() WHERE id = $1', [last.id, note]);
+        await assembly.entry(client, warehouseId, staffKeyId, supply, assembly.withComment(
+          `${last.worker_name} оставил комментарий к сборке поставки «${supply.number}».`, note));
+      }
+      return {
+        ...(await assembly.stateOf(client, warehouseId, supply, staffKeyId)),
+        minutes: Math.max(1, Math.round(assembly.workMs(last) / 60000)),
+        notTaken: [],
+      };
+    }
     throw new HttpError(409, `Сборку поставки «${supply.number}» сейчас ведёте не вы — откройте её заново`);
   }
   // По листу взятое записывается только кнопкой «Собрал по листу»: закончи

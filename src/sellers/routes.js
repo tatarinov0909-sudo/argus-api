@@ -379,8 +379,10 @@ router.get('/documents', requireAuth, requireRole('seller', 'owner', 'manager'),
          ), rec AS (
            SELECT ii.invoice_id, SUM(rr.accepted_qty) AS done_qty, MIN(rr.finished_at) AS first_at,
                   MAX(rr.finished_at) AS last_at,
-                  -- Принято без ячейки («своё место»): ещё не размещено.
-                  SUM(rr.accepted_qty) FILTER (WHERE rr.cell_block_id IS NULL) AS unplaced_qty,
+                  -- Принято, но не разложено по ячейкам («своё место»):
+                  -- принятое минус все укладки, сколько бы ячеек ни было.
+                  SUM(rr.accepted_qty - COALESCE((SELECT SUM(rp.qty) FROM receiving_placements rp
+                                                  WHERE rp.receiving_record_id = rr.id), 0)) AS unplaced_qty,
                   array_agg(DISTINCT rr.worker_key_id) FILTER (WHERE rr.worker_key_id IS NOT NULL) AS workers,
                   NULL::numeric AS good_qty, NULL::numeric AS bad_qty
              FROM receiving_records rr JOIN invoice_items ii ON ii.id=rr.invoice_item_id
@@ -602,7 +604,7 @@ router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), a
       return loadHistory(client, companyId, sku, page);
     });
     if (req.auth.role === 'seller') {
-      result.events = result.events.map(({ fromCell, toCell, ...event }) => event);
+      result.events = result.events.map(({ fromCell, toCell, toCells, ...event }) => event);
     }
     res.set('Cache-Control', 'no-store').json(result);
   } catch (err) { next(err); }

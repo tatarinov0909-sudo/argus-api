@@ -21,6 +21,8 @@ const journal = require('../journal/repository');
 const { plural } = require('../journal/plural');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Сколько идущий заход может жить после того, как работа сделана (settle).
+const SETTLE_GRACE = '10 minutes';
 const isLive = (row) => Boolean(row) && (row.status === 'active' || row.status === 'paused');
 const minutesText = (ms) => (ms < 60000 ? 'меньше минуты' : `${Math.round(ms / 60000)} мин`);
 const withComment = (text, comment) => (comment ? `${text} Комментарий: ${comment}` : text);
@@ -51,9 +53,15 @@ const TARGETS = {
       );
       return r.rows[0] || null;
     },
+    table: 'supplies',
     missing: 'Поставки нет — возможно, её разобрали',
     badId: 'Нужна поставка',
     canStart: (doc) => doc.status === 'collecting',
+    // Собирать больше нечего: поставка собрана или уже уехала. finalAt —
+    // с какого момента (см. settle).
+    finalSql: (d) => `${d}.status <> 'collecting'`,
+    finalAt: (d) => `COALESCE(${d}.ready_at, ${d}.shipped_at, ${d}.created_at)`,
+    isFinal: (doc) => doc.status !== 'collecting',
     done: (doc) => `Поставка «${doc.number}» уже собрана`,
     // Сколько штук поставки уже снято с полок и сколько в ней всего.
     async progress(client, warehouseId, ids) {
@@ -90,6 +98,8 @@ const TARGETS = {
       busy: (doc, cur) => `Поставку «${doc.number}» собирает ${cur.worker_name}`
         + `${cur.status === 'paused' ? ' — сборка на паузе' : ''}. Забрать сборку себе?`,
       notMine: (doc) => `Сборку поставки «${doc.number}» сейчас ведёте не вы`,
+      settled: (name, doc, minutes, taken) => `${name} закончил сборку поставки «${doc.number}» за ${minutes} мин: ${taken}`
+        + ` Поставка уже ${doc.status === 'shipped' ? 'уехала' : 'собрана'} — сборка закрыта сама.`,
     },
   },
 
@@ -111,9 +121,15 @@ const TARGETS = {
       const doc = r.rows[0];
       return doc && doc.direction === 'in' ? doc : null;
     },
+    table: 'invoices',
     missing: 'Прихода нет — возможно, его отменили',
     badId: 'Нужен приход',
     canStart: (doc) => doc.status !== 'completed',
+    // Все позиции приняты (в том числе нулём — «не приехало»).
+    finalSql: (d) => `${d}.status = 'completed' AND ${d}.direction = 'in'`,
+    finalAt: (d) => `(SELECT MAX(rr.finished_at) FROM receiving_records rr JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+                       WHERE ii.invoice_id = ${d}.id)`,
+    isFinal: (doc) => doc.status === 'completed',
     done: (doc) => `Приход «${doc.number}» уже принят`,
     async progress(client, warehouseId, ids) {
       const map = new Map();
@@ -148,6 +164,8 @@ const TARGETS = {
       busy: (doc, cur) => `Приход «${doc.number}» принимает ${cur.worker_name}`
         + `${cur.status === 'paused' ? ' — приёмка на паузе' : ''}. Забрать приёмку себе?`,
       notMine: (doc) => `Приёмку прихода «${doc.number}» сейчас ведёте не вы`,
+      settled: (name, doc, minutes, taken) => `${name} закончил приёмку прихода «${doc.number}» за ${minutes} мин: ${taken}`
+        + ' Все позиции приняты — приёмка закрыта сама.',
     },
   },
 };
@@ -291,6 +309,7 @@ function createWork(kind) {
 
   async function readState(client, warehouseId, id, staffKeyId = null) {
     if (!UUID.test(String(id || ''))) throw new HttpError(400, T.badId);
+    await settle(client, warehouseId, [id]);
     const doc = await T.find(client, warehouseId, id, false);
     if (!doc) throw new HttpError(404, T.missing);
     return stateOf(client, warehouseId, doc, staffKeyId);
@@ -306,6 +325,51 @@ function createWork(kind) {
     actorType: 'worker',
     actorId: staffKeyId,
   });
+
+  // Заход, у которого работа уже сделана — приход принят, поставка собрана
+  // или уехала, — не может висеть «идёт» или «на паузе» (случай 27.09.2026:
+  // Джоник принял 8 из 8, окно «Закончить приёмку» закрылось кликом мимо, и
+  // заход остался на паузе, а грузчик — на уже принятом товаре). Такой заход
+  // закрывается как законченный: сам — в той же транзакции, что последняя
+  // принятая позиция (receiving/routes.js), а на всякий другой случай —
+  // при следующем обращении к спискам и к самой работе.
+  //
+  // docIds — только эти документы; без них — все зависшие на складе (их
+  // единицы: живой заход у документа один) — так зовут списки приходов и
+  // поставок и журнал. Документ берём на запись первым — тот же порядок
+  // блокировок, что у самой работы.
+  //
+  // Заход на паузе закрывается сразу. Идущий — только если работа сделана
+  // больше SETTLE_GRACE назад: грузчик, взявший последний товар, ещё стоит
+  // на окне «Закончить сборку» с комментарием, и чужой список не должен
+  // закрывать работу у него из-под рук. force — без этой отсрочки: последняя
+  // позиция прихода (та же транзакция) и выход самого грузчика.
+  async function settle(client, warehouseId, docIds = null, { force = false } = {}) {
+    const ids = docIds ? [...new Set(docIds.filter(Boolean))] : null;
+    if (ids && !ids.length) return [];
+    const stuck = await client.query(
+      `SELECT DISTINCT ws.${col} AS id FROM work_sessions ws JOIN ${T.table} d ON d.id = ws.${col}
+        WHERE ws.warehouse_id = $1 AND ws.kind = $2 AND ws.status IN ('active', 'paused')
+          AND ($3::uuid[] IS NULL OR ws.${col} = ANY($3::uuid[])) AND ${T.finalSql('d')}
+          AND ($4::boolean OR ws.status = 'paused' OR ${T.finalAt('d')} < now() - interval '${SETTLE_GRACE}')
+        ORDER BY 1`,
+      [warehouseId, kind, ids, force],
+    );
+    const closed = [];
+    for (const { id } of stuck.rows) {
+      const doc = await T.find(client, warehouseId, id, true);
+      if (!doc || !T.isFinal(doc)) continue;
+      const cur = await latest(client, warehouseId, id);
+      if (!isLive(cur)) continue;
+      const row = await closeRow(client, cur, 'finished');
+      const minutes = Math.max(1, Math.round(workMs(row) / 60000));
+      const taken = T.takenText(await progressOf(client, warehouseId, id));
+      // Запись — от имени того, чей был заход: в журнале это его работа.
+      await entry(client, warehouseId, cur.worker_key_id, doc, T.text.settled(row.worker_name, doc, minutes, taken));
+      closed.push(row);
+    }
+    return closed;
+  }
 
   // Начать работу — только после «Начать» в окне с таймером (или скана QR
   // бумажного листа сборки), не от открытия экрана (владелец 27.09.2026).
@@ -382,6 +446,8 @@ function createWork(kind) {
     if (!UUID.test(String(id || ''))) return null;
     const doc = await T.find(client, warehouseId, id, true);
     if (!doc) return null;
+    // Работа уже сделана — не пауза, а конец захода.
+    if (T.isFinal(doc)) await settle(client, warehouseId, [doc.id], { force: true });
     const cur = await latest(client, warehouseId, doc.id);
     if (!isLive(cur) || cur.worker_key_id !== staffKeyId) return null;
     const name = await workerName(client, staffKeyId);
@@ -460,6 +526,8 @@ function createWork(kind) {
     pauseOrResume,
     abandon,
     liveOf,
+    latest,
+    settle,
     closeRow,
     workMs,
     takenText: T.takenText,

@@ -27,6 +27,10 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
 
     const hideUrgent = req.auth.role === 'manager' && !(req.auth.grants || []).includes('shortages');
     const entries = await withTenantContext({ warehouseId }, async (client) => {
+      // Зависшие заходы — закрыть до чтения: иначе у принятого прихода в
+      // журнале висело бы «принимает» (защита, work/sessions.js — settle).
+      await receiving.settle(client, warehouseId);
+      await assembly.settle(client, warehouseId);
       const rows = await repository.listEntries(client, warehouseId, { cellBlockId, invoiceId, hideUrgent });
       // Сборка поставки уходит в кабинет одной записью с полосой готовности,
       // поэтому к строкам этой поставки прикладываем её счёт позиций.
@@ -38,6 +42,10 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
         row.supply_items_total = done.total;
         row.supply_items_done = done.done;
       });
+      // Одна строка на работу: у каждой записи — её работа и то, как эта
+      // работа идёт сейчас (этап и прогресс для строки состояния).
+      const works = await repository.workStates(client, warehouseId, rows.map((r) => r.work_key), { receiving, assembly });
+      rows.forEach((row) => { row.work = works.get(row.work_key) || null; });
       return rows;
     });
     res.json(entries);
@@ -50,19 +58,26 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
   try {
     const { warehouseId, ownerId, role, staffKeyId } = req.auth;
     const { id } = req.params;
-    const { resolution, note } = req.body; // resolution: 'confirm' | 'rollback'
-    if (!['confirm', 'rollback'].includes(resolution)) {
-      throw new HttpError(400, 'resolution должен быть confirm или rollback');
+    // resolution: 'confirm' | 'rollback'; у записки грузчика о товаре —
+    // 'ack', «Принял к сведению»: соглашаться там не с чем.
+    const { resolution, note } = req.body;
+    if (!['confirm', 'rollback', 'ack'].includes(resolution)) {
+      throw new HttpError(400, 'resolution должен быть confirm, rollback или ack');
     }
 
     const entry = await withTenantContext({ warehouseId }, async (client) => {
       const original = await client.query(
-        `SELECT agent, urgent,
+        `SELECT agent, urgent, entity_type,
                 EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered
            FROM journal_entries je WHERE id = $1 AND warehouse_id = $2`,
         [id, warehouseId],
       );
       if (!original.rows[0]) return null;
+      if ((original.rows[0].entity_type === ITEM_NOTE) !== (resolution === 'ack')) {
+        throw new HttpError(400, original.rows[0].entity_type === ITEM_NOTE
+          ? 'Записку грузчика о товаре отмечают «Принял к сведению»'
+          : '«Принял к сведению» — только для записок грузчика о товаре');
+      }
       // Второй ответ на одну запись — два противоречащих решения в следе.
       // Так бывает с открытого давно кабинета: заказ уже убрали из поставки,
       // а на экране ещё висит «Принять».
@@ -82,6 +97,64 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
       });
     });
     if (!entry) throw new HttpError(404, 'Запись не найдена');
+    res.status(201).json(entry);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// «Написать руководителю о товаре» (владелец 27.09.2026, третье задание):
+// грузчик на карточке товара — в приёмке или в сборке — пишет, что не так
+// («коробка мятая», «штрихкод не читается»). Это запись журнала «ждёт
+// решения»: висит, пока руководитель или менеджер не нажмёт «Принял к
+// сведению» (resolve с resolution 'ack'), и видна в карточке прихода или
+// поставки.
+//
+// Приёмка и заказ — invoiceItemId (строка документа). Сборка — supplyId и
+// sku: на экране сборки товар один на всю поставку, а строк у него столько,
+// сколько заказов; запись ведёт на строку первого по номеру заказа, и через
+// него — на поставку.
+const ITEM_NOTE = 'item_note';
+router.post('/item-note', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const body = req.body || {};
+    const text = typeof body.text === 'string' ? body.text.trim().replace(/\s+/g, ' ') : '';
+    if (!text) throw new HttpError(400, 'Напишите, что не так с товаром');
+    if (text.length > 500) throw new HttpError(400, 'Слишком длинно — до 500 знаков');
+    const uuid = (v) => (typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v : null);
+    const invoiceItemId = uuid(body.invoiceItemId);
+    const supplyId = uuid(body.supplyId);
+    const sku = typeof body.sku === 'string' ? body.sku.trim() : '';
+    if (!invoiceItemId && !(supplyId && sku)) throw new HttpError(400, 'Нужен товар: строка документа или поставка и артикул');
+    const entry = await withTenantContext({ warehouseId }, async (client) => {
+      const item = (await client.query(
+        `SELECT ii.id, ii.sku, ii.name, i.id AS invoice_id, i.number, i.direction, s.number AS supply_number
+           FROM invoice_items ii
+           JOIN invoices i ON i.id = ii.invoice_id
+           LEFT JOIN supplies s ON s.id = i.supply_id
+          WHERE i.warehouse_id = $1
+            AND (CASE WHEN $2::uuid IS NOT NULL THEN ii.id = $2::uuid ELSE i.supply_id = $3::uuid AND ii.sku = $4 END)
+          ORDER BY i.number, ii.id LIMIT 1`,
+        [warehouseId, invoiceItemId, supplyId, sku],
+      )).rows[0];
+      if (!item) throw new HttpError(404, 'Товар не найден — возможно, документ изменился');
+      const who = (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0];
+      const where = supplyId && item.supply_number ? `при сборке поставки «${item.supply_number}»`
+        : item.direction === 'in' ? `в приходе «${item.number}»`
+          : item.direction === 'return' ? `в возврате «${item.number}»` : `в заказе «${item.number}»`;
+      return repository.createEntry(client, {
+        warehouseId,
+        agent: 'Кладовщик',
+        actionText: `${who ? who.name : 'Грузчик'} пишет о товаре «${item.name}» (${item.sku}) ${where}: «${text}»`,
+        entityType: ITEM_NOTE,
+        entityId: item.id,
+        invoiceId: item.invoice_id,
+        actorType: 'worker',
+        actorId: staffKeyId,
+        status: 'pending',
+      });
+    });
     res.status(201).json(entry);
   } catch (err) {
     next(err);
