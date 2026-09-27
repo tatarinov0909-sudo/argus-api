@@ -4,6 +4,7 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const repository = require('./repository');
 const assembly = require('../shipping/assembly');
+const receiving = require('../receiving/session');
 
 const router = express.Router();
 
@@ -91,10 +92,10 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 // это в журнале сразу, а не в итоге накладной (владелец 26.09.2026).
 // Работник журнал не читает, он только сообщает.
 //
-// Пауза сборки поставки идёт сюда же (владелец 27.09.2026): у грузчика,
-// который ведёт сборку, она ещё и останавливает таймер на сервере, а
-// exit — «вышел из сборки» (стрелка «назад», другая вкладка). Запись в
-// журнале при этом одна, с тем, сколько взято, и комментарием.
+// Пауза сборки поставки и приёмки прихода идёт сюда же (владелец 27.09.2026):
+// у грузчика, который ведёт эту работу, она ещё и останавливает таймер на
+// сервере, а exit — «вышел» (стрелка «назад», другая вкладка). Запись в
+// журнале при этом одна, с тем, сколько сделано, и комментарием.
 router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
@@ -106,13 +107,17 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
     const why = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ').slice(0, 200) : '';
     if (!why) throw new HttpError(400, 'Нужна причина паузы');
     const entry = await withTenantContext({ warehouseId }, async (client) => {
-      if (supplyId && !invoiceId) {
-        const out = await assembly.pauseOrResume(client, warehouseId, staffKeyId, supplyId, {
+      // Сборка поставки — по supplyId, приёмка прихода — по invoiceId
+      // (заказ на отгрузку приходом не окажется: у приёмки свой документ).
+      const work = supplyId && !invoiceId ? { of: assembly, id: supplyId }
+        : invoiceId && !supplyId ? { of: receiving, id: invoiceId } : null;
+      if (work) {
+        const out = await work.of.pauseOrResume(client, warehouseId, staffKeyId, work.id, {
           reason: why, resumed: resumed === true, exit: body.exit === true, comment: body.comment,
           at: typeof body.at === 'string' ? body.at : null,
         });
         if (out) return { ...(out.entry || { repeated: true }), assembly: out.state };
-        // Выход из сборки, которую этот грузчик уже не ведёт (её забрали,
+        // Выход из работы, которую этот грузчик уже не ведёт (её забрали,
         // закончили или страница устарела), — не событие для журнала.
         if (body.exit === true) return { repeated: true, assembly: null };
       }

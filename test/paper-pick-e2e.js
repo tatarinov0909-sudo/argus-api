@@ -78,7 +78,7 @@ const { withTenantContext } = require('../src/db/pool');
     // по часам телефона: сдвигаем начало захода на 12 минут назад, а
     // присланное телефоном «начал 3 часа назад» ни на что не влияет.
     await run((c) => c.query(
-      `UPDATE supply_assemblies SET started_at = now() - interval '12 minutes' WHERE supply_id = $1`, [supply.id]));
+      `UPDATE work_sessions SET started_at = now() - interval '12 minutes' WHERE supply_id = $1`, [supply.id]));
     const startedAt = new Date(Date.now() - 180 * 60000).toISOString();
     const done = must(await api('POST', '/api/shipping/paper/finish', worker, {
       supplyId: supply.id, startedAt, pausedMs: 0, notFound: [{ sku: 'PB-2', found: 0 }],

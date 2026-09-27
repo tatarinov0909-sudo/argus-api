@@ -139,10 +139,10 @@ const { withTenantContext } = require('../src/db/pool');
 
     // 3. Вернулся. Сдвигаем часы захода: работал 8 минут, на паузе 12.
     await run((c) => c.query(
-      `UPDATE supply_assemblies SET started_at = now() - interval '20 minutes', paused_at = now() - interval '12 minutes'
+      `UPDATE work_sessions SET started_at = now() - interval '20 minutes', paused_at = now() - interval '12 minutes'
         WHERE supply_id = $1 AND status = 'paused'`, [supply.id]));
     const firstStart = (await run((c) => c.query(
-      'SELECT started_at FROM supply_assemblies WHERE supply_id = $1', [supply.id]))).rows[0].started_at;
+      'SELECT started_at FROM work_sessions WHERE supply_id = $1', [supply.id]))).rows[0].started_at;
     const back = must(await api('POST', `/api/shipping/assembly/${supply.id}/start`, dima, {}));
     check('возврат: тот же заход, таймер не сброшен — 8 минут работы, 12 паузы', () => {
       assert.equal(back.started, false);
@@ -237,12 +237,12 @@ const { withTenantContext } = require('../src/db/pool');
     // Телефон «заморозил» страницу в фоне: выход записывается временем ухода,
     // но не раньше последнего изменения захода.
     await run((c) => c.query(
-      `UPDATE supply_assemblies SET started_at = now() - interval '30 minutes', updated_at = now() - interval '30 minutes'
+      `UPDATE work_sessions SET started_at = now() - interval '30 minutes', updated_at = now() - interval '30 minutes'
         WHERE supply_id = $1 AND status = 'active'`, [second.id]));
     const leftAt = new Date(Date.now() - 10 * 60000).toISOString();
     must(await api('POST', '/api/journal/pause', ivan, { supplyId: second.id, reason: 'Вышел из сборки', exit: true, at: leftAt }), 201);
     const frozen = (await run((c) => c.query(
-      `SELECT EXTRACT(EPOCH FROM (now() - paused_at))::int AS ago FROM supply_assemblies WHERE supply_id = $1 AND status = 'paused'`, [second.id]))).rows[0];
+      `SELECT EXTRACT(EPOCH FROM (now() - paused_at))::int AS ago FROM work_sessions WHERE supply_id = $1 AND status = 'paused'`, [second.id]))).rows[0];
     const frozenTexts = await journalTexts();
     check('выход «задним числом»: пауза с момента ухода (10 мин назад), в журнале — время ухода', () => {
       assert.ok(Math.abs(frozen.ago - 600) < 10, String(frozen.ago));
@@ -286,10 +286,10 @@ const { withTenantContext } = require('../src/db/pool');
       assert.match(wrongFinish.body.error, /Собрал по листу/);
     });
     await run((c) => c.query(
-      `UPDATE supply_assemblies SET started_at = now() - interval '9 minutes' WHERE supply_id = $1 AND status = 'active'`, [third.id]));
+      `UPDATE work_sessions SET started_at = now() - interval '9 minutes' WHERE supply_id = $1 AND status = 'active'`, [third.id]));
     const paperDone = must(await api('POST', '/api/shipping/paper/finish', dima,
       { supplyId: third.id, notFound: [], comment: 'положил на стол упаковки' }), 201);
-    const paperRow = (await run((c) => c.query('SELECT status, comment FROM supply_assemblies WHERE supply_id = $1', [third.id]))).rows[0];
+    const paperRow = (await run((c) => c.query('SELECT status, comment FROM work_sessions WHERE supply_id = $1', [third.id]))).rows[0];
     check('«собрал по листу»: время — по заходу на сервере, заход закончен, комментарий в итоге', () => {
       assert.equal(paperDone.minutes, 9);
       assert.equal(paperRow.status, 'finished');
@@ -303,7 +303,7 @@ const { withTenantContext } = require('../src/db/pool');
     const fourth = await supplyOf([o5]);
     must(await api('POST', `/api/shipping/assembly/${fourth.id}/start`, dima, {}), 201);
     const disband = await api('DELETE', `/api/supplies/${fourth.id}`, owner);
-    const leftRows = await run((c) => c.query('SELECT count(*)::int AS n FROM supply_assemblies WHERE supply_id = $1', [fourth.id]));
+    const leftRows = await run((c) => c.query('SELECT count(*)::int AS n FROM work_sessions WHERE supply_id = $1', [fourth.id]));
     check('разобрать поставку с начатой, но пустой сборкой можно — заходы уходят вместе с ней', () => {
       assert.equal(disband.status, 200, JSON.stringify(disband.body));
       assert.equal(leftRows.rows[0].n, 0);
@@ -317,12 +317,12 @@ const { withTenantContext } = require('../src/db/pool');
     const otherWarehouse = JSON.parse(Buffer.from(other.split('.')[1], 'base64url')).warehouseId;
     const foreign = await api('GET', `/api/shipping/assembly/${supply.id}`, other);
     const foreignRows = await withTenantContext({ warehouseId: otherWarehouse },
-      (c) => c.query('SELECT count(*)::int AS n FROM supply_assemblies WHERE supply_id = $1', [supply.id]));
+      (c) => c.query('SELECT count(*)::int AS n FROM work_sessions WHERE supply_id = $1', [supply.id]));
     const sellerKey = must(await api('POST', `/api/sellers/companies/${company}/keys`, owner, {}), 201);
     const seller = must(await api('POST', '/api/auth/seller/login', null, { keyCode: sellerKey.key_code, name: 'Test seller' })).token;
     const sellerRows = must(await api('GET', '/api/supplies', seller));
     const sellerDb = await withTenantContext({ companyId: company },
-      (c) => c.query('SELECT count(*)::int AS n FROM supply_assemblies'));
+      (c) => c.query('SELECT count(*)::int AS n FROM work_sessions'));
     check('чужой склад сборку не видит; продавцу ни состояния, ни имён грузчиков', () => {
       assert.equal(foreign.status, 404);
       assert.equal(foreignRows.rows[0].n, 0);

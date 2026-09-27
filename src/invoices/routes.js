@@ -4,6 +4,8 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { requireQty } = require('../middleware/qty');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
+const receiving = require('../receiving/session');
+const { productCodesJoin } = require('../products/codes');
 
 const router = express.Router();
 
@@ -37,7 +39,17 @@ router.get('/', requireAuth, async (req, res, next) => {
                 i.source_document_type, i.source_document_date, i.planned_from, i.planned_to,
                 i.boxes, i.pallets, i.weight_kg, i.carrier, i.vehicle, i.inbound_comment,
                 i.arrived_at, i.arrived_boxes, i.arrived_pallets, i.seller_verdict,
-                CASE WHEN i.direction = 'in' THEN (SELECT count(*)::int FROM invoice_comments ic WHERE ic.invoice_id = i.id) END AS comment_count
+                CASE WHEN i.direction = 'in' THEN (SELECT count(*)::int FROM invoice_comments ic WHERE ic.invoice_id = i.id) END AS comment_count,
+                -- Номера и поставщики документов привоза — поиск прихода по
+                -- номеру документа поставщика (владелец 27.09.2026).
+                CASE WHEN i.direction = 'in' THEN (SELECT string_agg(concat_ws(' ', d.number, d.supplier), ' · ' ORDER BY d.created_at)
+                                                     FROM invoice_documents d WHERE d.invoice_id = i.id) END AS supplier_docs,
+                -- Принятый приход с расхождением — отдельный фильтр в кабинете.
+                CASE WHEN i.direction = 'in' AND i.status = 'completed' THEN EXISTS (
+                  SELECT 1 FROM invoice_items x
+                   WHERE x.invoice_id = i.id
+                     AND COALESCE((SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = x.id), 0)
+                         <> x.declared_qty) END AS has_discrepancy
          FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
          LEFT JOIN supplies s ON s.id = i.supply_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
@@ -45,6 +57,10 @@ router.get('/', requireAuth, async (req, res, next) => {
            -- только отправленные на сборку, то есть в поставке.
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
            AND (NOT $2::boolean OR i.source = '1c' OR i.supply_id IS NOT NULL)
+           -- «Заказ поставщику» из 1С — это заказ, а не привоз: грузчику его
+           -- принимать нечего (решение владельца 27.09.2026). В кабинете он
+           -- остаётся — под фильтром «Откуда: из 1С».
+           AND (NOT $2::boolean OR i.source_document_type IS DISTINCT FROM 'supplier_order')
            -- Остальным: отменённый или завершённый на площадке заказ, с которым
            -- склад ничего не делал, — не документ склада, а шум в списке.
            AND ($2::boolean OR i.source = '1c' OR i.mp_closed_at IS NULL OR i.supply_id IS NOT NULL
@@ -53,6 +69,17 @@ router.get('/', requireAuth, async (req, res, next) => {
          ORDER BY i.created_at DESC`,
         [direction || null, req.auth.role === 'worker'],
       );
+      // Кто принимает приход и сколько принято: «На паузе · Дима · принято 3
+      // из 8 позиций» видят все грузчики и склад (владелец 27.09.2026).
+      // Продавцу имена грузчиков и их заметки не нужны.
+      if (req.auth.role !== 'seller') {
+        const open = result.rows.filter((r) => r.direction === 'in' && r.status !== 'completed').map((r) => r.id);
+        const states = await receiving.statesFor(client, req.auth.warehouseId, open, req.auth.staffKeyId || null);
+        for (const r of result.rows) {
+          const st = states.get(r.id);
+          if (st) r.work = st;
+        }
+      }
       return result.rows;
     });
     res.json(rows);
@@ -151,11 +178,15 @@ router.get('/:id', requireAuth, async (req, res, next) => {
         return { ...inv, items: itemsResult.rows };
       }
 
+      // Штрихкод и артикул WB — крупно на экране приёмки: по ним товар
+      // узнают на коробке (владелец 27.09.2026).
       const itemsResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+                codes.barcode, codes.wb_article,
                 rr.id AS receiving_id, rr.accepted_qty, rr.finished_at, rr.pause_reasons,
                 cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end, wr.row_num
          FROM invoice_items ii
+         ${productCodesJoin('ii.warehouse_id', 'ii.company_id', 'ii.sku')}
          LEFT JOIN receiving_records rr ON rr.invoice_item_id = ii.id
          LEFT JOIN cell_blocks cb ON cb.id = rr.cell_block_id
          LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
