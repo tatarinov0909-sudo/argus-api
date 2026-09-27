@@ -226,10 +226,29 @@ const { withTenantContext } = require('../src/db/pool');
     must(await api('POST', `/api/shipping/assembly/${second.id}/start`, dima, {}), 201);
     const taken = must(await api('POST', `/api/shipping/assembly/${second.id}/start`, ivan, { takeOver: true }), 201);
     const dimaLate = must(await api('POST', '/api/journal/pause', dima, { supplyId: second.id, reason: 'Перерыв' }), 201);
-    check('«забрать себе»: заход Ивана, у Димы сборки больше нет — его пауза пишется по-старому', () => {
+    const dimaExit = must(await api('POST', '/api/journal/pause', dima, { supplyId: second.id, reason: 'Вышел из сборки', exit: true }));
+    check('«забрать себе»: заход Ивана, у Димы сборки больше нет — его пауза пишется по-старому, а «вышел» — никак', () => {
       assert.equal(taken.assembly.workerName, 'Иван');
       assert.equal(dimaLate.assembly, undefined);
+      assert.equal(dimaExit.repeated, true);
     });
+    assert.ok(!(await journalTexts()).some((t) => /Дима поставил работу на паузу: Вышел из сборки/.test(t)));
+
+    // Телефон «заморозил» страницу в фоне: выход записывается временем ухода,
+    // но не раньше последнего изменения захода.
+    await run((c) => c.query(
+      `UPDATE supply_assemblies SET started_at = now() - interval '30 minutes', updated_at = now() - interval '30 minutes'
+        WHERE supply_id = $1 AND status = 'active'`, [second.id]));
+    const leftAt = new Date(Date.now() - 10 * 60000).toISOString();
+    must(await api('POST', '/api/journal/pause', ivan, { supplyId: second.id, reason: 'Вышел из сборки', exit: true, at: leftAt }), 201);
+    const frozen = (await run((c) => c.query(
+      `SELECT EXTRACT(EPOCH FROM (now() - paused_at))::int AS ago FROM supply_assemblies WHERE supply_id = $1 AND status = 'paused'`, [second.id]))).rows[0];
+    const frozenTexts = await journalTexts();
+    check('выход «задним числом»: пауза с момента ухода (10 мин назад), в журнале — время ухода', () => {
+      assert.ok(Math.abs(frozen.ago - 600) < 10, String(frozen.ago));
+      assert.ok(frozenTexts.some((t) => new RegExp(`^Иван вышел из сборки поставки «${second.number}» в \\d{2}:\\d{2}, сборка на паузе`).test(t)));
+    });
+    must(await api('POST', `/api/shipping/assembly/${second.id}/start`, ivan, {}));
     assert.ok((await journalTexts()).includes(`Иван забрал себе сборку поставки «${second.number}», которую вёл Дима `
       + '(сборка шла), и продолжил в приложении: взято 0 из 2 шт.'));
 
@@ -260,6 +279,11 @@ const { withTenantContext } = require('../src/db/pool');
       assert.equal(paperStarts.length, 1);
       assert.equal(rescan.started, false);
       assert.equal(rescan.assembly.mode, 'paper');
+    });
+    const wrongFinish = await api('POST', `/api/shipping/assembly/${third.id}/finish`, dima, {});
+    check('сборку по листу не закончить «Закончить сборку»: взятое по бумаге не ушло бы в «нет товара»', () => {
+      assert.equal(wrongFinish.status, 409);
+      assert.match(wrongFinish.body.error, /Собрал по листу/);
     });
     await run((c) => c.query(
       `UPDATE supply_assemblies SET started_at = now() - interval '9 minutes' WHERE supply_id = $1 AND status = 'active'`, [third.id]));

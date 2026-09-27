@@ -109,8 +109,12 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
       if (supplyId && !invoiceId) {
         const out = await assembly.pauseOrResume(client, warehouseId, staffKeyId, supplyId, {
           reason: why, resumed: resumed === true, exit: body.exit === true, comment: body.comment,
+          at: typeof body.at === 'string' ? body.at : null,
         });
         if (out) return { ...(out.entry || { repeated: true }), assembly: out.state };
+        // Выход из сборки, которую этот грузчик уже не ведёт (её забрали,
+        // закончили или страница устарела), — не событие для журнала.
+        if (body.exit === true) return { repeated: true, assembly: null };
       }
       const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
       const doc = invoiceId ? (await client.query(

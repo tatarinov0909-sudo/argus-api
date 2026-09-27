@@ -608,6 +608,11 @@ async function finishAssembly(client, warehouseId, staffKeyId, supplyId, { comme
   if (!cur) {
     throw new HttpError(409, `Сборку поставки «${supply.number}» сейчас ведёте не вы — откройте её заново`);
   }
+  // По листу взятое записывается только кнопкой «Собрал по листу»: закончи
+  // сборку здесь — и всё собранное по бумаге ушло бы руководителю «нет товара».
+  if (cur.mode === 'paper') {
+    throw new HttpError(409, 'Сборку по бумажному листу заканчивают кнопкой «Собрал по листу»');
+  }
   const notTaken = new Map();
   if (supply.status === 'collecting') {
     // Недобор ложится на самые поздние заказы: ранние уедут собранными.

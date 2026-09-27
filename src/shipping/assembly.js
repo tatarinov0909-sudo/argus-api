@@ -39,7 +39,7 @@ async function lockSupply(client, warehouseId, supplyId) {
 async function latest(client, warehouseId, supplyId) {
   const r = await client.query(
     `SELECT * FROM supply_assemblies WHERE warehouse_id = $1 AND supply_id = $2
-      ORDER BY started_at DESC, updated_at DESC LIMIT 1 FOR UPDATE`,
+      ORDER BY (status IN ('active', 'paused')) DESC, started_at DESC, updated_at DESC LIMIT 1 FOR UPDATE`,
     [warehouseId, supplyId],
   );
   return r.rows[0] || null;
@@ -110,7 +110,7 @@ async function statesFor(client, warehouseId, supplyIds, staffKeyId = null) {
   const sessions = await client.query(
     `SELECT DISTINCT ON (supply_id) * FROM supply_assemblies
       WHERE warehouse_id = $1 AND supply_id = ANY($2::uuid[])
-      ORDER BY supply_id, started_at DESC, updated_at DESC`,
+      ORDER BY supply_id, (status IN ('active', 'paused')) DESC, started_at DESC, updated_at DESC`,
     [warehouseId, ids],
   );
   const comments = await client.query(
@@ -263,8 +263,12 @@ async function start(client, warehouseId, staffKeyId, supplyId, { mode = 'app', 
 //
 // exit — грузчик вышел из сборки (стрелка «назад», другая вкладка,
 // закрыл страницу): таймер встаёт на паузу сам.
+//
+// at — когда человек на самом деле ушёл: телефон, свёрнутый в фоне, может не
+// успеть сообщить о выходе, и экран присылает время ухода, вернувшись. Раньше
+// последнего изменения захода и позже «сейчас» оно не бывает.
 async function pauseOrResume(client, warehouseId, staffKeyId, supplyId, {
-  reason = '', resumed = false, exit = false, comment = '',
+  reason = '', resumed = false, exit = false, comment = '', at = null,
 } = {}) {
   const note = cleanComment(comment);
   if (!UUID.test(String(supplyId || ''))) return null;
@@ -289,17 +293,23 @@ async function pauseOrResume(client, warehouseId, staffKeyId, supplyId, {
     }
   } else if (cur.status === 'active') {
     const why = exit ? EXIT_REASON : reason;
-    await client.query(
+    const left = exit && at && !Number.isNaN(new Date(at).getTime()) ? new Date(at) : null;
+    const paused = (await client.query(
       `UPDATE supply_assemblies
-          SET status = 'paused', paused_at = now(), pause_reason = $2,
+          SET status = 'paused', paused_at = GREATEST(updated_at, LEAST(now(), COALESCE($4::timestamptz, now()))),
+              pause_reason = $2,
               comment = COALESCE(NULLIF($3, ''), comment),
               comment_at = CASE WHEN $3 <> '' THEN now() ELSE comment_at END,
               updated_at = now()
-        WHERE id = $1`,
-      [cur.id, why, note],
-    );
+        WHERE id = $1 RETURNING paused_at`,
+      [cur.id, why, note, left ? left.toISOString() : null],
+    )).rows[0];
+    // Ушёл заметно раньше, чем об этом узнал сервер, — время ухода в тексте.
+    const when = Date.now() - new Date(paused.paused_at).getTime() > 60000
+      ? ` в ${new Date(paused.paused_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' })}`
+      : '';
     text = exit
-      ? `${name} вышел из сборки поставки «${supply.number}», сборка на паузе, ${takenText(prog)}`
+      ? `${name} вышел из сборки поставки «${supply.number}»${when}, сборка на паузе, ${takenText(prog)}`
       : `${name} поставил сборку поставки «${supply.number}» на паузу: ${why}. ${takenText(prog).replace(/^в/, 'В')}`;
   } else if (note) {
     // Уже на паузе — второй паузы нет, но комментарий человек оставил.
