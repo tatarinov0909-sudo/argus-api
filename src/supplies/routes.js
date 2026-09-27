@@ -7,6 +7,7 @@ const service = require('./service');
 const wbHandoff = require('./wbHandoff');
 const wb = require('../marketplaces/wb');
 const credentials = require('../marketplaces/credentials');
+const assembly = require('../shipping/assembly');
 
 const router = express.Router();
 
@@ -118,9 +119,17 @@ router.get('/pending/:companyId', requireAuth, requireRole('owner', 'manager'), 
 router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller'), async (req, res, next) => {
   try {
     const ctx = tenantContextFromAuth(req.auth);
-    const rows = await withTenantContext(ctx, (client) => service.list(
-      client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth) },
-    ));
+    const rows = await withTenantContext(ctx, async (client) => {
+      const list = await service.list(
+        client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth) },
+      );
+      // Ход сборки — строкой у поставки: «На паузе · Дима · взято 3 из 7».
+      // Складу, не продавцу: имена грузчиков и их заметки — внутреннее дело.
+      if (req.auth.role === 'seller') return list;
+      const states = await assembly.statesFor(client, req.auth.warehouseId,
+        list.filter((s) => s.status !== 'shipped').map((s) => s.id), req.auth.staffKeyId || null);
+      return list.map((s) => ({ ...s, assembly: states.get(s.id) || null }));
+    });
     res.json(rows);
   } catch (err) { next(err); }
 });

@@ -9,6 +9,7 @@ const { requireQty } = require('../middleware/qty');
 const { refreshSupplyStatus, lockSupplyOfInvoice } = require('../supplies/state');
 const { buildPickList, parseInvoiceIds } = require('./pickList');
 const { kitSkusAmong } = require('../kits/kits');
+const assembly = require('./assembly');
 
 const router = express.Router();
 
@@ -115,13 +116,16 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
 // ?invoiceIds=a,b,c — конкретные заказы; без параметра берутся все, что ждут
 // отбора. Кладовщик здесь именно сводит, а не решает: количество и маршрут —
 // арифметика (см. pickList.js).
+// ?full=1 вместе с supplyId — вся поставка, а не только то, что осталось
+// взять: печать листа уже собранной поставки «с отметками» или «пустой».
 router.get('/pick-list', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const invoiceIds = parseInvoiceIds(req.query.invoiceIds);
     const supplyId = req.query.supplyId ? parseInvoiceIds(String(req.query.supplyId))[0] : null;
+    const full = Boolean(supplyId) && req.query.full === '1';
     const list = await withTenantContext({ warehouseId }, (client) => (
-      buildPickList(client, warehouseId, invoiceIds, supplyId)
+      buildPickList(client, warehouseId, invoiceIds, supplyId, { full })
     ));
     res.json(list);
   } catch (err) {
@@ -510,15 +514,8 @@ async function pickProduct(client, warehouseId, staffKeyId, {
 // сканирует QR на листе — начало сборки и таймер; в конце — «собрал по
 // листу» и чего не нашёл. Взятое записывается теми же правилами, что и
 // сборка по товарам, недостача — теми же отметками «нет товара».
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 async function paperSupply(client, warehouseId, supplyId) {
-  if (!UUID.test(String(supplyId || ''))) throw new HttpError(400, 'Нужна поставка');
-  const s = (await client.query(
-    'SELECT id, number, status, company_id FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
-    [warehouseId, supplyId],
-  )).rows[0];
-  if (!s) throw new HttpError(404, 'Поставки нет — возможно, её разобрали');
+  const s = await assembly.lockSupply(client, warehouseId, supplyId);
   if (s.status !== 'collecting') throw new HttpError(409, `Поставка «${s.number}» уже собрана`);
   return s;
 }
@@ -526,27 +523,120 @@ async function paperSupply(client, warehouseId, supplyId) {
 const workerName = async (client, staffKeyId) =>
   (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0]?.name || 'Грузчик';
 
+// Начало сборки по листу — только от скана QR или «Начать» в окне с таймером
+// (владелец 27.09.2026), а не от открытия листа: экран зовёт сюда только
+// после этого. Это тот же заход сборки, что и в приложении, — с тем же
+// таймером на сервере, паузой, отказом и «забрать себе».
 router.post('/paper/start', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, async (client) => {
-      const s = await paperSupply(client, warehouseId, (req.body || {}).supplyId);
-      const entry = await journal.createEntry(client, {
-        warehouseId,
-        agent: 'Кладовщик',
-        actionText: `${await workerName(client, staffKeyId)} начал сборку поставки «${s.number}» по бумажному листу.`,
-        entityType: 'paper_pick',
-        entityId: s.id,
-        actorType: 'worker',
-        actorId: staffKeyId,
-      });
-      return { supplyId: s.id, number: s.number, startedAt: entry.created_at };
+    const body = req.body || {};
+    const out = await withTenantContext({ warehouseId }, (client) => assembly.start(
+      client, warehouseId, staffKeyId, body.supplyId, { mode: 'paper', takeOver: body.takeOver === true },
+    ));
+    res.status(201).json({
+      supplyId: out.supply.id, number: out.supply.number, startedAt: out.assembly.startedAt, ...out,
     });
-    res.status(201).json(out);
   } catch (err) {
     next(err);
   }
 });
+
+// ---------- Состояние сборки поставки (владелец 27.09.2026) ----------
+// Действует только грузчик; руководитель и менеджер видят состояние, но
+// сборку за грузчика не начинают, не бросают и не заканчивают.
+
+router.get('/assembly/:supplyId', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => assembly.readState(
+      client, warehouseId, req.params.supplyId, staffKeyId || null,
+    ));
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// «Начать» в окне «Сейчас запустится таймер сборки». takeOver — забрать
+// сборку, которую ведёт другой грузчик (он ушёл, телефон сел).
+router.post('/assembly/:supplyId/start', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const body = req.body || {};
+    const out = await withTenantContext({ warehouseId }, (client) => assembly.start(
+      client, warehouseId, staffKeyId, req.params.supplyId,
+      { mode: 'app', takeOver: body.takeOver === true, comment: body.comment },
+    ));
+    res.status(out.started ? 201 : 200).json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/assembly/:supplyId/abandon', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => assembly.abandon(
+      client, warehouseId, staffKeyId, req.params.supplyId, { comment: (req.body || {}).comment },
+    ));
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// «Закончить сборку» с тем, что уже взято: недобор уходит руководителю
+// отметками «нет товара» — так же, как при сборке по бумажному листу. Когда
+// взято всё, это просто конец работы с временем и комментарием.
+router.post('/assembly/:supplyId/finish', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, (client) => finishAssembly(
+      client, warehouseId, staffKeyId, req.params.supplyId, { comment: (req.body || {}).comment },
+    ));
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function finishAssembly(client, warehouseId, staffKeyId, supplyId, { comment }) {
+  const note = assembly.cleanComment(comment);
+  const supply = await assembly.lockSupply(client, warehouseId, supplyId);
+  const cur = await assembly.liveOf(client, warehouseId, supply.id, staffKeyId);
+  if (!cur) {
+    throw new HttpError(409, `Сборку поставки «${supply.number}» сейчас ведёте не вы — откройте её заново`);
+  }
+  const notTaken = new Map();
+  if (supply.status === 'collecting') {
+    // Недобор ложится на самые поздние заказы: ранние уедут собранными.
+    for (const l of (await openSupplyLines(client, warehouseId, supply.id)).reverse()) {
+      const qty = Number(l.left_qty);
+      await markMissing(client, warehouseId, staffKeyId, {
+        invoiceItemId: l.id, qty, how: 'при завершении сборки',
+      });
+      const it = notTaken.get(l.sku) || { sku: l.sku, name: l.name, qty: 0 };
+      it.qty += qty;
+      notTaken.set(l.sku, it);
+    }
+  }
+  const closed = await assembly.closeRow(client, cur, 'finished', note);
+  const prog = (await assembly.progress(client, warehouseId, [supply.id])).get(supply.id) || { taken: 0, total: 0 };
+  const minutes = Math.max(1, Math.round(assembly.workMs(closed) / 60000));
+  const list = [...notTaken.values()];
+  await assembly.entry(client, warehouseId, staffKeyId, supply, assembly.withComment(
+    `${closed.worker_name} закончил сборку поставки «${supply.number}» за ${minutes} мин: ${assembly.takenText(prog)}`
+    + (list.length
+      ? ` Не взято: ${list.map((x) => `«${x.name}» — ${x.qty} шт.`).join(', ')} Руководителю ушло «нет товара».`
+      : ''),
+    note));
+  return {
+    ...(await assembly.stateOf(client, warehouseId, supply, staffKeyId)),
+    minutes,
+    notTaken: list,
+  };
+}
 
 router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
@@ -563,6 +653,8 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
     }
     const started = new Date(body.startedAt);
     const pausedMs = Math.max(0, Number(body.pausedMs) || 0);
+    // «Где оставил, что осталось» — уходит в итог одной записью с ним.
+    const note = assembly.cleanComment(body.comment);
     const out = await withTenantContext({ warehouseId }, async (client) => {
       const s = await paperSupply(client, warehouseId, body.supplyId);
       const bySku = new Map();
@@ -624,8 +716,14 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
         }
         report.push({ sku: it.sku, name: it.name, need: it.need, taken, missing, noCells, kit: kits.has(it.sku) });
       }
-      const workMs = Number.isNaN(started.getTime()) ? null
-        : Date.now() - started.getTime() - pausedMs;
+      // Время — по заходу сборки на сервере: он начался сканом QR или
+      // «Начать», и паузы в нём посчитаны сервером. Без захода (старый экран)
+      // — по началу и паузам, что прислал телефон.
+      const live = await assembly.liveOf(client, warehouseId, s.id, staffKeyId);
+      const closed = live ? await assembly.closeRow(client, live, 'finished', note) : null;
+      const workMs = closed ? assembly.workMs(closed)
+        : Number.isNaN(started.getTime()) ? null
+          : Date.now() - started.getTime() - pausedMs;
       // Время считаем, только если начало правдоподобное: не из будущего и
       // не старше суток (лист могли отсканировать вчера и забыть).
       const minutes = workMs != null && workMs >= 0 && workMs < 86400000 ? Math.max(1, Math.round(workMs / 60000)) : null;
@@ -634,16 +732,17 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
       await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
-        actionText: `${await workerName(client, staffKeyId)} собрал поставку «${s.number}» по бумажному листу`
+        actionText: assembly.withComment(`${await workerName(client, staffKeyId)} собрал поставку «${s.number}» по бумажному листу`
           + (minutes ? ` за ${minutes} мин` : '') + `: взято ${takenTotal} шт.`
           + (short.length ? ` Не нашёл: ${short.map((r) => `«${r.name}» — ${r.missing} шт.`
             + (r.noCells ? (r.kit ? ' (набор не собран из компонентов)' : ' (нашёл, но в ячейках Аргуса его нет)') : '')).join(', ')}` : ''),
+        note),
         entityType: 'paper_pick',
         entityId: s.id,
         actorType: 'worker',
         actorId: staffKeyId,
       });
-      return { number: s.number, taken: takenTotal, minutes, report };
+      return { number: s.number, taken: takenTotal, minutes, report, comment: note || null };
     });
     res.status(201).json(out);
   } catch (err) {

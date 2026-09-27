@@ -2,7 +2,9 @@ function errorHandler(err, req, res, _next) {
   req.log?.error({ err }, 'request failed');
 
   if (err.status) {
-    return res.status(err.status).json({ error: err.message });
+    // details — то, что экрану нужно для ответа человеку («сборку ведёт
+    // Дима, забрать?»), а не только текст ошибки.
+    return res.status(err.status).json({ ...(err.details || {}), error: err.message });
   }
   // Postgres unique_violation
   if (err.code === '23505') {
@@ -29,9 +31,10 @@ function errorHandler(err, req, res, _next) {
 }
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, details = null) {
     super(message);
     this.status = status;
+    this.details = details;
   }
 }
 

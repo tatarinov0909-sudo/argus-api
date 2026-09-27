@@ -39,7 +39,11 @@ function orderView(r) {
   };
 }
 
-async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = null) {
+// full — вся поставка целиком, а не только то, что осталось взять: лист уже
+// собранной поставки печатают «с отметками» (что откуда взято) или «пустым»
+// (владелец 27.09.2026). Только вместе с supplyId.
+async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = null, { full = false } = {}) {
+  const whole = Boolean(full && supplyId);
   // Без списка берём всё, что реально ждёт отбора: открытые и начатые
   // отгрузки. Именно этот случай и есть «утро, заказов много». Заказы
   // с площадки — только отправленные менеджером на сборку, то есть
@@ -52,13 +56,13 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      LEFT JOIN supplies s ON s.id = i.supply_id
      WHERE i.warehouse_id = $1 AND i.direction = 'out'
-       AND i.status IN ('open', 'in_progress')
+       AND (i.status IN ('open', 'in_progress') OR $4::boolean)
        AND i.mp_closed_at IS NULL
        AND (i.source = '1c' OR i.supply_id IS NOT NULL)
        AND ($2::uuid[] IS NULL OR i.id = ANY($2::uuid[]))
        AND ($3::uuid IS NULL OR i.supply_id = $3::uuid)
      ORDER BY i.created_at`,
-    [warehouseId, invoiceIds.length ? invoiceIds : null, supplyId],
+    [warehouseId, invoiceIds.length ? invoiceIds : null, supplyId, whole],
   );
   if (invoices.rows.length === 0) {
     return { orders: [], lines: [], totalUnits: 0, cellsToVisit: 0 };
@@ -96,12 +100,16 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   // в своих ячейках и смешивать его нельзя даже в листе.
   const lines = new Map();
   for (const it of items.rows) {
-    const need = Number(it.declared_qty) - Number(it.picked);
-    if (it.closed || need <= 0) continue;
+    const declared = Number(it.declared_qty);
+    const picked = Math.min(Number(it.picked), declared);
+    // Сколько по строке ещё взять с полки: закрытая строка — нисколько.
+    const left = it.closed ? 0 : Math.max(0, declared - Number(it.picked));
+    const need = whole ? declared : left;
+    if (!whole && need <= 0) continue;
     const key = `${it.company_id}|${it.sku}`;
     if (!lines.has(key)) {
       lines.set(key, {
-        sku: it.sku, name: it.name, companyId: it.company_id, needQty: 0, perOrder: [],
+        sku: it.sku, name: it.name, companyId: it.company_id, needQty: 0, leftQty: 0, pickedQty: 0, perOrder: [],
         // Артикул площадки и штрихкод: по ним сборщик и ищет товар на полке,
         // а не по внутреннему коду.
         article: it.mp_article || null,
@@ -112,6 +120,8 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     }
     const line = lines.get(key);
     line.needQty += need;
+    line.leftQty += left;
+    line.pickedQty += picked;
     if (!line.article && it.mp_article) line.article = it.mp_article;
     if (!line.photo && it.photo_url) line.photo = it.photo_url;
     if (!line.barcode && it.barcode) line.barcode = it.barcode;
@@ -149,13 +159,43 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     stockByKey.get(key).push(r);
   }
 
+  // Откуда уже взято — для листа всей поставки: отметка стоит у той ячейки,
+  // из которой товар действительно сняли.
+  const takenByKey = new Map();
+  if (whole) {
+    const taken = await client.query(
+      `SELECT ii.company_id, ii.sku, sr.cell_block_id, SUM(sr.picked_qty) AS qty,
+              wr.row_num, cb.label, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+         FROM shipping_records sr
+         JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+         LEFT JOIN cell_blocks cb ON cb.id = sr.cell_block_id
+         LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+        WHERE ii.invoice_id = ANY($1::uuid[]) AND sr.picked_qty > 0
+        GROUP BY ii.company_id, ii.sku, sr.cell_block_id, wr.row_num, cb.label,
+                 cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+        ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
+      [ids],
+    );
+    for (const r of taken.rows) {
+      const key = `${r.company_id}|${r.sku}`;
+      if (!takenByKey.has(key)) takenByKey.set(key, []);
+      takenByKey.get(key).push({
+        cellBlockId: r.cell_block_id,
+        label: r.row_num == null ? '—' : cellLabel(r),
+        route: r.row_num == null ? [Infinity, 0, 0] : [Number(r.row_num), Number(r.rack_start), Number(r.tier_start)],
+        qty: Number(r.qty),
+      });
+    }
+  }
+
   const result = [];
   const visited = new Set();
   for (const [key, line] of lines) {
     // Раскладываем нужное количество по ячейкам в порядке обхода: сколько
     // есть в первой, потом остаток во второй. Работнику остаётся идти и брать,
-    // а не считать у стеллажа.
-    let left = line.needQty;
+    // а не считать у стеллажа. У листа всей поставки — только то, что ещё
+    // не взято.
+    let left = whole ? line.leftQty : line.needQty;
     const cells = [];
     for (const r of stockByKey.get(key) || []) {
       if (left <= 0) break;
@@ -183,6 +223,11 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       // Нехватку показываем здесь же: узнать о ней до похода, а не у полки.
       shortfall: left,
       perOrder: line.perOrder,
+      ...(whole ? {
+        pickedQty: line.pickedQty,
+        leftQty: line.leftQty,
+        taken: takenByKey.get(key) || [],
+      } : {}),
     });
   }
 
@@ -228,7 +273,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   // ведёт работника по складу, а не гоняет туда-обратно.
   // Ряд, потом ячейка вдоль ряда, потом ярус — порядок шагов по складу.
   // Строки без ячеек — в конец.
-  const routeOf = (line) => line.cells[0]?.route || [Infinity, 0, 0];
+  const routeOf = (line) => line.cells[0]?.route || line.taken?.[0]?.route || [Infinity, 0, 0];
   result.sort((a, b) => {
     const [ra, rb] = [routeOf(a), routeOf(b)];
     return (ra[0] - rb[0]) || (ra[1] - rb[1]) || (ra[2] - rb[2]);
@@ -239,6 +284,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     lines: result,
     totalUnits: result.reduce((sum, l) => sum + l.needQty, 0),
     cellsToVisit: visited.size,
+    ...(whole ? { full: true, pickedUnits: result.reduce((sum, l) => sum + l.pickedQty, 0) } : {}),
   };
 }
 

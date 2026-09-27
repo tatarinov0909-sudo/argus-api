@@ -3,6 +3,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const repository = require('./repository');
+const assembly = require('../shipping/assembly');
 
 const router = express.Router();
 
@@ -89,6 +90,11 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 // Грузчик поставил работу на паузу или вернулся к ней — руководитель видит
 // это в журнале сразу, а не в итоге накладной (владелец 26.09.2026).
 // Работник журнал не читает, он только сообщает.
+//
+// Пауза сборки поставки идёт сюда же (владелец 27.09.2026): у грузчика,
+// который ведёт сборку, она ещё и останавливает таймер на сервере, а
+// exit — «вышел из сборки» (стрелка «назад», другая вкладка). Запись в
+// журнале при этом одна, с тем, сколько взято, и комментарием.
 router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
@@ -100,6 +106,12 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
     const why = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ').slice(0, 200) : '';
     if (!why) throw new HttpError(400, 'Нужна причина паузы');
     const entry = await withTenantContext({ warehouseId }, async (client) => {
+      if (supplyId && !invoiceId) {
+        const out = await assembly.pauseOrResume(client, warehouseId, staffKeyId, supplyId, {
+          reason: why, resumed: resumed === true, exit: body.exit === true, comment: body.comment,
+        });
+        if (out) return { ...(out.entry || { repeated: true }), assembly: out.state };
+      }
       const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
       const doc = invoiceId ? (await client.query(
         `SELECT i.id, i.number, s.number AS supply_number FROM invoices i
@@ -125,7 +137,7 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
         actorId: staffKeyId,
       });
     });
-    res.status(201).json(entry);
+    res.status(entry.repeated ? 200 : 201).json(entry);
   } catch (err) {
     next(err);
   }

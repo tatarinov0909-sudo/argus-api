@@ -574,6 +574,10 @@ async function stockCover(client, warehouseId, companyId = null) {
     [warehouseId, companyId],
   );
   for (const r of cells.rows) stock.set(`${r.company_id}|${r.sku}`, Number(r.qty));
+  // Сколько лежит годного и сколько из этого уже ждут собираемые поставки —
+  // до раскладки по заказам: это числа для экрана, а не для очереди.
+  const onHand = new Map(stock);
+  const reserved = new Map();
   const demand = await client.query(
     `SELECT s.id AS supply_id, i.id AS invoice_id, i.company_id, ii.sku,
             ${LEFT_TO_PICK_SQL} AS need
@@ -594,9 +598,11 @@ async function stockCover(client, warehouseId, companyId = null) {
     return true;
   };
   for (const r of demand.rows) {
-    if (!take(`${r.company_id}|${r.sku}`, Number(r.need))) shortInvoices.add(r.invoice_id);
+    const key = `${r.company_id}|${r.sku}`;
+    reserved.set(key, (reserved.get(key) || 0) + Math.max(0, Number(r.need)));
+    if (!take(key, Number(r.need))) shortInvoices.add(r.invoice_id);
   }
-  return { shortInvoices, take };
+  return { shortInvoices, take, onHand, reserved };
 }
 
 async function list(client, warehouseId, { status = null, showShortages = false } = {}) {
@@ -732,6 +738,23 @@ async function pendingOrders(client, warehouseId, companyId) {
   for (const x of byAge) {
     if (x.sku && !cover.take(`${companyId}|${x.sku}`, Number(x.left_to_pick || 0))) stockShort.add(x.id);
   }
+  // Цвет строки — по товару целиком (владелец 27.09.2026): красный — годного
+  // в ячейках нет совсем, жёлтый — есть, но меньше, чем нужно этим заказам
+  // вместе с поставками, которые уже собираются («1 из 3»).
+  const pendingNeed = new Map();
+  for (const x of r.rows) {
+    if (!x.sku || !x.pickable) continue;
+    pendingNeed.set(x.sku, (pendingNeed.get(x.sku) || 0) + Math.max(0, Number(x.left_to_pick || 0)));
+  }
+  const stockOf = (x) => {
+    if (!x.sku || !x.pickable) return { stockQty: null, stockNeed: null, stockReserved: null, stockLevel: null };
+    const key = `${companyId}|${x.sku}`;
+    const qty = cover.onHand.get(key) || 0;
+    const reservedQty = cover.reserved.get(key) || 0;
+    const need = pendingNeed.get(x.sku) || 0;
+    const level = need + reservedQty <= 0 ? 'ok' : qty <= 0 ? 'none' : qty < need + reservedQty ? 'short' : 'ok';
+    return { stockQty: qty, stockNeed: need, stockReserved: reservedQty, stockLevel: level };
+  };
   return r.rows.map((x) => ({
     id: x.id,
     number: x.number,
@@ -762,6 +785,10 @@ async function pendingOrders(client, warehouseId, companyId) {
     // По учёту на полках не хватит — поставку с таким заказом склад
     // полностью не соберёт. Решать лучше сейчас, а не у пустой ячейки.
     stockShort: stockShort.has(x.id),
+    // «На складе, шт.»: годный остаток товара в ячейках Аргуса, сколько его
+    // нужно этим заказам и сколько уже ждут собираемые поставки; stockLevel —
+    // none (нет совсем), short (меньше нужного), ok. У несопоставленного — null.
+    ...stockOf(x),
   }));
 }
 
