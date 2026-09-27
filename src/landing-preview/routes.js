@@ -30,7 +30,7 @@ function createLandingPreviewRouter({
 
   router.use((req, res, next) => {
     res.set({ 'Cache-Control': 'private, no-store', 'X-Robots-Tag': 'noindex, nofollow',
-      'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+      'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin' });
     if (!/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(passwordHash || '')) {
       return res.status(503).type('html').send(loginPage('Доступ ещё не настроен.'));
     }
