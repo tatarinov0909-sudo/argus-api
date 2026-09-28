@@ -1,4 +1,5 @@
 const { blockLabelSql } = require('../cells/label');
+const { categoryOf, CATEGORIES } = require('./category');
 
 // Append-only by construction: this module exports no update/delete
 // function, the DB grants for the argus_app role REVOKE UPDATE/DELETE on
@@ -53,6 +54,9 @@ async function listEntries(client, warehouseId, {
             EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
             i.number AS invoice_number,
             i.direction AS invoice_direction,
+            -- Документ, на который запись ссылается как на сущность («отменил
+            -- привоз» пишется без invoice_id) — для категории (journal/category.js).
+            ei.direction AS entity_direction,
             -- Кто именно работал: в кабинете работа грузчика — одна строка с
             -- его именем, а не «Кладовщик» на каждый товар.
             sk.name AS actor_name,
@@ -74,6 +78,7 @@ async function listEntries(client, warehouseId, {
                  WHEN wi.id IS NOT NULL THEN wi.direction || ':' || wi.id END AS work_key
      FROM journal_entries je
      LEFT JOIN invoices i ON i.id = je.invoice_id
+     LEFT JOIN invoices ei ON je.entity_type = 'invoice' AND ei.id = je.entity_id
      LEFT JOIN supplies s ON s.id = i.supply_id
      LEFT JOIN journal_entries o ON o.id = je.related_entry_id
      LEFT JOIN invoices wi ON wi.id = COALESCE(je.invoice_id, o.invoice_id)
@@ -105,11 +110,20 @@ async function listEntries(client, warehouseId, {
               (je.entity_type IN ('receiving_session', 'supply_assembly', 'paper_pick')) DESC`,
     [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
-  if (!cellBlockId) return result.rows;
+  if (!cellBlockId) return withCategory(result.rows);
   const ops = await cellOperations(client, warehouseId, cellBlockId);
-  return [...result.rows, ...ops]
+  return withCategory([...result.rows, ...ops]
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    .slice(0, limit);
+    .slice(0, limit));
+}
+
+const CATEGORY_LABEL = new Map(CATEGORIES);
+function withCategory(rows) {
+  rows.forEach((row) => {
+    row.category = categoryOf(row);
+    row.category_label = CATEGORY_LABEL.get(row.category);
+  });
+  return rows;
 }
 
 const CELL_HISTORY = '1 year';
