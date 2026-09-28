@@ -11,6 +11,7 @@ const initialStock = require('./initialStock');
 const stockAlign = require('./stockAlign');
 const journal = require('../journal/repository');
 const { blockContents } = require('./contents');
+const { cellFills } = require('./fill');
 
 const router = express.Router();
 
@@ -34,7 +35,8 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const rowsResult = await client.query(
-        `SELECT id, row_num, rack_count, tier_count, label, aisle_after FROM warehouse_rows
+        `SELECT id, row_num, rack_count, tier_count, label, aisle_after,
+                cell_width_cm, cell_depth_cm, cell_height_cm FROM warehouse_rows
          WHERE warehouse_id = $1 ORDER BY row_num ASC`,
         [warehouseId],
       );
@@ -82,8 +84,11 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
          WHERE cb.warehouse_id = $1`,
         [warehouseId],
       );
+      // Заполнение — приблизительно, по объёму (src/cells/fill.js).
+      const fills = await cellFills(client, warehouseId);
       const blocksByRow = new Map();
       for (const block of blocksResult.rows) {
+        block.fill = fills.get(block.id) || null;
         const list = blocksByRow.get(block.warehouse_row_id) || [];
         list.push(block);
         blocksByRow.set(block.warehouse_row_id, list);
@@ -288,6 +293,37 @@ router.patch('/rows/:rowNum/name', requireAuth, requireGrant('warehouse'), async
         throw err;
       }
     });
+    if (!row) throw new HttpError(404, 'Ряд не найден');
+    res.json(row);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Размер одной ячейки ряда в сантиметрах — ширина места стеллажа, глубина,
+// высота яруса (владелец 28.09.2026). По нему и габаритам товаров считается
+// заполнение. null во всех трёх — «не задан».
+router.patch('/rows/:rowNum/cell-size', requireAuth, requireGrant('warehouse'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const rowNum = Number(req.params.rowNum);
+    if (!Number.isInteger(rowNum) || rowNum < 1) throw new HttpError(400, 'Неверный номер ряда');
+    const body = req.body || {};
+    const names = { widthCm: 'ширина', depthCm: 'глубина', heightCm: 'высота' };
+    const vals = Object.keys(names).map((k) => body[k]);
+    const clear = vals.every((v) => v === null);
+    const size = clear ? [null, null, null] : Object.keys(names).map((k) => {
+      const v = body[k];
+      const n = typeof v === 'number' ? v : typeof v === 'string' && /^\d+([.,]\d+)?$/.test(v.trim()) ? Number(v.trim().replace(',', '.')) : NaN;
+      if (!Number.isFinite(n) || n <= 0 || n > 2000) throw new HttpError(400, `Размер ячейки: ${names[k]} — число сантиметров от 1 до 2000`);
+      return n;
+    });
+    const row = await withTenantContext({ warehouseId }, async (client) => (await client.query(
+      `UPDATE warehouse_rows SET cell_width_cm = $3, cell_depth_cm = $4, cell_height_cm = $5
+        WHERE warehouse_id = $1 AND row_num = $2
+        RETURNING row_num, cell_width_cm, cell_depth_cm, cell_height_cm`,
+      [warehouseId, rowNum, ...size],
+    )).rows[0]);
     if (!row) throw new HttpError(404, 'Ряд не найден');
     res.json(row);
   } catch (err) {

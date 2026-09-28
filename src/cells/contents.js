@@ -8,6 +8,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { formatBlockLabel } = require('./label');
 const { productCodesJoin } = require('../products/codes');
+const { cellFills } = require('./fill');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const QUALITY = { good: 'годный', defective: 'брак', packaging_defect: 'брак упаковки' };
@@ -42,6 +43,8 @@ async function blockContents(client, warehouseId, blockId) {
     cellBlockId: block.id,
     label: formatBlockLabel(block.row_num, block),
     state: block.state,
+    // Насколько заполнена — приблизительно; нет данных — причина.
+    fill: items.length ? (await cellFills(client, warehouseId, block.id)).get(block.id) || null : null,
     totalUnits: items.reduce((sum, i) => sum + Number(i.qty), 0),
     items: items.map((i) => ({
       companyId: i.company_id,
