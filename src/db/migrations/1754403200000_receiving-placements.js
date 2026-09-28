@@ -14,9 +14,19 @@ exports.shorthands = undefined;
 //
 // receiving_records.cell_block_id остаётся ячейкой первой укладки: на неё
 // ведёт запись журнала, и по ней старые отчёты видят «размещено».
+//
+// Откат не удаляет раскладку, а откладывает таблицу
+// (receiving_placements_rolled_back), накат возвращает её и дописывает только
+// то, что приняли, пока её не было. Раньше откат с накатом выдумывали
+// раскладку заново — «всё принятое в первой ячейке» (проверка 28.09.2026).
 exports.up = (pgm) => {
   pgm.sql(`
-    CREATE TABLE receiving_placements (
+    DO $$ BEGIN
+      IF to_regclass('receiving_placements_rolled_back') IS NOT NULL THEN
+        ALTER TABLE receiving_placements_rolled_back RENAME TO receiving_placements;
+      END IF;
+    END $$;
+    CREATE TABLE IF NOT EXISTS receiving_placements (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       receiving_record_id UUID NOT NULL REFERENCES receiving_records(id) ON DELETE CASCADE,
       invoice_item_id UUID NOT NULL REFERENCES invoice_items(id) ON DELETE CASCADE,
@@ -37,15 +47,16 @@ exports.up = (pgm) => {
       confirm_method TEXT CHECK (confirm_method IS NULL OR confirm_method IN ('qr')),
       UNIQUE (receiving_record_id, step)
     );
-    CREATE UNIQUE INDEX receiving_placements_one_cell
+    CREATE UNIQUE INDEX IF NOT EXISTS receiving_placements_one_cell
       ON receiving_placements (receiving_record_id, cell_block_id) WHERE cell_block_id IS NOT NULL;
-    CREATE INDEX receiving_placements_item ON receiving_placements (invoice_item_id);
-    CREATE INDEX receiving_placements_cell ON receiving_placements (cell_block_id, placed_at DESC);
-    CREATE INDEX receiving_placements_company ON receiving_placements (company_id);
+    CREATE INDEX IF NOT EXISTS receiving_placements_item ON receiving_placements (invoice_item_id);
+    CREATE INDEX IF NOT EXISTS receiving_placements_cell ON receiving_placements (cell_block_id, placed_at DESC);
+    CREATE INDEX IF NOT EXISTS receiving_placements_company ON receiving_placements (company_id);
 
     -- Как у receiving_records: склад видит свои, продавец — укладки своего
     -- товара (адреса ему не отдаются — это делают маршруты, как и раньше).
     ALTER TABLE receiving_placements ENABLE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS tenant_isolation ON receiving_placements;
     CREATE POLICY tenant_isolation ON receiving_placements USING (
       warehouse_id = NULLIF(current_setting('app.current_warehouse_id', true), '')::uuid
       OR company_id = NULLIF(current_setting('app.current_company_id', true), '')::uuid
@@ -60,10 +71,11 @@ exports.up = (pgm) => {
     SELECT rr.id, rr.invoice_item_id, rr.warehouse_id, rr.company_id, rr.cell_block_id, ii.sku, rr.accepted_qty, 1,
            COALESCE(rr.finished_at, rr.started_at), rr.worker_key_id
       FROM receiving_records rr JOIN invoice_items ii ON ii.id = rr.invoice_item_id
-     WHERE rr.cell_block_id IS NOT NULL AND rr.accepted_qty > 0;
+     WHERE rr.cell_block_id IS NOT NULL AND rr.accepted_qty > 0
+       AND NOT EXISTS (SELECT 1 FROM receiving_placements x WHERE x.receiving_record_id = rr.id);
   `);
 };
 
 exports.down = (pgm) => {
-  pgm.sql('DROP TABLE IF EXISTS receiving_placements;');
+  pgm.sql('ALTER TABLE receiving_placements RENAME TO receiving_placements_rolled_back;');
 };

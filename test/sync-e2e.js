@@ -358,6 +358,8 @@ async function api(method, path, { token, body } = {}) {
 
     const freshDetail = await api('GET', `/api/invoices/${invoiceId}`, { token: ownerToken });
     const lineId = freshDetail.body.items[0].id;
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${invoiceId}/start`, { token: workerToken });
     const received = await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: lineId, acceptedQty: 38, cellBlockId: cell.id },

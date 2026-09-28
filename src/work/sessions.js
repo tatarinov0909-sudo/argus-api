@@ -169,6 +169,8 @@ const TARGETS = {
       busy: (doc, cur) => `Приход «${doc.number}» принимает ${cur.worker_name}`
         + `${cur.status === 'paused' ? ' — приёмка на паузе' : ''}. Забрать приёмку себе?`,
       notMine: (doc) => `Приёмку прихода «${doc.number}» сейчас ведёте не вы`,
+      notStarted: (doc) => `Приёмка прихода «${doc.number}» не начата — нажмите «Начать приёмку»`,
+      pausedLock: (doc) => `Приёмка прихода «${doc.number}» на паузе — сначала «Продолжить»`,
       settled: (name, doc, minutes, taken) => `${name} закончил приёмку прихода «${doc.number}» за ${minutes} мин: ${taken}`
         + ' Все позиции приняты и разложены — приёмка закрыта сама.',
     },
@@ -513,6 +515,22 @@ function createWork(kind) {
   }
 
   // Свой живой заход — для «Закончить» и бумажного листа.
+  // Действие внутри работы (принять позицию, разложить) — только тому, кто
+  // её ведёт, и не на паузе (задание 27.09: работа начинается «Начать»,
+  // чужую забирают явно — «забрал себе» в журнале; решение 26.09.2026: на
+  // паузе работа заперта целиком). Раньше это держал только экран, и через
+  // API принимал кто угодно — в том числе второй грузчик за первого, а конец
+  // работы записывался первому. Документ уже взят на запись вызывающим.
+  async function requireActive(client, warehouseId, staffKeyId, doc) {
+    const cur = await latest(client, warehouseId, doc.id);
+    if (!isLive(cur)) throw new HttpError(409, T.text.notStarted(doc));
+    if (cur.worker_key_id !== staffKeyId) {
+      throw new HttpError(409, T.text.busy(doc, cur), { taken: true, assembly: view(cur, staffKeyId) });
+    }
+    if (cur.status === 'paused') throw new HttpError(409, T.text.pausedLock(doc));
+    return cur;
+  }
+
   async function liveOf(client, warehouseId, id, staffKeyId) {
     const cur = await latest(client, warehouseId, id);
     return isLive(cur) && cur.worker_key_id === staffKeyId ? cur : null;
@@ -531,6 +549,7 @@ function createWork(kind) {
     pauseOrResume,
     abandon,
     liveOf,
+    requireActive,
     latest,
     settle,
     closeRow,

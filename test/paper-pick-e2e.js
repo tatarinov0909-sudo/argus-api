@@ -44,8 +44,14 @@ const { withTenantContext } = require('../src/db/pool');
     const receipt = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-1',
       items: [{ sku: 'PB-1', name: 'Батончик', declaredQty: 2 }, { sku: 'PB-1', name: 'Батончик', declaredQty: 2 },
         { sku: 'PB-2', name: 'Паста', declaredQty: 5 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[0].id, acceptedQty: 2, cellBlockId: cells[0].id }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[1].id, acceptedQty: 2, cellBlockId: cells[1].id }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[2].id, acceptedQty: 5, cellBlockId: cells[2].id }), 201);
 
     // Хлебцы — набор из пасты: на полке его нет, пока не собрали.

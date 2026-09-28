@@ -226,6 +226,7 @@ const { withTenantContext } = require('../src/db/pool');
     // Принято 7, в ячейку легло 4 — 3 шт. не размещено (раньше так было у
     // «своего места»; теперь без ячейки принять нельзя — задание 28.09.2026).
     const loose = await invoice('ПР-ЯЧ-2', [['MC-4', 7], ['MC-2', 1]]);
+    must(await api('POST', `/api/receiving/session/${loose.id}/start`, dima, {}), 201);
     must(await post(dima, { invoiceItemId: loose.item('MC-4').id, acceptedQty: 7, placements: [{ cellBlockId: c41.id, qty: 4 }] }), 201);
     const looseCard = must(await api('GET', `/api/inbound/${loose.id}`, owner));
     check('не разложено: 3 шт. «без ячейки» в карточке', () => assert.equal(looseCard.unplaced, 3));
@@ -234,9 +235,9 @@ const { withTenantContext } = require('../src/db/pool');
     const stuck = await invoice('ПР-270926-1', [['MC-2', 3], ['MC-3', 2]]);
     must(await api('POST', `/api/receiving/session/${stuck.id}/start`, jonik, {}), 201);
     must(await post(jonik, { invoiceItemId: stuck.item('MC-2').id, acceptedQty: 3, cellBlockId: c31.id }), 201);
-    // Старый экран: последняя позиция принята без захода (так принимал
-    // экран до 27.09), а заход остался — как на проде: на паузе.
-    await run((c) => c.query(`UPDATE work_sessions SET status = 'finished', ended_at = now() WHERE invoice_id = $1`, [stuck.id]));
+    // Как на проде 27.09: приход принят, а заход остался на паузе (так
+    // оставлял старый экран; без захода сервер теперь не принимает — 28.09,
+    // поэтому состояние готовим в базе после честной приёмки).
     must(await post(jonik, { invoiceItemId: stuck.item('MC-3').id, acceptedQty: 2, cellBlockId: c41.id }), 201);
     await run((c) => c.query(
       `UPDATE work_sessions SET status = 'paused', paused_at = now() - interval '5 minutes', pause_reason = 'вышел из приёмки',
@@ -261,6 +262,7 @@ const { withTenantContext } = require('../src/db/pool');
     });
     // Тот же случай, но первым обратились к самой работе.
     const stuck2 = await invoice('ПР-270926-5', [['MC-2', 1]]);
+    must(await api('POST', `/api/receiving/session/${stuck2.id}/start`, dima, {}), 201);
     must(await post(dima, { invoiceItemId: stuck2.item('MC-2').id, acceptedQty: 1, cellBlockId: c31.id }), 201);
     await run((c) => c.query(
       `INSERT INTO work_sessions (warehouse_id, kind, invoice_id, worker_key_id, worker_name, status, paused_at, pause_reason)

@@ -39,6 +39,8 @@ const { loadStock } = require('../src/sellers/stock');
     for(const c of [company,foreignCompany]) {
       await run(q=>q.query(`INSERT INTO products(warehouse_id,company_id,sku,name) VALUES($1,$2,'TEST-SKU','Test stock')`,[warehouseId,c.id]));
       const inv=await must('POST','/api/invoices',owner.token,{companyId:c.id,number:`RECEIPT-${c.id}`,items:[{sku:'TEST-SKU',name:'Test stock',declaredQty:20}]},201);
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.id}/start`, worker.token, {});
       await must('POST','/api/receiving',worker.token,{invoiceItemId:inv.items[0].id,acceptedQty:20,cellBlockId:cell},201);
     }
     const orders=[];

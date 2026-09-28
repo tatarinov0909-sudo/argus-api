@@ -108,6 +108,8 @@ async function api(method, path, { token, body } = {}) {
         },
       });
       assert.equal(inv.status, 201, `inbound invoice: ${JSON.stringify(inv.body)}`);
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
       const rec = await api('POST', '/api/receiving', {
         token: workerToken,
         body: { invoiceItemId: inv.body.items[0].id, acceptedQty: qty, cellBlockId },

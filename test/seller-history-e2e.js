@@ -38,8 +38,12 @@ const { withTenantContext, pool } = require('../src/db/pool');
     }
     await api('POST','/api/products',owner,{companyId:alpha.id,sku:'SharedCase',name:'History test item'},201);
     const incoming=await invoice(alpha.id,'HISTORY-IN','in',100);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${incoming.id}/start`, worker, {}, 201);
     await api('POST','/api/receiving',worker,{invoiceItemId:incoming.items[0].id,acceptedQty:100,cellBlockId:blocks[0].id},201);
     const foreign=await invoice(beta.id,'FOREIGN-IN','in',12);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${foreign.id}/start`, worker, {}, 201);
     await api('POST','/api/receiving',worker,{invoiceItemId:foreign.items[0].id,acceptedQty:12,cellBlockId:blocks[2].id},201);
     const standalone=await invoice(alpha.id,'HISTORY-OUT','out',3);
     await api('POST','/api/shipping',worker,{invoiceItemId:standalone.items[0].id,pickedQty:3,cellBlockId:blocks[0].id},201);

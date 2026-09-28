@@ -44,6 +44,8 @@ function check(name, fn) {
     // ---------- б) дата акта приёмки ----------
     const inv = await ok('POST', '/api/invoices', w.token, { companyId: seller, number: 'ATK-IN-1', direction: 'in',
       items: [{ name: 'Товар синтетический', sku: 'AC-1', declaredQty: 2 }, { name: 'Товар синтетический 2', sku: 'AC-2', declaredQty: 2 }] });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await ok('POST', `/api/receiving/session/${inv.id}/start`, worker, {});
     for (const it of inv.items) {
       await ok('POST', '/api/receiving', worker, { invoiceItemId: it.id, acceptedQty: 2, cellBlockId: blocks[1].id });
     }

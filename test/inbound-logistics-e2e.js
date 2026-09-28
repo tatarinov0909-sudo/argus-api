@@ -153,6 +153,8 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const inv = await api('GET', `/api/invoices/${one.id}`, worker);
     // Принято 5, в ячейку легло 3 — у продавца «не размещено 2», приход ещё
     // не принят; «положить ещё 2» — принят (задание 28.09.2026).
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await call('POST', `/api/receiving/session/${inv.id}/start`, worker, {});
     await api('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 5,
       placements: [{ cellBlockId: cell, qty: 3 }] }, 201);
     card = await api('GET', `/api/inbound/${one.id}`, sa);
@@ -174,6 +176,8 @@ const { pool, withTenantContext } = require('../src/db/pool');
     // 9. Приёмка без отметки у ворот сама ставит «машина приехала».
     const two = (await api('POST', '/api/sellers/inbound', sa, { grid, apply: true })).invoice;
     const inv2 = await api('GET', `/api/invoices/${two.id}`, worker);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await call('POST', `/api/receiving/session/${inv2.id}/start`, worker, {});
     await api('POST', '/api/receiving', worker, { invoiceItemId: inv2.items[0].id, acceptedQty: 10, cellBlockId: cell }, 201);
     card = await api('GET', `/api/inbound/${two.id}`, sa);
     assert.ok(card.arrivedAt); assert.equal(card.unplaced, 0);

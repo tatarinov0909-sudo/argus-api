@@ -51,7 +51,11 @@ const { withTenantContext } = require('../src/db/pool');
     // На полках: батончик 10, паста 10.
     const receipt = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-1',
       items: [{ sku: 'PB-1', name: 'Батончик', declaredQty: 10 }, { sku: 'PB-2', name: 'Паста', declaredQty: 10 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, dima, {});
     must(await api('POST', '/api/receiving', dima, { invoiceItemId: receipt.items[0].id, acceptedQty: 10, cellBlockId: cells[0].id }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, dima, {});
     must(await api('POST', '/api/receiving', dima, { invoiceItemId: receipt.items[1].id, acceptedQty: 10, cellBlockId: cells[1].id }), 201);
 
     let orderNo = 0;
@@ -348,8 +352,14 @@ const { withTenantContext } = require('../src/db/pool');
     const shopIn = must(await api('POST', '/api/invoices', owner, { companyId: shop, number: 'IN-S',
       items: [{ sku: 'ST-1', name: 'Один на три', declaredQty: 1 }, { sku: 'ST-5', name: 'Хватает', declaredQty: 5 },
         { sku: 'ST-R', name: 'Обещан поставке', declaredQty: 5 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${shopIn.id}/start`, dima, {});
     must(await api('POST', '/api/receiving', dima, { invoiceItemId: shopIn.items[0].id, acceptedQty: 1, cellBlockId: cells[2].id }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${shopIn.id}/start`, dima, {});
     must(await api('POST', '/api/receiving', dima, { invoiceItemId: shopIn.items[1].id, acceptedQty: 5, cellBlockId: cells[2].id }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${shopIn.id}/start`, dima, {});
     must(await api('POST', '/api/receiving', dima, { invoiceItemId: shopIn.items[2].id, acceptedQty: 5, cellBlockId: cells[3].id }), 201);
     const reservedOrder = await wbOrder([['ST-R', 'Обещан поставке', 5]], shop);
     await supplyOf([reservedOrder]);

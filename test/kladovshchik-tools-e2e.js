@@ -91,6 +91,8 @@ function warehouseIdOf(token) {
         items: [{ name: 'Лимонад Лайм', sku: 'PB-LIME', declaredQty: 10 }],
       },
     });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inb.body.id}/start`, { token: workerToken });
     await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: inb.body.items[0].id, acceptedQty: 8, cellBlockId: blocks[0].id },

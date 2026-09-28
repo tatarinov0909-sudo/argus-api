@@ -29,6 +29,10 @@ function categoryOf(e) {
   const type = e.entity_type;
   if (e.agent === 'Обмен с 1С') return 'onec';
   if (e.agent === 'Обмен с WB' || e.agent === 'Сверка заказов WB') return type === 'supply' ? 'wb' : 'orders';
+  // Сам приход (машина приехала, документы, переписка) — «Приходы», кто бы
+  // ни нажал: «машину» у ворот отмечает и грузчик (проверка 28.09.2026).
+  const inbound = (e.invoice_direction || e.entity_direction) === 'in';
+  if ((type === 'invoice' || type === 'invoice_comment') && inbound) return 'inbound';
   // Всё, что входит в работу грузчика (приход, поставка, возврат, заказ), —
   // одной категорией с самой работой: в ленте это одна строка.
   if (e.work_key || WORK_TYPES.has(type)) return 'labor';

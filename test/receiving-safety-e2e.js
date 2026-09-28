@@ -72,6 +72,8 @@ const check = (name, fn) => {
       items: [{ sku: 'RC-1', name: 'Товар приёмки', declaredQty: 10 }],
     }), 201);
     const body = { invoiceItemId: receipt.items[0].id, acceptedQty: 10, cellBlockId: cell };
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker.token, {});
     const [first, second] = await Promise.all([
       api('POST', '/api/receiving', worker.token, body),
       api('POST', '/api/receiving', worker.token, body),

@@ -40,6 +40,8 @@ const { reconcile } = require('../src/marketplaces/statuses');
     await run((q) => q.query(`INSERT INTO products(warehouse_id,company_id,sku,name) VALUES($1,$2,'CH-1','Chain item')`, [warehouseId, company.id]));
     const receipt = await must('POST', '/api/invoices', owner.token, { companyId: company.id, number: 'CH-IN',
       items: [{ sku: 'CH-1', name: 'Chain item', declaredQty: 50 }] }, 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker.token, {});
     await must('POST', '/api/receiving', worker.token, { invoiceItemId: receipt.items[0].id, acceptedQty: 50, cellBlockId: cell }, 201);
 
     // 1. Orders arrive from WB: four new, one someone already confirmed in the WB cabinet.

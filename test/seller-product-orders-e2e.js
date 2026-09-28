@@ -44,7 +44,11 @@ const { withTenantContext } = require('../src/db/pool');
     const seller = must(await api('POST', '/api/auth/seller/login', null, { keyCode: key.key_code, name: 'Продавец' })).token;
     const inbound = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-1',
       items: [{ sku: 'P-1', name: 'Батончик', declaredQty: 40 }, { sku: 'P-2', name: 'Паста', declaredQty: 5 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inbound.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: inbound.items[0].id, acceptedQty: 40, cellBlockId: cell }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inbound.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: inbound.items[1].id, acceptedQty: 5, cellBlockId: cell }), 201);
 
     let n = 0;

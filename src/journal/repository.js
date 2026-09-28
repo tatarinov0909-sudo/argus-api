@@ -74,6 +74,8 @@ async function listEntries(client, warehouseId, {
             -- самого захода), «in:…» — приёмка прихода, «return:…»/«out:…» —
             -- возврат и заказ без поставки.
             CASE WHEN COALESCE(o.actor_type, je.actor_type) <> 'worker' THEN NULL
+                 -- «Машина приехала» — событие прихода, а не шаг приёмки.
+                 WHEN COALESCE(o.entity_type, je.entity_type) IN ('invoice', 'invoice_comment') AND wi.direction = 'in' THEN NULL
                  WHEN COALESCE(wsup.id, wi.supply_id) IS NOT NULL THEN 'supply:' || COALESCE(wsup.id, wi.supply_id)
                  WHEN wi.id IS NOT NULL THEN wi.direction || ':' || wi.id END AS work_key
      FROM journal_entries je

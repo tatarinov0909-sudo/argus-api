@@ -101,6 +101,8 @@ async function expectFails(run) {
           items: [{ name, sku, declaredQty: qty }],
         },
       });
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
       const res = bucket
         ? await api('POST', '/api/returns', {
           token: workerToken,

@@ -83,6 +83,9 @@ async function moveStock(client, warehouseId, {
 // приёмки («Переложить», «Убрать из ячейки», receiving/routes.js).
 async function takeFromCell(client, warehouseId, {
   cellBlockId, sku, companyId = null, quality = 'good', qty, verb = 'забрать',
+  // newest — снимать с самых свежих строк (раскладка приёмки забирает то, что
+  // сама положила); по умолчанию — с самой давней.
+  newest = false,
 }) {
   // Блокируем строки источника: два работника, переставляющие один и тот же
   // товар одновременно, не должны оба пройти проверку остатка.
@@ -91,7 +94,7 @@ async function takeFromCell(client, warehouseId, {
      WHERE cell_block_id = $1 AND warehouse_id = $2 AND sku = $3 AND quality = $4
        AND ($5::uuid IS NULL OR company_id = $5::uuid)
        AND qty > 0
-     ORDER BY updated_at
+     ORDER BY ${newest ? 'placed_at DESC, updated_at DESC' : 'updated_at'}
      FOR UPDATE`,
     [cellBlockId, warehouseId, sku, quality, companyId || null],
   );

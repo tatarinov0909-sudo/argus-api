@@ -41,6 +41,8 @@ function cellFields(obj, path = '') {
     // Приход продавца принят в ячейку; у грузчика была пауза «обед».
     const inv = await ok('POST', '/api/invoices', w.token, { companyId: company, number: 'ПР-IC1', direction: 'in',
       items: [{ sku: 'IC-1', name: 'Товар ячейки', declaredQty: 5 }] });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await ok('POST', `/api/receiving/session/${inv.id}/start`, worker, {});
     await ok('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 5, cellBlockId: cells[4].id,
       pausedMs: 900000, pauseReasons: [{ reason: 'обед', ms: 900000 }] });
     // Заказ (1С) собран из ячейки.

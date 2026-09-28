@@ -195,6 +195,7 @@ const { withTenantContext } = require('../src/db/pool');
     // ---------- Ноль — без ячейки можно ----------
     const inv2 = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'ПР-ШАГ-2',
       items: [{ sku: 'ST-2', name: 'Пастила', declaredQty: 5 }] }), 201);
+    must(await api('POST', `/api/receiving/session/${inv2.id}/start`, jonik, {}), 201);
     const zero = must(await api('POST', '/api/receiving', jonik, { invoiceItemId: inv2.items[0].id, acceptedQty: 0 }), 201);
     check('«не приехало» (0) — без ячейки, приход принят', () => {
       assert.equal(zero.unplaced, 0);

@@ -114,6 +114,8 @@ const whIdOf = (token) => JSON.parse(
         items: [{ name: 'Лимонад', sku: 'PB-AL', declaredQty: 10 }],
       },
     });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inb.body.id}/start`, { token: workerToken });
     await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: inb.body.items[0].id, acceptedQty: 7, cellBlockId: blocks[0].id },
@@ -217,6 +219,8 @@ const whIdOf = (token) => JSON.parse(
           items: [{ name: 'Заполнитель', sku: `FILL-${i}`, declaredQty: 1 }],
         },
       });
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
       await api('POST', '/api/receiving', {
         token: workerToken,
         body: { invoiceItemId: inv.body.items[0].id, acceptedQty: 1, cellBlockId: blocks[i].id },

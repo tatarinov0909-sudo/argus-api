@@ -24,6 +24,8 @@ function check(name, fn) {
       VALUES ($1, $2, 'AR-1', 'Товар архив', '4600000000925', 10, now())`, [w.warehouseId, company]));
     const inv = await ok('POST', '/api/invoices', w.token, { companyId: company, number: 'ПР-AR1', direction: 'in',
       items: [{ sku: 'AR-1', name: 'Товар архив', declaredQty: 10 }] });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await ok('POST', `/api/receiving/session/${inv.id}/start`, worker, {});
     await ok('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 10, cellBlockId: cells[0].id });
 
     // Заказ 1С (реализация) — без поставки. Собран целиком: 6 шт. сняты с полки.

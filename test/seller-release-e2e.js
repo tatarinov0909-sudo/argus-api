@@ -42,6 +42,8 @@ const { pool, withTenantContext } = require('../src/db/pool');
     }
     for (const [company, qty, cell] of [[a,100,cells[0]],[b,55,cells[1]]]) {
       const inv = await invoice(company,'in',qty);
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.id}/start`, worker, {}, 201);
       await api('POST', '/api/receiving', worker, {invoiceItemId:inv.items[0].id,acceptedQty:qty,cellBlockId:cell.id},201);
     }
     const warehouseId = JSON.parse(Buffer.from(token.split('.')[1], 'base64url')).warehouseId;

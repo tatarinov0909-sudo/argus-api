@@ -309,6 +309,8 @@ async function api(method, path, { token, body } = {}) {
         items: [{ name: 'Blue Widget', sku: 'SKU-A1', declaredQty: 20 }],
       },
     });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inbound.body.id}/start`, { token: workerToken });
     await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: inbound.body.items[0].id, acceptedQty: 20, cellBlockId: cell.id },
@@ -339,6 +341,8 @@ async function api(method, path, { token, body } = {}) {
         items: [{ name: 'Ghost', sku: 'SKU-NOCARD', declaredQty: 3 }],
       },
     });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${orphanIn.body.id}/start`, { token: workerToken });
     await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: orphanIn.body.items[0].id, acceptedQty: 3, cellBlockId: cell.id },

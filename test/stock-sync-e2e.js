@@ -135,6 +135,8 @@ const whIdOf = (token) => JSON.parse(
         items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 480 }],
       },
     });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
     await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: inv.body.items[0].id, acceptedQty: 480, cellBlockId: blocks[0].id },

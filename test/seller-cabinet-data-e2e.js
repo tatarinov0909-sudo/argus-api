@@ -50,6 +50,8 @@ const { withTenantContext } = require('../src/db/pool');
       carrier: '  ТК «Байкал»  ', vehicle: 'А123ВС 77', comment: 'Два короба',
     })).invoice;
     const doc = must(await api('GET', `/api/invoices/${inbound.id}`, owner));
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${doc.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: doc.items[0].id, acceptedQty: 11, cellBlockId: cells[0].id }), 201);
     // Возврат: 2 годных, 1 брак с описанием.
     const ret = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'ВЗ-1', direction: 'return',

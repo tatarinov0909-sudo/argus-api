@@ -78,6 +78,8 @@ async function api(method, path, { token, body } = {}) {
         token: ownerToken,
         body: { companyId, number: num, direction: 'in', items: [{ name: 'Товар ' + sku, sku, declaredQty: qty }] },
       });
+      // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+      await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
       const rec = await api('POST', '/api/receiving', {
         token: workerToken,
         body: { invoiceItemId: inv.body.items[0].id, acceptedQty: qty, cellBlockId: cellId },
@@ -164,6 +166,8 @@ async function api(method, path, { token, body } = {}) {
     // Работник кладёт НЕ туда, куда советовали, — это и есть тот факт, ради
     // которого всё писалось.
     const otherCell = rowOf(1)[2];
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
     const rec = await api('POST', '/api/receiving', {
       token: workerToken,
       body: {
@@ -198,6 +202,8 @@ async function api(method, path, { token, body } = {}) {
       assert.ok(Array.isArray(row.options) && row.options.length > 0, 'не сохранился список предложенного');
     });
 
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${inv.body.id}/start`, { token: workerToken });
     const noRef = await api('POST', '/api/receiving', {
       token: workerToken,
       body: { invoiceItemId: inv.body.items[0].id, acceptedQty: 1, cellBlockId: otherCell.id },

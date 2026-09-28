@@ -57,6 +57,8 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     const receipt = await must('POST', '/api/invoices', owner.token, {
       companyId: company.id, number: 'WW-IN', items: [{ sku: 'WW-1', name: 'Товар записи', declaredQty: 30 }],
     }, 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker.token, {});
     await must('POST', '/api/receiving', worker.token,
       { invoiceItemId: receipt.items[0].id, acceptedQty: 30, cellBlockId: cell }, 201);
 

@@ -32,6 +32,8 @@ function check(name, fn) {
       VALUES ($1, $2, 'TR-1', 'Товар транзит', '4600000000901', 20, now())`, [w.warehouseId, company]));
     const inv = await ok('POST', '/api/invoices', w.token, { companyId: company, number: 'ПР-T1', direction: 'in',
       items: [{ sku: 'TR-1', name: 'Товар транзит', declaredQty: 10 }] });
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await ok('POST', `/api/receiving/session/${inv.id}/start`, worker, {});
     await ok('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 10, cellBlockId: cells[0].id });
 
     const order = await ok('POST', '/api/invoices', w.token, { companyId: company, number: 'WB-900001', direction: 'out',

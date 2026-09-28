@@ -78,6 +78,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
 
     const record = await withTenantContext({ warehouseId }, (client) => receiveItem(client, {
       warehouseId, staffKeyId, invoiceItemId, accepted, placements: plan, pausedMs, pauseReasons, suggestionId,
+      requireWork: true,
     }));
     res.status(201).json(record);
   } catch (err) {
@@ -217,6 +218,10 @@ async function finishReceiving(client, warehouseId, staffKeyId, invoiceId, { com
 async function receiveItem(client, {
   warehouseId, staffKeyId, invoiceItemId, accepted, placements = [], pausedMs = 0, pauseReasons = [],
   suggestionId = null, closeWork = true,
+  // Приход принимает только тот, кто ведёт приёмку, и не на паузе
+  // (requireActive). «Закончить приёмку» уже проверила заход сама — ей можно
+  // и с паузы.
+  requireWork = false,
 }) {
   // Приход — на запись первым, строка — вторым: тот же порядок, что у
   // «Закончить приёмку» и у хода приёмки (receiving/session.js). Иначе две
@@ -264,6 +269,10 @@ async function receiveItem(client, {
     [invoiceItemId],
   );
   if (existing.rows[0]) throw new HttpError(409, 'Эта позиция уже принята');
+  // После «уже принята»: по этому ответу экран грузчика идёт к следующей.
+  if (requireWork && item.direction === 'in') {
+    await work.requireActive(client, warehouseId, staffKeyId, { id: item.invoice_id, number: item.invoice_number });
+  }
 
   // Все ячейки — этого склада; адреса — для записи в журнал.
   const cells = new Map();
@@ -438,7 +447,10 @@ async function putStep(client, { warehouseId, staffKeyId, recordId, item, cellBl
 // с самой давней), укладка пишется с минусом. Позже шаг подтвердят сканом
 // QR ячейки.
 async function takeStep(client, { warehouseId, staffKeyId, recordId, item, cellBlockId, qty }) {
-  await takeFromCell(client, warehouseId, { cellBlockId, sku: item.sku, companyId: item.company_id, qty, verb: 'забрать' });
+  // С полки снимается самое свежее этого товара — то, что положила эта
+  // приёмка, а не весенний остаток: иначе весенний товар «молодел» бы, а его
+  // время укладки и порядок «сначала старое» врали.
+  await takeFromCell(client, warehouseId, { cellBlockId, sku: item.sku, companyId: item.company_id, qty, verb: 'забрать', newest: true });
   const row = (await client.query(
     `INSERT INTO receiving_placements
        (receiving_record_id, invoice_item_id, warehouse_id, company_id, cell_block_id, sku, qty, step, placed_by, kind)
@@ -489,7 +501,11 @@ async function syncRecordCell(client, recordId) {
 // Только пока приход не принят: после — через «Перепаковка и перестановка»,
 // чтобы закрытый акт не менялся задним числом.
 
-async function lockPlacing(client, warehouseId, invoiceItemId) {
+// action 'place' на уже принятом приходе — только для старого «своего места»
+// (принято без ячейки до 28.09.2026): его разложить можно и после приёмки —
+// акт от этого не меняется, а иначе товар навсегда «не размещён». Такой
+// приход не переоткрывается, заход для этого не нужен.
+async function lockPlacing(client, warehouseId, invoiceItemId, { staffKeyId, action }) {
   if (!UUID.test(String(invoiceItemId || ''))) throw new HttpError(404, 'Позиция накладной не найдена');
   // Приход — на запись первым, строка — вторым: тот же порядок, что у приёмки.
   const invoice = (await client.query(
@@ -507,10 +523,13 @@ async function lockPlacing(client, warehouseId, invoiceItemId) {
     [invoiceItemId],
   )).rows[0];
   if (!item.record_id) throw new HttpError(409, 'Сначала примите товар: сколько пришло и первая ячейка');
-  if (invoice.status === 'completed') {
+  const unplaced = Number(item.accepted_qty) - Number(item.placed);
+  const legacy = invoice.status === 'completed' && action === 'place' && unplaced > 0;
+  if (invoice.status === 'completed' && !legacy) {
     throw new HttpError(409, `Приход «${invoice.number}» уже принят — переложить товар можно через «Перепаковка и перестановка»`);
   }
-  return { invoice, item, unplaced: Number(item.accepted_qty) - Number(item.placed) };
+  if (!legacy) await work.requireActive(client, warehouseId, staffKeyId, invoice);
+  return { invoice, item, unplaced, legacy };
 }
 
 async function cellLabelOf(client, warehouseId, cellBlockId) {
@@ -534,7 +553,7 @@ async function inCell(client, recordId, cellBlockId) {
 
 // Шаг сделан: ячейка записи приёмки, запись журнала, статус прихода (всё
 // разложено — принят, заход закрыт) и раскладка позиции для экрана.
-async function placingDone(client, { warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId }) {
+async function placingDone(client, { warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId, legacy = false }) {
   await syncRecordCell(client, item.record_id);
   await journal.createEntry(client, {
     warehouseId,
@@ -547,7 +566,8 @@ async function placingDone(client, { warehouseId, staffKeyId, invoice, item, jou
     actorType: 'worker',
     actorId: staffKeyId,
   });
-  const { status, finished } = await settleInvoice(client, {
+  // Старое «своё место» принятого прихода — приход остаётся принятым.
+  const { status, finished } = legacy ? { status: invoice.status, finished: null } : await settleInvoice(client, {
     warehouseId, staffKeyId, invoiceId: invoice.id, number: invoice.number, direction: invoice.direction,
   });
   const placed = await client.query(
@@ -570,7 +590,7 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
     const body = req.body || {};
     const qty = requireQty(body.qty, 'Сколько кладёте в ячейку', { min: 1 });
     const out = await withTenantContext({ warehouseId }, async (client) => {
-      const { invoice, item, unplaced } = await lockPlacing(client, warehouseId, req.params.invoiceItemId);
+      const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'place' });
       if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено');
       if (qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — больше положить нельзя`);
       const label = await cellLabelOf(client, warehouseId, body.cellBlockId);
@@ -579,7 +599,7 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
       });
       const left = unplaced - qty;
       return placingDone(client, {
-        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId: body.cellBlockId,
+        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId: body.cellBlockId, legacy,
         journalText: `Положил ${qty} шт. ${what(item)} в ячейку ${label}. `
           + (left ? `Осталось разложить ${left} шт.` : `Разложено всё принятое — ${Number(item.accepted_qty)} шт.`),
       });
@@ -596,9 +616,12 @@ router.post('/items/:invoiceItemId/move', requireAuth, requireRole('worker'), as
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
     const qty = requireQty(body.qty, 'Сколько перекладываете', { min: 1 });
-    if (body.fromCellBlockId === body.toCellBlockId) throw new HttpError(400, 'Это та же ячейка — выберите другую');
+    // Та же ячейка — и когда тот же номер прислали заглавными буквами.
+    if (String(body.fromCellBlockId || '').toLowerCase() === String(body.toCellBlockId || '').toLowerCase()) {
+      throw new HttpError(400, 'Это та же ячейка — выберите другую');
+    }
     const out = await withTenantContext({ warehouseId }, async (client) => {
-      const { invoice, item } = await lockPlacing(client, warehouseId, req.params.invoiceItemId);
+      const { invoice, item } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'move' });
       const from = await cellLabelOf(client, warehouseId, body.fromCellBlockId);
       const to = await cellLabelOf(client, warehouseId, body.toCellBlockId);
       const here = await inCell(client, item.record_id, body.fromCellBlockId);
@@ -628,7 +651,7 @@ router.post('/items/:invoiceItemId/remove', requireAuth, requireRole('worker'), 
     const body = req.body || {};
     const qty = requireQty(body.qty, 'Сколько убираете из ячейки', { min: 1 });
     const out = await withTenantContext({ warehouseId }, async (client) => {
-      const { invoice, item, unplaced } = await lockPlacing(client, warehouseId, req.params.invoiceItemId);
+      const { invoice, item, unplaced } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'remove' });
       const label = await cellLabelOf(client, warehouseId, body.cellBlockId);
       const here = await inCell(client, item.record_id, body.cellBlockId);
       if (here <= 0) throw new HttpError(409, `В ячейке ${label} этого товара из этой приёмки нет`);

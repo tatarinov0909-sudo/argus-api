@@ -468,6 +468,13 @@ router.post('/blocks/merge-rect', requireAuth, requireGrant('warehouse'), async 
          WHERE cell_block_id = ANY($2::uuid[])`,
         [keeper.id, absorbedIds],
       );
+      // Куда разложена приёмка — туда же: иначе у укладок поглощённых ячеек
+      // адрес обнулился бы, и в карточке прихода товар стал бы «без ячейки»,
+      // а «Убрать из ячейки» — невозможным (проверка 28.09.2026).
+      await client.query(
+        'UPDATE receiving_placements SET cell_block_id = $1 WHERE cell_block_id = ANY($2::uuid[])', [keeper.id, absorbedIds]);
+      await client.query(
+        'UPDATE receiving_records SET cell_block_id = $1 WHERE cell_block_id = ANY($2::uuid[])', [keeper.id, absorbedIds]);
       await client.query(`DELETE FROM cell_blocks WHERE id = ANY($1::uuid[])`, [absorbedIds]);
 
       const updated = await client.query(

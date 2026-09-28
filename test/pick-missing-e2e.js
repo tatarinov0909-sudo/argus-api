@@ -45,6 +45,8 @@ const { withTenantContext } = require('../src/db/pool');
     // Товар на полке: 3 шт.
     const receipt = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-1',
       items: [{ sku: 'PB-1', name: 'Батончик', declaredQty: 3 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt.items[0].id, acceptedQty: 3, cellBlockId: cell }), 201);
 
     // Заказ WB на 5 шт. в поставке.
@@ -140,6 +142,8 @@ const { withTenantContext } = require('../src/db/pool');
     const cell2 = must(await api('GET', '/api/cells/rows', owner)).flatMap((r) => r.blocks)[1].id;
     const receipt2 = must(await api('POST', '/api/invoices', owner, { companyId: company, number: 'IN-2',
       items: [{ sku: 'PB-2', name: 'Вафли', declaredQty: 1 }] }), 201);
+    // «Начать приёмку» — без захода сервер приход не принимает (28.09.2026).
+    await api('POST', `/api/receiving/session/${receipt2.id}/start`, worker, {});
     must(await api('POST', '/api/receiving', worker, { invoiceItemId: receipt2.items[0].id, acceptedQty: 1, cellBlockId: cell2 }), 201);
     const wbOrder = async (n, sku, name) => {
       const o = must(await api('POST', '/api/invoices', owner, { companyId: company, number: `WB-${n}`, direction: 'out',
