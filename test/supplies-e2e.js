@@ -283,6 +283,8 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
     });
 
     // Количество отбора — целое, больше нуля и не больше, чем осталось по заказу.
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await api('POST', `/api/shipping/assembly/${supplyId}/start`, { token: workerToken });
     const o3Item = (await api('GET', `/api/invoices/${o3}`, { token: ownerToken })).body.items[0];
     const badQty = [];
     for (const pickedQty of ['NaN', 1.5, 0, 6]) {

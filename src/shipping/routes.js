@@ -150,7 +150,7 @@ router.post('/missing', requireAuth, requireRole('worker'), async (req, res, nex
     if (!invoiceItemId) throw new HttpError(400, 'Нужна позиция заказа');
     const qty = requireQty(missingQty, 'Сколько не хватает', { min: 1 });
     const out = await withTenantContext({ warehouseId }, (client) => markMissing(
-      client, warehouseId, staffKeyId, { invoiceItemId, qty, note },
+      client, warehouseId, staffKeyId, { invoiceItemId, qty, note, requireWork: true },
     ));
     res.status(out.repeated ? 200 : 201).json(out);
   } catch (err) {
@@ -160,7 +160,7 @@ router.post('/missing', requireAuth, requireRole('worker'), async (req, res, nex
 
 // Отметка «нет товара» по одной позиции заказа: уходит «очень важно»
 // руководителю. Общая для кнопки на сборке и для сборки по бумажному листу.
-async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty, note, how = 'при сборке' }) {
+async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty, note, how = 'при сборке', requireWork = false }) {
   const comment = typeof note === 'string' ? note.trim().replace(/\s+/g, ' ').slice(0, 300) : '';
   const pre = await client.query(
     'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
@@ -168,7 +168,8 @@ async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty
   );
   if (!pre.rows[0]) throw new HttpError(404, 'Позиция заказа не найдена');
   // Тот же порядок блокировок, что у отбора: поставка, потом заказ.
-  await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
+  const supplyId = await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
+  if (requireWork) await requireAssembly(client, warehouseId, staffKeyId, supplyId);
   const itemResult = await client.query(
     `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.invoice_id,
             i.number AS invoice_number, i.direction, i.status, i.mp_closed_at, s.number AS supply_number
@@ -232,7 +233,7 @@ async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty
 // Общая для отбора по заказу и по товару — правила (что можно, откуда
 // списать, журнал, 1С, статусы заказа и поставки) не должны разойтись.
 async function recordPick(client, warehouseId, staffKeyId, {
-  invoiceItemId, qty, cellBlockId, isFinal = true, pausedMs, pauseReasons,
+  invoiceItemId, qty, cellBlockId, isFinal = true, pausedMs, pauseReasons, requireWork = false,
 }) {
   const pre = await client.query(
     'SELECT invoice_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
@@ -240,6 +241,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   );
   if (!pre.rows[0]) throw new HttpError(404, 'Позиция накладной не найдена');
   const supplyId = await lockSupplyOfInvoice(client, warehouseId, pre.rows[0].invoice_id);
+  if (requireWork) await requireAssembly(client, warehouseId, staffKeyId, supplyId);
   const itemResult = await client.query(
     `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
             ii.external_id,
@@ -428,7 +430,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     // записывались в остаток ячейки как есть.
     const qty = requireQty(pickedQty, 'Количество', { min: 1 });
     const record = await withTenantContext({ warehouseId }, (client) => recordPick(
-      client, warehouseId, staffKeyId, { invoiceItemId, qty, cellBlockId, isFinal, pausedMs, pauseReasons },
+      client, warehouseId, staffKeyId, { invoiceItemId, qty, cellBlockId, isFinal, pausedMs, pauseReasons, requireWork: true },
     ));
     res.status(201).json(record);
   } catch (err) {
@@ -449,9 +451,11 @@ router.post('/product', requireAuth, requireRole('worker'), async (req, res, nex
       throw new HttpError(400, 'Нужны поставка, товар, ячейка и количество');
     }
     const qty = requireQty(pickedQty, 'Количество', { min: 1 });
-    const out = await withTenantContext({ warehouseId }, (client) => pickProduct(
-      client, warehouseId, staffKeyId, { supplyId, sku, cellBlockId, qty, pausedMs, pauseReasons },
-    ));
+    const out = await withTenantContext({ warehouseId }, async (client) => {
+      const s = await assembly.lockSupply(client, warehouseId, supplyId);
+      await requireAssembly(client, warehouseId, staffKeyId, s.id);
+      return pickProduct(client, warehouseId, staffKeyId, { supplyId, sku, cellBlockId, qty, pausedMs, pauseReasons });
+    });
     res.status(201).json(out);
   } catch (err) {
     next(err);
@@ -522,6 +526,16 @@ async function paperSupply(client, warehouseId, supplyId) {
 
 const workerName = async (client, staffKeyId) =>
   (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0]?.name || 'Грузчик';
+
+// Заказ поставки собирает только тот, кто ведёт сборку, и не на паузе
+// (владелец 29.09.2026: «защита точно нужна» — как у приёмки). Раньше это
+// держал только экран. Заказы без поставки (отгрузки 1С) захода не имеют.
+// Поставка уже взята на запись вызывающим.
+async function requireAssembly(client, warehouseId, staffKeyId, supplyId) {
+  if (!supplyId) return;
+  const s = (await client.query('SELECT id, number FROM supplies WHERE id = $1 AND warehouse_id = $2', [supplyId, warehouseId])).rows[0];
+  if (s) await assembly.requireActive(client, warehouseId, staffKeyId, s);
+}
 
 // Начало сборки по листу — только от скана QR или «Начать» в окне с таймером
 // (владелец 27.09.2026), а не от открытия листа: экран зовёт сюда только
@@ -679,6 +693,13 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
     const note = assembly.cleanComment(body.comment);
     const out = await withTenantContext({ warehouseId }, async (client) => {
       const s = await paperSupply(client, warehouseId, body.supplyId);
+      // «Собрал по листу» — конец своей сборки (можно и с паузы), не чужой и
+      // не без скана QR / «Начать».
+      if (!(await assembly.liveOf(client, warehouseId, s.id, staffKeyId))) {
+        const cur = await assembly.latest(client, warehouseId, s.id);
+        throw new HttpError(409, cur && ['active', 'paused'].includes(cur.status)
+          ? assembly.notMine(s) : `Сборка поставки «${s.number}» не начата — отсканируйте QR на листе или нажмите «Начать»`);
+      }
       const bySku = new Map();
       for (const l of await openSupplyLines(client, warehouseId, s.id)) {
         const it = bySku.get(l.sku) || { sku: l.sku, name: l.name, need: 0 };

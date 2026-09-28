@@ -157,6 +157,8 @@ function check(name, fn) {
 
     // ---------- Менеджер отдал поставку складу: «в сборке» ----------
     const supply = await must('POST', '/api/supplies', { token: ownerToken, body: { invoiceIds: [order.id] } });
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await must('POST', `/api/shipping/assembly/${supply.id}/start`, { token: workerToken, body: {} });
     const inSupply = await sellerStock();
     check('поставка передана на склад — то же количество стало «в сборке»', () => {
       const a = rowOf(inSupply, 'PB-A');

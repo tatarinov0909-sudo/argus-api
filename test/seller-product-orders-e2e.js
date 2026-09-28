@@ -62,8 +62,12 @@ const { withTenantContext } = require('../src/db/pool');
       }
       return o;
     }
-    const supplyOf = async (orders) => must(await api('POST', '/api/supplies', owner,
-      { invoiceIds: orders.map((o) => o.id), marketplace: 'wb' }), 201);
+    const supplyOf = async (orders) => {
+      const s = must(await api('POST', '/api/supplies', owner, { invoiceIds: orders.map((o) => o.id), marketplace: 'wb' }), 201);
+      // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+      must(await api('POST', `/api/shipping/assembly/${s.id}/start`, worker, {}), 201);
+      return s;
+    };
     const pickAll = async (supply, qty) => must(await api('POST', '/api/shipping/product', worker,
       { supplyId: supply.id, sku: 'P-1', cellBlockId: cell, pickedQty: qty }), 201);
 

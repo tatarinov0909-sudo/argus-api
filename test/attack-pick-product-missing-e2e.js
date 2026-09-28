@@ -37,6 +37,8 @@ function check(name, fn) {
     await w.run((c) => c.query(`UPDATE invoices SET source = 'wb' WHERE warehouse_id = $1`, [w.warehouseId]));
     await w.run((c) => c.query(`UPDATE invoice_items SET mp_rid = 'rid-' || id::text WHERE warehouse_id = $1`, [w.warehouseId]));
     const supply = await ok('POST', '/api/supplies', w.token, { invoiceIds: orders.map((o) => o.id) }, 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await ok('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {});
 
     // Грузчик в заказе WB-ATK-1 не нашёл товар и отметил «нет товара».
     const item1 = orders[0].items[0].id;

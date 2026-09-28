@@ -98,6 +98,8 @@ const TARGETS = {
       busy: (doc, cur) => `Поставку «${doc.number}» собирает ${cur.worker_name}`
         + `${cur.status === 'paused' ? ' — сборка на паузе' : ''}. Забрать сборку себе?`,
       notMine: (doc) => `Сборку поставки «${doc.number}» сейчас ведёте не вы`,
+      notStarted: (doc) => `Сборка поставки «${doc.number}» не начата — нажмите «Начать сборку»`,
+      pausedLock: (doc) => `Сборка поставки «${doc.number}» на паузе — сначала «Продолжить»`,
       settled: (name, doc, minutes, taken) => `${name} закончил сборку поставки «${doc.number}» за ${minutes} мин: ${taken}`
         + ` Поставка уже ${doc.status === 'shipped' ? 'уехала' : 'собрана'} — сборка закрыта сама.`,
     },

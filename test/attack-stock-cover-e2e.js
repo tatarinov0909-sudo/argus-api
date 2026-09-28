@@ -39,6 +39,8 @@ function check(name, fn) {
     const i2 = await mk('ATK-C-2', 'SC-2', 1);
     const i3 = await mk('ATK-C-3', 'SC-4', 5);
     const supply = await ok('POST', '/api/supplies', w.token, { invoiceIds: [i1.id, i2.id, i3.id] }, 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await ok('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {});
     await pick(i1, 3, 0);
     await pick(i3, 3, 3);
     // Накладная 1С без поставки: собрана целиком (2 из 2), ещё не уехала.

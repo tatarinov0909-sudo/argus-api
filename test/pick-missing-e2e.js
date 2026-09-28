@@ -55,6 +55,8 @@ const { withTenantContext } = require('../src/db/pool');
     await run((c) => c.query(`UPDATE invoices SET source = 'wb', external_id = '900001', mp_supplier_status = 'new' WHERE id = $1`, [order.id]));
     await run((c) => c.query(`UPDATE invoice_items SET mp_rid = 'rid-900001' WHERE invoice_id = $1`, [order.id]));
     const supply = must(await api('POST', '/api/supplies', owner, { invoiceIds: [order.id], marketplace: 'wb' }), 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    must(await api('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {}), 201);
     const itemId = order.items[0].id;
     const stockBefore = await run((c) => c.query('SELECT SUM(qty)::int AS q FROM cell_stock WHERE warehouse_id = $1', [warehouseId]));
     const outboxBefore = await run((c) => c.query('SELECT count(*)::int AS n FROM sync_outbox WHERE warehouse_id = $1', [warehouseId]));
@@ -155,6 +157,8 @@ const { withTenantContext } = require('../src/db/pool');
     const has = await wbOrder(900002, 'PB-2', 'Вафли');
     const lacks = await wbOrder(900003, 'PB-3', 'Пастила');
     const supply2 = must(await api('POST', '/api/supplies', owner, { invoiceIds: [has.id, lacks.id], marketplace: 'wb' }), 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    must(await api('POST', `/api/shipping/assembly/${supply2.id}/start`, worker, {}), 201);
     const mark2 = must(await api('POST', '/api/shipping/missing', worker, { invoiceItemId: lacks.items[0].id, missingQty: 1 }), 201);
     must(await api('POST', '/api/shipping', worker, { invoiceItemId: has.items[0].id, pickedQty: 1, cellBlockId: cell2, isFinal: true }), 201);
     const stuckShip = await api('POST', `/api/supplies/${supply2.id}/ship`, owner, {});
@@ -196,6 +200,8 @@ const { withTenantContext } = require('../src/db/pool');
     const shipped = must(await api('POST', `/api/supplies/${supply2.id}/ship`, owner, {}));
     check('поставка уехала без него', () => assert.equal(shipped.status, 'shipped'));
     const supply3 = must(await api('POST', '/api/supplies', owner, { invoiceIds: [lacks.id], marketplace: 'wb' }), 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    must(await api('POST', `/api/shipping/assembly/${supply3.id}/start`, worker, {}), 201);
     const lonely = await api('POST', `/api/supplies/orders/${lacks.id}/remove`, owner);
     check('убранный заказ встаёт в новую поставку; единственный заказ не убрать — поставку разбирают', () => {
       assert.ok(supply3.id);

@@ -77,6 +77,8 @@ const { reconcile } = require('../src/marketplaces/statuses');
 
     // 3. The manager builds the supply.
     const supply = await must('POST', '/api/supplies', manager.token, { invoiceIds: [a.id, b.id, c.id, d.id], marketplace: 'wb' }, 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await must('POST', `/api/shipping/assembly/${supply.id}/start`, worker.token, {}, 201);
     const listed = await must('GET', '/api/invoices?direction=out', worker.token);
     const sheet = await must('GET', '/api/shipping/pick-list', worker.token);
     check('after the supply is built, its orders reach the worker and nothing else from WB does', () => {

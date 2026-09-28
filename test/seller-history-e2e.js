@@ -65,6 +65,8 @@ const { withTenantContext, pool } = require('../src/db/pool');
 
     const second=await invoice(alpha.id,'HISTORY-SUPPLY-ORDER','out',4);
     const supply=await api('POST','/api/supplies',owner,{invoiceIds:[second.id]},201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await api('POST',`/api/shipping/assembly/${supply.id}/start`,worker,{},201);
     await api('POST','/api/shipping',worker,{invoiceItemId:second.items[0].id,pickedQty:4,cellBlockId:blocks[0].id},201);
     const departed=await api('POST',`/api/supplies/${supply.id}/ship`,owner);
     const supplyHistory=await api('GET','/api/sellers/history?sku=SharedCase',seller);

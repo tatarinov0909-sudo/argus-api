@@ -32,6 +32,8 @@ function check(name, fn) {
     const out = await ok('POST', '/api/invoices', w.token, { companyId: seller, number: 'ATK-OUT-1', direction: 'out',
       items: [{ name: 'Товар синтетический', sku: 'AC-1', declaredQty: 5 }] });
     const supply = await ok('POST', '/api/supplies', w.token, { invoiceIds: [out.id] }, 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await ok('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {});
     // На полке только 3: грузчик берёт 3 и закрывает позицию — так велит экран.
     await ok('POST', '/api/shipping', worker,
       { invoiceItemId: out.items[0].id, pickedQty: 3, cellBlockId: blocks[0].id, isFinal: true }, 201);

@@ -50,7 +50,9 @@ const { loadStock } = require('../src/sellers/stock');
       await run(q=>q.query(`UPDATE invoice_items SET mp_rid=$2 WHERE invoice_id=$1`,[inv.id,'test-rid-'+externalId]));
       // A WB order is picked only as part of a supply the manager sent to the floor.
       if(picked) {
-        await must('POST','/api/supplies',owner.token,{invoiceIds:[inv.id]},201);
+        const sup=await must('POST','/api/supplies',owner.token,{invoiceIds:[inv.id]},201);
+        // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+        await must('POST',`/api/shipping/assembly/${sup.id}/start`,worker.token,{},201);
         await must('POST','/api/shipping',worker.token,{invoiceItemId:inv.items[0].id,pickedQty:picked,cellBlockId:cell,isFinal:picked===qty},201);
       }
       orders.push(inv);return inv;

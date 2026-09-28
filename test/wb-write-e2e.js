@@ -200,6 +200,8 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     });
 
     // ---------- Отгрузка передаёт поставку в доставку ----------
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    await must('POST', `/api/shipping/assembly/${supply.id}/start`, worker.token, {}, 201);
     for (const inv of [good1, good2]) {
       const full = await must('GET', `/api/invoices/${inv.id}`, owner.token);
       await must('POST', '/api/shipping', worker.token,

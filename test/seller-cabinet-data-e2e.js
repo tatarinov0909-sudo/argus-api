@@ -90,6 +90,8 @@ const { withTenantContext } = require('../src/db/pool');
     await run((c) => c.query(`UPDATE invoices SET source = 'wb', external_id = '1' WHERE id = $1`, [order.id]));
     await run((c) => c.query(`UPDATE invoice_items SET mp_rid = 'rid-1' WHERE invoice_id = $1`, [order.id]));
     const supply = must(await api('POST', '/api/supplies', owner, { invoiceIds: [order.id], marketplace: 'wb', destination: 'СЦ Коледино' }), 201);
+    // «Начать сборку» — без захода сервер сборку поставки не принимает (29.09.2026).
+    must(await api('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {}), 201);
     must(await api('POST', '/api/shipping', worker, { invoiceItemId: order.items[0].id, pickedQty: 2, cellBlockId: cells[0].id }), 201);
     must(await api('POST', `/api/supplies/${supply.id}/ship`, owner, {}));
     const stock = must(await api('GET', '/api/sellers/stock', seller));
