@@ -157,17 +157,29 @@ async function cellOperations(client, warehouseId, cellBlockId) {
   // Приёмка в несколько ячеек: запись журнала о позиции ведёт на ячейку
   // первой укладки, а в остальные товар тоже лёг — и их история должна это
   // показывать (владелец 27.09.2026, третье задание).
+  //
+  // Шаги раскладки (задание 28.09.2026): у «положил ещё», «убрал» и второй
+  // половины «Переложить» своя запись журнала с этой ячейкой — их здесь не
+  // повторяем. Остаются укладки, о которых журнал в этой ячейке молчит:
+  // вторая и следующие ячейки одной приёмки (первая — в записи о позиции) и
+  // «забрал отсюда» при «Переложить».
   const placed = await client.query(
-    `SELECT rp.id, rp.qty, rp.placed_at, rp.placed_by, rp.sku, ii.name, i.id AS invoice_id, i.number,
-            rr.accepted_qty, sk.name AS actor_name,
-            (SELECT count(*)::int FROM receiving_placements x WHERE x.receiving_record_id = rp.receiving_record_id) AS cells
+    `SELECT rp.id, rp.qty, rp.kind, rp.placed_at, rp.placed_by, rp.sku, ii.name, i.id AS invoice_id, i.number,
+            rr.accepted_qty, sk.name AS actor_name, ${blockLabelSql('tcb', 'twr')} AS to_label,
+            (SELECT count(DISTINCT x.cell_block_id)::int FROM receiving_placements x
+              WHERE x.receiving_record_id = rp.receiving_record_id) AS cells
        FROM receiving_placements rp
        JOIN receiving_records rr ON rr.id = rp.receiving_record_id
        JOIN invoice_items ii ON ii.id = rp.invoice_item_id
        JOIN invoices i ON i.id = ii.invoice_id
        LEFT JOIN staff_keys sk ON sk.id = rp.placed_by
+       LEFT JOIN receiving_placements pair ON pair.pair_id = rp.id
+       LEFT JOIN cell_blocks tcb ON tcb.id = pair.cell_block_id
+       LEFT JOIN warehouse_rows twr ON twr.id = tcb.warehouse_row_id
       WHERE rp.warehouse_id = $1 AND rp.cell_block_id = $2
-        AND rr.cell_block_id IS DISTINCT FROM $2
+        AND rp.step > 1
+        AND NOT EXISTS (SELECT 1 FROM journal_entries je
+                         WHERE je.entity_type = 'receiving_placement' AND je.entity_id = rp.id AND je.cell_block_id = $2)
         AND rp.placed_at > now() - interval '${CELL_HISTORY}'
       ORDER BY rp.placed_at DESC LIMIT 200`,
     [warehouseId, cellBlockId],
@@ -176,8 +188,11 @@ async function cellOperations(client, warehouseId, cellBlockId) {
     id: `rp-${p.id}`,
     warehouse_id: warehouseId,
     agent: 'Кладовщик',
-    action_text: `Приёмка «${p.number}»: положено ${qty(p.qty)} «${p.name}» (${p.sku}) — часть принятых `
-      + `${qty(p.accepted_qty)}, разложенных по ${p.cells} ячейкам.`,
+    action_text: p.kind === 'take'
+      ? `Приёмка «${p.number}»: ${p.to_label ? `переложено ${qty(-p.qty)} «${p.name}» (${p.sku}) в ячейку ${p.to_label}`
+        : `забрано ${qty(-p.qty)} «${p.name}» (${p.sku}) — вернули в «осталось разложить»`}.`
+      : `Приёмка «${p.number}»: положено ${qty(p.qty)} «${p.name}» (${p.sku}) — часть принятых `
+        + `${qty(p.accepted_qty)}, разложенных по ${p.cells} ячейкам.`,
     entity_type: 'receiving_placement',
     entity_id: p.id,
     actor_type: p.placed_by ? 'worker' : 'owner',

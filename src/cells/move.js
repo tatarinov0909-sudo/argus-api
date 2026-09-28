@@ -38,49 +38,9 @@ async function moveStock(client, warehouseId, {
     if (!dest.rows[0]) throw new HttpError(404, 'Ячейка назначения не найдена');
   }
 
-  // Блокируем строки источника: два работника, переставляющие один и тот же
-  // товар одновременно, не должны оба пройти проверку остатка.
-  const source = await client.query(
-    `SELECT id, qty, company_id FROM cell_stock
-     WHERE cell_block_id = $1 AND warehouse_id = $2 AND sku = $3 AND quality = $4
-       AND ($5::uuid IS NULL OR company_id = $5::uuid)
-       AND qty > 0
-     ORDER BY updated_at
-     FOR UPDATE`,
-    [fromCellBlockId, warehouseId, sku, fromQuality, companyId || null],
-  );
-  const available = source.rows.reduce((sum, r) => sum + Number(r.qty), 0);
-  if (available <= 0) throw new HttpError(409, 'В этой ячейке нет такого товара в таком состоянии');
-  if (amount > available) {
-    throw new HttpError(409, `В ячейке только ${available}, переместить ${amount} нельзя`);
-  }
-
-  // Списываем со старых строк, начиная с самой давней, — тем же правилом, что
-  // и отбор на отгрузке, чтобы товар не «молодел» при перестановке.
-  //
-  // Продавца запоминаем построчно. Один артикул у двух продавцов — обычное
-  // дело (коды берутся от поставщика), и раньше всё перемещённое ложилось
-  // одной строкой на того, чья строка попалась последней: товар продавца А
-  // физически становился товаром продавца Б, и оба видели это как факт —
-  // и в остатке, и в истории операций.
-  let left = amount;
-  const takenByCompany = new Map();
-  for (const row of source.rows) {
-    if (left <= 0) break;
-    const take = Math.min(left, Number(row.qty));
-    const rest = Number(row.qty) - take;
-    if (rest === 0) {
-      await client.query(`DELETE FROM cell_stock WHERE id = $1`, [row.id]);
-    } else {
-      await client.query(
-        `UPDATE cell_stock SET qty = $2, updated_at = now() WHERE id = $1`,
-        [row.id, rest],
-      );
-    }
-    const key = row.company_id || '';
-    takenByCompany.set(key, (takenByCompany.get(key) || 0) + take);
-    left -= take;
-  }
+  const takenByCompany = await takeFromCell(client, warehouseId, {
+    cellBlockId: fromCellBlockId, sku, companyId, quality: fromQuality, qty: amount, verb: 'переместить',
+  });
 
   for (const [key, moved] of takenByCompany) {
     await client.query(
@@ -116,4 +76,55 @@ async function moveStock(client, warehouseId, {
   };
 }
 
-module.exports = { moveStock };
+// Снять товар с полки: строки остатка ячейки, начиная с самой давней, — тем
+// же правилом, что и отбор на отгрузке, чтобы товар не «молодел» при
+// перестановке. Возвращает, сколько снято у какого продавца. Нехватка — отказ
+// до того, как что-то сдвинулось. Общая для перестановки и для раскладки
+// приёмки («Переложить», «Убрать из ячейки», receiving/routes.js).
+async function takeFromCell(client, warehouseId, {
+  cellBlockId, sku, companyId = null, quality = 'good', qty, verb = 'забрать',
+}) {
+  // Блокируем строки источника: два работника, переставляющие один и тот же
+  // товар одновременно, не должны оба пройти проверку остатка.
+  const source = await client.query(
+    `SELECT id, qty, company_id FROM cell_stock
+     WHERE cell_block_id = $1 AND warehouse_id = $2 AND sku = $3 AND quality = $4
+       AND ($5::uuid IS NULL OR company_id = $5::uuid)
+       AND qty > 0
+     ORDER BY updated_at
+     FOR UPDATE`,
+    [cellBlockId, warehouseId, sku, quality, companyId || null],
+  );
+  const available = source.rows.reduce((sum, r) => sum + Number(r.qty), 0);
+  if (available <= 0) throw new HttpError(409, 'В этой ячейке нет такого товара в таком состоянии');
+  if (qty > available) {
+    throw new HttpError(409, `В ячейке только ${available}, ${verb} ${qty} нельзя`);
+  }
+
+  // Продавца запоминаем построчно. Один артикул у двух продавцов — обычное
+  // дело (коды берутся от поставщика), и раньше всё перемещённое ложилось
+  // одной строкой на того, чья строка попалась последней: товар продавца А
+  // физически становился товаром продавца Б, и оба видели это как факт —
+  // и в остатке, и в истории операций.
+  let left = qty;
+  const takenByCompany = new Map();
+  for (const row of source.rows) {
+    if (left <= 0) break;
+    const take = Math.min(left, Number(row.qty));
+    const rest = Number(row.qty) - take;
+    if (rest === 0) {
+      await client.query(`DELETE FROM cell_stock WHERE id = $1`, [row.id]);
+    } else {
+      await client.query(
+        `UPDATE cell_stock SET qty = $2, updated_at = now() WHERE id = $1`,
+        [row.id, rest],
+      );
+    }
+    const key = row.company_id || '';
+    takenByCompany.set(key, (takenByCompany.get(key) || 0) + take);
+    left -= take;
+  }
+  return takenByCompany;
+}
+
+module.exports = { moveStock, takeFromCell };

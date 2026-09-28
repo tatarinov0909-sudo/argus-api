@@ -189,17 +189,23 @@ router.get('/:id', requireAuth, async (req, res, next) => {
                 codes.barcode, codes.wb_article,
                 rr.id AS receiving_id, rr.accepted_qty, rr.finished_at, rr.pause_reasons,
                 cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end, wr.row_num,
-                -- Все укладки позиции по порядку: товар мог лечь в несколько
-                -- ячеек (третье задание 27.09.2026). Ячейка выше — первая.
+                -- Где товар позиции лежит сейчас: ячейка и сколько в ней —
+                -- сумма шагов раскладки «положил / забрал» (задание 28.09.2026),
+                -- в порядке первой укладки. Ячейка выше — первая.
                 COALESCE((SELECT json_agg(json_build_object(
-                                   'id', rp.id, 'step', rp.step, 'qty', rp.qty, 'cellBlockId', rp.cell_block_id,
+                                   'qty', l.qty, 'cellBlockId', l.cell_block_id,
                                    'rowNum', pwr.row_num, 'rackStart', pcb.rack_start, 'rackEnd', pcb.rack_end,
                                    'tierStart', pcb.tier_start, 'tierEnd', pcb.tier_end,
-                                   'placedAt', rp.placed_at, 'confirmedAt', rp.confirmed_at) ORDER BY rp.step)
-                            FROM receiving_placements rp
-                            LEFT JOIN cell_blocks pcb ON pcb.id = rp.cell_block_id
-                            LEFT JOIN warehouse_rows pwr ON pwr.id = pcb.warehouse_row_id
-                           WHERE rp.receiving_record_id = rr.id), '[]') AS placements
+                                   'placedAt', l.placed_at) ORDER BY l.first_step)
+                            FROM (SELECT rp.cell_block_id, SUM(rp.qty) AS qty, MIN(rp.step) AS first_step,
+                                         MIN(rp.placed_at) AS placed_at
+                                    FROM receiving_placements rp WHERE rp.receiving_record_id = rr.id
+                                   GROUP BY rp.cell_block_id HAVING SUM(rp.qty) > 0) l
+                            LEFT JOIN cell_blocks pcb ON pcb.id = l.cell_block_id
+                            LEFT JOIN warehouse_rows pwr ON pwr.id = pcb.warehouse_row_id), '[]') AS placements,
+                -- Сколько принятого разложено: меньше принятого — позиция не
+                -- закончена, приёмка не закрывается.
+                (SELECT COALESCE(SUM(rp.qty), 0) FROM receiving_placements rp WHERE rp.receiving_record_id = rr.id) AS placed_qty
          FROM invoice_items ii
          ${productCodesJoin('ii.warehouse_id', 'ii.company_id', 'ii.sku')}
          LEFT JOIN receiving_records rr ON rr.invoice_item_id = ii.id

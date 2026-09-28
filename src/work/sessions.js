@@ -125,10 +125,15 @@ const TARGETS = {
     missing: 'Прихода нет — возможно, его отменили',
     badId: 'Нужен приход',
     canStart: (doc) => doc.status !== 'completed',
-    // Все позиции приняты (в том числе нулём — «не приехало»).
+    // Все позиции приняты (в том числе нулём — «не приехало») и разложены
+    // по ячейкам (задание 28.09.2026): конец работы — последняя приёмка или
+    // последний шаг раскладки, что позже.
     finalSql: (d) => `${d}.status = 'completed' AND ${d}.direction = 'in'`,
-    finalAt: (d) => `(SELECT MAX(rr.finished_at) FROM receiving_records rr JOIN invoice_items ii ON ii.id = rr.invoice_item_id
-                       WHERE ii.invoice_id = ${d}.id)`,
+    finalAt: (d) => `GREATEST(
+                       (SELECT MAX(rr.finished_at) FROM receiving_records rr JOIN invoice_items ii ON ii.id = rr.invoice_item_id
+                         WHERE ii.invoice_id = ${d}.id),
+                       (SELECT MAX(rp.placed_at) FROM receiving_placements rp JOIN invoice_items ii ON ii.id = rp.invoice_item_id
+                         WHERE ii.invoice_id = ${d}.id))`,
     isFinal: (doc) => doc.status === 'completed',
     done: (doc) => `Приход «${doc.number}» уже принят`,
     async progress(client, warehouseId, ids) {
@@ -165,7 +170,7 @@ const TARGETS = {
         + `${cur.status === 'paused' ? ' — приёмка на паузе' : ''}. Забрать приёмку себе?`,
       notMine: (doc) => `Приёмку прихода «${doc.number}» сейчас ведёте не вы`,
       settled: (name, doc, minutes, taken) => `${name} закончил приёмку прихода «${doc.number}» за ${minutes} мин: ${taken}`
-        + ' Все позиции приняты — приёмка закрыта сама.',
+        + ' Все позиции приняты и разложены — приёмка закрыта сама.',
     },
   },
 };

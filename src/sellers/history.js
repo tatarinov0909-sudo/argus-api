@@ -73,12 +73,15 @@ async function loadHistory(client, companyId, sku, page) {
   ) SELECT p.*,p.at::text AS cursor_at,
            ${cellFields('fc','fr')} AS from_cell, ${cellFields('tc','tr')} AS to_cell,
            -- Приёмка в несколько ячеек: куда и сколько легло (to_cell — первая).
+           -- Где лежит сейчас — сумма шагов раскладки по ячейке (28.09.2026).
            CASE WHEN p.kind='received' THEN (
-             SELECT json_agg(json_build_object('cell', ${cellFields('pc','pr')}, 'qty', rp.qty) ORDER BY rp.step)
-               FROM receiving_placements rp
-               LEFT JOIN cell_blocks pc ON pc.id=rp.cell_block_id
-               LEFT JOIN warehouse_rows pr ON pr.id=pc.warehouse_row_id
-              WHERE rp.receiving_record_id=p.id AND rp.company_id=$1) END AS placements
+             SELECT json_agg(json_build_object('cell', ${cellFields('pc','pr')}, 'qty', l.qty) ORDER BY l.first_step)
+               FROM (SELECT rp.cell_block_id, SUM(rp.qty) AS qty, MIN(rp.step) AS first_step
+                       FROM receiving_placements rp
+                      WHERE rp.receiving_record_id=p.id AND rp.company_id=$1
+                      GROUP BY rp.cell_block_id HAVING SUM(rp.qty) > 0) l
+               LEFT JOIN cell_blocks pc ON pc.id=l.cell_block_id
+               LEFT JOIN warehouse_rows pr ON pr.id=pc.warehouse_row_id) END AS placements
       FROM page p
       LEFT JOIN cell_blocks fc ON fc.id=p.from_cell_id
       LEFT JOIN warehouse_rows fr ON fr.id=fc.warehouse_row_id

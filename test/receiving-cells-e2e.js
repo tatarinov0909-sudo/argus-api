@@ -60,7 +60,10 @@ const { withTenantContext } = require('../src/db/pool');
     must(await api('POST', `/api/receiving/session/${inv.id}/start`, jonik, {}), 201);
     const post = (token, body) => api('POST', '/api/receiving', token, body);
     const zefir = inv.item('MC-1').id;
-    const short = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36, placements: [{ cellBlockId: c11.id, qty: 30 }] });
+    // Разложено меньше принятого — уже не отказ, а первый шаг раскладки
+    // (задание 28.09.2026, test/receiving-steps-e2e.js). Без ячейки — отказ.
+    const noCell = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36 });
+    const nullCell = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36, cellBlockId: null });
     const over = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36,
       placements: [{ cellBlockId: c11.id, qty: 30 }, { cellBlockId: c21.id, qty: 10 }] });
     const twice = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36,
@@ -76,9 +79,10 @@ const { withTenantContext } = require('../src/db/pool');
     const foreign = must(await api('GET', '/api/cells/rows', other))[0].blocks[0];
     const alien = await post(jonik, { invoiceItemId: zefir, acceptedQty: 36,
       placements: [{ cellBlockId: c11.id, qty: 30 }, { cellBlockId: foreign.id, qty: 6 }] });
-    check('раскладка не сходится с принятым — отказ с понятным «осталось разложить»', () => {
-      assert.equal(short.status, 400);
-      assert.equal(short.body.error, 'Разложено 30 из 36 шт. — осталось разложить 6');
+    check('разложено больше принятого или без ячейки — отказ с понятной причиной', () => {
+      assert.equal(noCell.status, 400);
+      assert.match(noCell.body.error, /без ячейки принять нельзя/);
+      assert.equal(nullCell.status, 400);
       assert.equal(over.status, 400);
       assert.equal(over.body.error, 'Разложено 40 шт., а принято 36 — уберите лишние 4');
       assert.equal(twice.status, 400);
@@ -173,7 +177,7 @@ const { withTenantContext } = require('../src/db/pool');
     });
     const autoTexts = (await journal()).map((e) => e.action_text);
     check('журнал: «закончил приёмку … закрыта сама»', () => {
-      assert.ok(autoTexts.some((t) => /^Джоник закончил приёмку прихода «ПР-ЯЧ-1» за \d+ мин: принято 3 из 3 позиций\. Все позиции приняты — приёмка закрыта сама\.$/.test(t)),
+      assert.ok(autoTexts.some((t) => /^Джоник закончил приёмку прихода «ПР-ЯЧ-1» за \d+ мин: принято 3 из 3 позиций\. Все позиции приняты и разложены — приёмка закрыта сама\.$/.test(t)),
         autoTexts.slice(0, 5).join('\n'));
     });
     const lateFinish = must(await api('POST', `/api/receiving/session/${inv.id}/finish`, jonik, { comment: 'всё на местах' }));
@@ -219,11 +223,12 @@ const { withTenantContext } = require('../src/db/pool');
       assert.deepEqual(rec.toCells.map((x) => [x.cell.rackStart, x.qty]), [[1, 30], [2, 6]]);
     });
 
-    // Принято «на своё место» без ячейки — не размещено.
+    // Принято 7, в ячейку легло 4 — 3 шт. не размещено (раньше так было у
+    // «своего места»; теперь без ячейки принять нельзя — задание 28.09.2026).
     const loose = await invoice('ПР-ЯЧ-2', [['MC-4', 7], ['MC-2', 1]]);
-    must(await post(dima, { invoiceItemId: loose.item('MC-4').id, acceptedQty: 7 }), 201);
+    must(await post(dima, { invoiceItemId: loose.item('MC-4').id, acceptedQty: 7, placements: [{ cellBlockId: c41.id, qty: 4 }] }), 201);
     const looseCard = must(await api('GET', `/api/inbound/${loose.id}`, owner));
-    check('без ячейки: 7 шт. «без ячейки» в карточке', () => assert.equal(looseCard.unplaced, 7));
+    check('не разложено: 3 шт. «без ячейки» в карточке', () => assert.equal(looseCard.unplaced, 3));
 
     // ---------- Сценарий 27.09: заход завис на паузе у принятого прихода ----------
     const stuck = await invoice('ПР-270926-1', [['MC-2', 3], ['MC-3', 2]]);
@@ -252,7 +257,7 @@ const { withTenantContext } = require('../src/db/pool');
     });
     const settleTexts = (await journal()).map((e) => e.action_text);
     check('журнал: зависший заход закрыт с записью от имени Джоника', () => {
-      assert.ok(settleTexts.some((t) => /^Джоник закончил приёмку прихода «ПР-270926-1» за \d+ мин: принято 2 из 2 позиций\. Все позиции приняты — приёмка закрыта сама\.$/.test(t)));
+      assert.ok(settleTexts.some((t) => /^Джоник закончил приёмку прихода «ПР-270926-1» за \d+ мин: принято 2 из 2 позиций\. Все позиции приняты и разложены — приёмка закрыта сама\.$/.test(t)));
     });
     // Тот же случай, но первым обратились к самой работе.
     const stuck2 = await invoice('ПР-270926-5', [['MC-2', 1]]);

@@ -151,11 +151,18 @@ const { pool, withTenantContext } = require('../src/db/pool');
     // 7. Акт расхождений: ответ продавца — когда приход принят, один раз.
     await api('POST', `/api/inbound/${one.id}/verdict`, sa, { verdict: 'agreed' }, 409);
     const inv = await api('GET', `/api/invoices/${one.id}`, worker);
-    await api('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 5, cellBlockId: null }, 201);
+    // Принято 5, в ячейку легло 3 — у продавца «не размещено 2», приход ещё
+    // не принят; «положить ещё 2» — принят (задание 28.09.2026).
+    await api('POST', '/api/receiving', worker, { invoiceItemId: inv.items[0].id, acceptedQty: 5,
+      placements: [{ cellBlockId: cell, qty: 3 }] }, 201);
     card = await api('GET', `/api/inbound/${one.id}`, sa);
-    assert.deepEqual([card.discrepancy, card.unplaced], [-2, 5]);
+    assert.deepEqual([card.discrepancy, card.unplaced], [null, 2]);   // расхождение — у принятого прихода
     const docs = (await api('GET', '/api/sellers/documents', sa)).rows.find((r) => r.id === one.id);
-    assert.equal(Number(docs.unplaced_qty), 5); assert.equal(docs.comment_count, 2); assert.equal(docs.document_count, 2);
+    assert.equal(Number(docs.unplaced_qty), 2); assert.equal(docs.comment_count, 2); assert.equal(docs.document_count, 2);
+    await api('POST', `/api/inbound/${one.id}/verdict`, sa, { verdict: 'agreed' }, 409);
+    await api('POST', `/api/receiving/items/${inv.items[0].id}/place`, worker, { cellBlockId: cell, qty: 2 }, 201);
+    card = await api('GET', `/api/inbound/${one.id}`, sa);
+    assert.deepEqual([card.discrepancy, card.unplaced], [-2, 0]);
     await api('POST', `/api/inbound/${one.id}/verdict`, owner, { verdict: 'agreed' }, 403);
     await api('POST', `/api/inbound/${one.id}/verdict`, sa, { verdict: 'disputed' }, 400);
     await api('POST', `/api/inbound/${one.id}/verdict`, sa, { verdict: 'disputed', note: 'Отгружали 7, есть видео' });
