@@ -55,15 +55,22 @@ function sellerStockResponse(rows) {
     .filter(Boolean)
     .reduce((latest, value) => (!latest || new Date(value) > new Date(latest) ? value : latest), null);
 
+  // «Всего» и «Доступно» — по товарам, у которых есть число учёта; товары
+  // без него названы отдельно (unknownNames), а не прячут всё число прочерком:
+  // один тестовый товар, заведённый в Аргусе, гасил итог по восьмидесяти
+  // (владелец 30.09.2026). Прочерк — когда не знаем ни одного.
+  const knownRows = inventoryRows.filter(row => row.totalKnown);
   return {
     rows: inventoryRows.map(sellerStockView),
     summary: {
       productCount: inventoryRows.length,
-      total: unknownRows.length ? null : sum(inventoryRows, 'total'),
+      total: knownRows.length ? sum(knownRows, 'total') : null,
       ordered: sum(inventoryRows, 'orderedNotInSupply'),
       inAssembly: sum(inventoryRows, 'inAssembly'),
       inTransit: sum(inventoryRows, 'inTransit'),
-      available: unknownRows.length ? null : sum(inventoryRows, 'sellerAvailable'),
+      available: knownRows.length ? sum(knownRows, 'sellerAvailable') : null,
+      unknownCount: unknownRows.length,
+      unknownNames: unknownRows.slice(0, 5).map(row => row.name || row.sku),
       updatedAt,
     },
   };
@@ -750,3 +757,4 @@ router.patch('/keys/:id/toggle', requireAuth, requireGrant('clients'), async (re
 });
 
 module.exports = router;
+module.exports.sellerStockResponse = sellerStockResponse;

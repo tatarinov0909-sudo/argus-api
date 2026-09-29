@@ -66,6 +66,9 @@ function parseInboundSheet(grid) {
     return limitLines(parseStockSheet(grid).filter((r) => r.qty > 0)
       .map((r, i) => ({ row: i + 1, barcode: r.barcode, article: r.article || r.code, name: r.name, ...qtyOf(r.qty) })));
   }
+  // Шапку с колонками нашли, а строк товара под ней нет (пустой бланк акта)
+  // — так и говорим, а не «не нашёл колонку» (владелец 30.09.2026).
+  let headerFound = false;
   for (let h = 0; h < Math.min(30, rows.length); h += 1) {
     const cols = {};
     rows[h].forEach((v, j) => {
@@ -78,6 +81,7 @@ function parseInboundSheet(grid) {
       }
     });
     if (cols.qty === undefined || (cols.barcode === undefined && cols.article === undefined && cols.name === undefined)) continue;
+    headerFound = true;
     const out = [];
     for (let i = h + 1; i < rows.length; i += 1) {
       const r = rows[i];
@@ -94,6 +98,9 @@ function parseInboundSheet(grid) {
       out.push({ ...line, ...q });
     }
     if (out.length) return limitLines(out);
+  }
+  if (headerFound) {
+    throw new HttpError(400, 'В таблице нет ни одной строки с товаром: заполните артикул, штрихкод или название и количество штук');
   }
   throw new HttpError(400, 'Не нашёл в файле колонку количества и колонку штрихкода, артикула или названия товара');
 }
