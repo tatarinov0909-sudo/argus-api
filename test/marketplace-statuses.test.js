@@ -65,7 +65,8 @@ test('partial responses, duplicate IDs and unrelated seller IDs do not close loc
       {id:999,supplierStatus:'cancel',wbStatus:'canceled'}];
   };
   const out = await reconcile(client, 'warehouse-A', 'company-A', 'synthetic-test-token', {fetchStatuses});
-  assert.deepEqual(out, {checked:3,closed:2,missing:2,conflicts:1});
+  assert.deepEqual(out, {checked:3,closed:2,missing:2,conflicts:1,quiet:{fulfilled:0,canceled:1}});
+  // Конфликт — своей строкой, тихо закрытый заказ — сводной (01.10.2026).
   assert.equal(queries.filter(q=>q.sql.includes('INSERT INTO journal_entries')).length,2);
   assert.ok(queries.filter(q=>q.sql.includes('UPDATE invoices')).every(q=>q.args[0]==='warehouse-A'&&q.args[1]==='company-A'));
   assert.ok(!queries.some(q=>/UPDATE cell_stock|DELETE FROM cell_stock|INSERT INTO cell_stock|SET status\s*=/.test(q.sql)));

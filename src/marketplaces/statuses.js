@@ -69,6 +69,11 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
     byId.set(id, row);
   }
   let checked = 0; let closed = 0; let conflicts = 0;
+  // Заказы, которые склад в Аргусе не трогал (не отбирал, не ставил в
+  // поставку), — одной строкой на обмен, а не строкой на заказ (владелец
+  // 01.10.2026: 10 тысяч строк «посылку уже принял WB» — это обычная жизнь
+  // заказов, собранных без Аргуса, а не события, которые надо читать).
+  const quiet = { fulfilled: 0, canceled: 0 };
   for (const candidate of selected.rows) {
     const row = byId.get(candidate.external_id);
     const valid = row && !duplicates.has(candidate.external_id) && !row.errors?.length && !row.isError
@@ -114,6 +119,7 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       // An order nobody picked simply leaves the queue or its supply.
       const conflict = inv.has_picks;
       if (conflict) conflicts++;
+      if (!conflict && !inv.supply_id) { quiet[reason === 'canceled' ? 'canceled' : 'fulfilled'] += 1; continue; }
       const event = reason === 'canceled' ? 'отменён на WB' : 'посылку уже принял WB';
       const fromSupply = inv.supply_id ? ` Убран из поставки «${inv.supply_number}».` : '';
       await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
@@ -126,7 +132,14 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       });
     }
   }
-  return { checked, closed, missing: selected.rows.length - checked, conflicts };
+  if (quiet.fulfilled || quiet.canceled) {
+    const company = (await client.query('SELECT name FROM companies WHERE id = $1', [companyId])).rows[0]?.name || 'продавца';
+    const parts = [quiet.fulfilled && `приняты WB — ${quiet.fulfilled}`, quiet.canceled && `отменены — ${quiet.canceled}`].filter(Boolean);
+    await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system', status: 'auto',
+      actionText: `Заказы «${company}» закрыты на WB: ${parts.join(', ')}. `
+        + 'В Аргусе их не собирали, поэтому остаток на складе не меняется.' });
+  }
+  return { checked, closed, missing: selected.rows.length - checked, conflicts, quiet };
 }
 
 module.exports = { reconcile, closeReason, statusText };
