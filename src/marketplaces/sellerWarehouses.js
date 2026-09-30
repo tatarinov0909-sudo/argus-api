@@ -88,12 +88,15 @@ async function applyAuto(client, warehouseId, companyId = null) {
 }
 
 // Пункты приёмки, куда возит фулфилмент, Аргус при первом чтении складов
-// добавляет сам: те, где у продавцов стоят склады с его именем. Один раз:
-// убрал человек пункт — Аргус его обратно не вернёт. Возвращает число
-// добавленных пунктов.
+// продавцов добавляет сам: те, где у продавцов стоят склады с его именем.
+// Один раз (отметка wb_offices_auto_at): убрал человек пункт — Аргус его
+// обратно не вернёт. Возвращает число добавленных пунктов.
 async function autoOffices(client, warehouseId) {
   const wh = (await client.query('SELECT wb_offices_auto_at FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
   if (!wh || wh.wb_offices_auto_at) return 0;
+  // Складов продавцов ещё не знаем — решать не по чему, ждём первого чтения.
+  const known = (await client.query('SELECT 1 FROM seller_wb_warehouses WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
+  if (!known) return 0;
   const has = (await client.query('SELECT 1 FROM ff_wb_offices WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
   const ctx = await ffContext(client, warehouseId);
   const rows = has ? [] : (await client.query(
@@ -101,8 +104,6 @@ async function autoOffices(client, warehouseId) {
             array_agg(name) AS names
        FROM seller_wb_warehouses WHERE warehouse_id = $1 AND gone_at IS NULL AND office_id IS NOT NULL
       GROUP BY office_id`, [warehouseId])).rows.filter((o) => o.names.some((n) => nameMatches(n, ctx)));
-  // Нечего добавить — не ставим отметку: продавец может завести склад позже.
-  if (!has && !rows.length) return 0;
   for (const o of rows) {
     await client.query(
       `INSERT INTO ff_wb_offices (warehouse_id, office_id, name, city, address, added_by)
@@ -203,16 +204,28 @@ async function refresh(client, warehouseId, companyId, token, {
   return { count: rows.length, created: created.length, changed: changed.length };
 }
 
+// Решено ли, куда возит фулфилмент: есть пункты приёмки или Аргус уже
+// пробовал добавить их сам. До этого (склад только что обновился на эту
+// версию, складов продавцов ещё не читали) заказы берутся, как раньше:
+// иначе обновление само спрятало бы все заказы склада.
+async function officesDecided(client, warehouseId) {
+  const r = (await client.query(
+    `SELECT w.wb_offices_auto_at IS NOT NULL OR EXISTS (SELECT 1 FROM ff_wb_offices o WHERE o.warehouse_id = w.id) AS decided
+       FROM warehouses w WHERE w.id = $1`, [warehouseId])).rows[0];
+  return Boolean(r?.decided);
+}
+
 async function policy(client, warehouseId, companyId) {
   const rows = (await client.query(
     'SELECT mp_warehouse_id, ours FROM seller_wb_warehouses WHERE warehouse_id = $1 AND company_id = $2',
     [warehouseId, companyId])).rows;
+  const decided = await officesDecided(client, warehouseId);
   const ours = new Set(rows.filter((r) => r.ours).map((r) => r.mp_warehouse_id));
-  const known = new Set(rows.map((r) => r.mp_warehouse_id));
+  const known = new Set(decided ? rows.map((r) => r.mp_warehouse_id) : []);
   // Склад, которого мы не знаем (WB не отдал список складов), считаем своим:
   // лучше лишний заказ, который уберётся на следующем обмене, чем потерянный.
   const isForeign = (id) => Boolean(id) && known.has(String(id)) && !ours.has(String(id));
-  return { ours, known, isForeign, foreignIds: [...known].filter((id) => !ours.has(id)) };
+  return { decided, ours, known, isForeign, foreignIds: [...known].filter((id) => !ours.has(id)) };
 }
 
 // Заказы чужих складов из очереди WB — в сторону, не в работу.
@@ -250,7 +263,9 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
                   'barcodes', CASE WHEN ii.mp_barcode IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(ii.mp_barcode) END,
                   'rid', ii.mp_rid, 'createdAt', i.mp_created_at, 'offices', to_jsonb(COALESCE(i.mp_offices, '{}'::text[])),
                   'salePriceKopecks', i.mp_sale_price_kopecks, 'warehouseId', i.mp_warehouse_id,
-                  'chrtId', ii.mp_chrt_id) AS wb_order
+                  'chrtId', ii.mp_chrt_id) AS wb_order,
+                to_jsonb(i.*) AS invoice_row,
+                (SELECT jsonb_agg(to_jsonb(x.*)) FROM invoice_items x WHERE x.invoice_id = i.id) AS item_rows
            FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
           WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.source = 'wb' AND i.direction = 'out'
             AND i.mp_warehouse_id = ANY($3::text[])
@@ -264,21 +279,41 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
             AND NOT EXISTS (SELECT 1 FROM work_sessions w WHERE w.invoice_id = i.id)
           LIMIT ${BATCH}
        ), saved AS (
-         INSERT INTO wb_foreign_orders (warehouse_id, company_id, external_id, mp_warehouse_id, mp_created_at, wb_order)
-         SELECT $1, $2, external_id, mp_warehouse_id, mp_created_at, wb_order FROM victims
-         ON CONFLICT (warehouse_id, external_id) DO NOTHING
+         INSERT INTO wb_foreign_orders (warehouse_id, company_id, external_id, mp_warehouse_id, mp_created_at,
+                                        wb_order, invoice_row, item_rows)
+         SELECT $1, $2, external_id, mp_warehouse_id, mp_created_at, wb_order, invoice_row, item_rows FROM victims
+         ON CONFLICT (warehouse_id, external_id) DO UPDATE SET
+           mp_warehouse_id = EXCLUDED.mp_warehouse_id, wb_order = EXCLUDED.wb_order,
+           invoice_row = EXCLUDED.invoice_row, item_rows = EXCLUDED.item_rows
        )
        DELETE FROM invoices WHERE id IN (SELECT id FROM victims)`,
       [warehouseId, companyId, p.foreignIds]);
     hidden = r.rowCount;
   }
   const back = (await client.query(
-    `SELECT id, wb_order FROM wb_foreign_orders
+    `SELECT id, wb_order, invoice_row IS NOT NULL AS whole FROM wb_foreign_orders
       WHERE warehouse_id = $1 AND company_id = $2 AND NOT (mp_warehouse_id = ANY($3::text[]))
       ORDER BY mp_created_at NULLS LAST LIMIT ${BATCH}`,
     [warehouseId, companyId, p.foreignIds])).rows;
   if (back.length) {
-    await importOrders(client, warehouseId, { companyId, orders: back.map((r) => r.wb_order) });
+    // Заказ, который был в работе, — его же строкой (номер записи, статус WB,
+    // даты); заказ, который в работу не попадал, — дорогой нового заказа.
+    // ponytail: снимок — все колонки на момент убирания; новая NOT NULL
+    // колонка в invoices без значения в снимке сломает возврат — добавлять
+    // её вместе с дозаполнением снимков в wb_foreign_orders.
+    const whole = back.filter((r) => r.whole).map((r) => r.id);
+    if (whole.length) {
+      await client.query(
+        `WITH src AS (SELECT invoice_row, item_rows FROM wb_foreign_orders WHERE id = ANY($1::uuid[])),
+              ins AS (INSERT INTO invoices SELECT (jsonb_populate_record(NULL::invoices, src.invoice_row)).* FROM src
+                      ON CONFLICT DO NOTHING RETURNING id)
+         INSERT INTO invoice_items
+         SELECT (jsonb_populate_record(NULL::invoice_items, it)).*
+           FROM src, jsonb_array_elements(src.item_rows) AS it
+          WHERE (it->>'invoice_id')::uuid IN (SELECT id FROM ins)`, [whole]);
+    }
+    const fresh = back.filter((r) => !r.whole).map((r) => r.wb_order);
+    if (fresh.length) await importOrders(client, warehouseId, { companyId, orders: fresh });
     await client.query('DELETE FROM wb_foreign_orders WHERE id = ANY($1::uuid[])', [back.map((r) => r.id)]);
   }
   if (hidden || back.length) {
@@ -506,7 +541,20 @@ async function afterRuleChange(client, warehouseId, importOrders) {
     restored: results.reduce((s, r) => s + r.restored, 0) };
 }
 
-async function setOffice(client, warehouseId, officeId, on, actor, { importOrders }) {
+// Несколько пунктов одним решением: добавить все — один пересчёт отметок и
+// заказов, а не по одному на пункт (30.09.2026 по одному: после первого
+// пункта склады на остальных на миг становились чужими, и их заказы
+// уходили из работы и возвращались).
+async function setOffices(client, warehouseId, officeIds, on, actor, { importOrders }) {
+  const ids = [...new Set((officeIds || []).map(String))];
+  if (!ids.length || ids.length > 100 || ids.some((id) => !/^\d{1,15}$/.test(id))) {
+    throw new HttpError(400, 'Неверный список пунктов приёмки WB');
+  }
+  for (const id of ids) await setOffice(client, warehouseId, id, on, actor, { importOrders, recount: false });
+  return afterRuleChange(client, warehouseId, importOrders);
+}
+
+async function setOffice(client, warehouseId, officeId, on, actor, { importOrders, recount = true }) {
   const id = String(officeId || '');
   if (!/^\d{1,15}$/.test(id)) throw new HttpError(400, 'Неверный пункт приёмки WB');
   if (on) {
@@ -529,10 +577,19 @@ async function setOffice(client, warehouseId, officeId, on, actor, { importOrder
     entityType: 'wb_warehouse',
     actionText: `Пункт приёмки WB ${[office.city, office.address].filter(Boolean).join(', ') || id} `
       + (on ? 'добавлен в «Куда вы возите на WB».' : 'убран из «Куда вы возите на WB».') });
-  return afterRuleChange(client, warehouseId, importOrders);
+  return recount ? afterRuleChange(client, warehouseId, importOrders) : null;
+}
+
+// Каждый обмен, до правила: если пункты ещё не решены, а склады продавцов
+// уже известны, — добавить пункты сами и пересчитать отметки.
+async function ensureOffices(client, warehouseId) {
+  const added = await autoOffices(client, warehouseId);
+  if (added) await applyAuto(client, warehouseId, null);
+  return added;
 }
 
 module.exports = {
+  ensureOffices, officesDecided,
   autoOurs, norm, applyAuto, refresh, policy, hideOrders, settle, backfillHistory, refreshStocks,
-  list, setOurs, listOffices, setOffice, afterRuleChange,
+  list, setOurs, listOffices, setOffice, setOffices, afterRuleChange,
 };

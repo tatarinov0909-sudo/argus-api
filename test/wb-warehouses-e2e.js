@@ -130,9 +130,13 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
     // ---------- 1. Первый обмен: пункт с нашим именем Аргус добавил сам ----------
     WB.queue = [order(2001, 11), order(2002, 99)];
     const first = await api('POST', '/api/marketplaces/sync', { token: owner, body: { companyId } });
-    check('обмен прошёл, склады продавца прочитаны у WB', () => {
+    check('склады продавца прочитаны у WB сразу при подключении ключа', () => {
+      assert.equal(conn.body.warehouses.count, 3, JSON.stringify(conn.body));
       assert.equal(first.status, 200, JSON.stringify(first.body));
-      assert.equal(first.body.warehouses.count, 3);
+    });
+    const listed = await api('GET', '/api/marketplaces', { token: owner });
+    check('чей кабинет WB подключён — запомнено', () => {
+      assert.equal(listed.body.find((m) => m.companyId === companyId).sellerName, 'ИП Авезов');
     });
     check('заказ чужого склада из очереди в работу не взят', () => assert.equal(first.body.foreign, 1));
     let inv = await invoicesOf();
@@ -308,7 +312,17 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
       assert.ok(setup.body.setup_at);
     });
 
-    // ---------- 11. Работник к складам WB и настройкам не допущен ----------
+    // ---------- 11. «Забрать у всех»: каждый продавец отдельно ----------
+    WB.queue = [order(2006, 11)];
+    const all = await api('POST', '/api/marketplaces/sync', { token: owner, body: {} });
+    check('«забрать у всех» — по каждому продавцу свой итог, без ошибок', () => {
+      assert.equal(all.status, 200, JSON.stringify(all.body));
+      assert.deepEqual(all.body.map((r) => r.company).sort(), ['Авезов', 'Другой']);
+      assert.ok(all.body.every((r) => !r.error), JSON.stringify(all.body));
+      assert.equal(all.body.find((r) => r.company === 'Авезов').created, 1);
+    });
+
+    // ---------- 12. Работник к складам WB и настройкам не допущен ----------
     const staff = await api('POST', '/api/staff', { token: owner, body: { name: 'Грузчик' } });
     const worker = (await api('POST', '/api/auth/staff/login', { body: { keyCode: staff.body.key_code } })).body.token;
     const w1 = await api('GET', `/api/marketplaces/${companyId}/wb/warehouses`, { token: worker });

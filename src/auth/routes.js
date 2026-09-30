@@ -4,6 +4,15 @@ const service = require('./service');
 const { loginLimiter, keyLoginLimiter, registerLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
+const { requireAuth, requireRole } = require('../middleware/auth');
+
+router.post('/owner/password', loginLimiter, requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    res.json(await service.changeOwnerPassword(req.auth.ownerId, req.body));
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post('/owner/register', registerLimiter, async (req, res, next) => {
   try {

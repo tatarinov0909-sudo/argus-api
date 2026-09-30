@@ -64,6 +64,11 @@ const POINTS_TTL_MS = 6 * 60 * 60 * 1000;
 // WB — сбой, а не «пунктов нет»: его не запоминаем, спросим в следующий раз.
 const pointsCache = new Map(); // `${warehouseId}:${companyId}` → { at, points }
 const POINTS_LIMIT = 40;
+// Один и тот же список (80 тысяч пунктов) у сотни продавцов хранился сотней
+// копий (аудит 30.09.2026). Каждый продавец по-прежнему получает только то,
+// что WB отдал его ключу, но одинаковые списки лежат в памяти один раз.
+const sharedLists = new Map(); // отпечаток списка → сам список
+const listPrint = (points) => require('crypto').createHash('sha1').update(JSON.stringify(points)).digest('hex');
 
 async function allPoints(companyId, warehouseId) {
   const key = `${warehouseId}:${companyId}`;
@@ -72,7 +77,14 @@ async function allPoints(companyId, warehouseId) {
   const token = await withTenantContext({ warehouseId },
     (client) => credentials.tokenFor(client, warehouseId, companyId, 'wb'));
   const points = await wb.shippingPoints(token, { city: '', cargoType: 1 });
-  if (Array.isArray(points) && points.length) pointsCache.set(key, { at: Date.now(), points });
+  if (Array.isArray(points) && points.length) {
+    const print = listPrint(points);
+    if (!sharedLists.has(print)) sharedLists.set(print, points);
+    pointsCache.set(key, { at: Date.now(), points: sharedLists.get(print), print });
+    // Списки, на которые больше никто не ссылается, — из памяти.
+    const used = new Set([...pointsCache.values()].map((c) => c.print));
+    for (const p of sharedLists.keys()) if (!used.has(p)) sharedLists.delete(p);
+  }
   return points || [];
 }
 
@@ -120,8 +132,10 @@ router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller')
   try {
     const ctx = tenantContextFromAuth(req.auth);
     const rows = await withTenantContext(ctx, async (client) => {
+      // ?limit= — последние N поставок (экрану актов не нужна вся история).
+      const limit = /^\d{1,4}$/.test(String(req.query.limit || '')) ? Math.min(Number(req.query.limit), 1000) : null;
       const list = await service.list(
-        client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth) },
+        client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth), limit },
       );
       // Ход сборки — строкой у поставки: «На паузе · Дима · взято 3 из 7».
       // Складу, не продавцу: имена грузчиков и их заметки — внутреннее дело.

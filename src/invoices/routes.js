@@ -61,6 +61,11 @@ router.get('/', requireAuth, async (req, res, next) => {
            -- принимать нечего (решение владельца 27.09.2026). В кабинете он
            -- остаётся — под фильтром «Откуда: из 1С».
            AND (NOT $2::boolean OR i.source_document_type IS DISTINCT FROM 'supplier_order')
+           -- Грузчику закрытое старше двух недель не нужно: он видит работу и
+           -- десяток недавно принятых. Без этого список рос бы бесконечно —
+           -- каждый уехавший заказ WB остаётся документом (аудит 30.09.2026).
+           AND (NOT $2::boolean OR i.status::text NOT IN ('completed', 'shipped')
+                OR i.created_at > now() - interval '14 days')
            -- Остальным: отменённый или завершённый на площадке заказ, с которым
            -- склад ничего не делал, — не документ склада, а шум в списке.
            AND ($2::boolean OR i.source = '1c' OR i.mp_closed_at IS NULL OR i.supply_id IS NOT NULL

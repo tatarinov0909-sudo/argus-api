@@ -23,6 +23,18 @@ exports.up = (pgm) => {
       ADD COLUMN wb_names TEXT[] NOT NULL DEFAULT '{}',
       ADD COLUMN setup_at TIMESTAMPTZ,
       ADD COLUMN wb_offices_auto_at TIMESTAMPTZ;
+    -- Чей кабинет WB подключён: WB называет его при проверке ключа. Раньше
+    -- ответ показывался один раз и забывался (аудит 30.09.2026).
+    ALTER TABLE marketplace_credentials
+      ADD COLUMN wb_seller_name TEXT,
+      ADD COLUMN wb_seller_inn TEXT;
+    -- Заказ, убранный из работы, хранится целиком — строкой заказа и его
+    -- позиций — и возвращается тем же: с тем же номером записи, статусом WB и
+    -- датами. 30.09.2026 он возвращался «как новый»: обмен статусов заново
+    -- закрывал тысячи уже закрытых заказов и засыпал журнал записями.
+    ALTER TABLE wb_foreign_orders
+      ADD COLUMN invoice_row JSONB,
+      ADD COLUMN item_rows JSONB;
     -- Склад, у которого уже идёт обмен с 1С, ведёт учёт в 1С.
     UPDATE warehouses w SET stock_source = '1c'
      WHERE EXISTS (SELECT 1 FROM products p WHERE p.warehouse_id = w.id AND p.stock_qty_1c IS NOT NULL);
@@ -31,6 +43,8 @@ exports.up = (pgm) => {
 
 exports.down = (pgm) => {
   pgm.sql(`
+    ALTER TABLE wb_foreign_orders DROP COLUMN IF EXISTS invoice_row, DROP COLUMN IF EXISTS item_rows;
+    ALTER TABLE marketplace_credentials DROP COLUMN IF EXISTS wb_seller_name, DROP COLUMN IF EXISTS wb_seller_inn;
     ALTER TABLE warehouses
       DROP COLUMN IF EXISTS stock_source, DROP COLUMN IF EXISTS timezone,
       DROP COLUMN IF EXISTS wb_supplies_by, DROP COLUMN IF EXISTS wb_names,

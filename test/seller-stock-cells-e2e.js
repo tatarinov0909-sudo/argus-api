@@ -106,6 +106,23 @@ function check(name, fn) {
     const [y, m, d] = require('../src/warehouses/time').todayIn(zone).split('-');
     check('номер поставки — по дню в поясе склада', () => assert.ok(supply.number.startsWith(`ПС-${d}${m}${y.slice(2)}-`), supply.number));
 
+    // Смена пароля владельцем из кабинета.
+    const email = `cells${stamp}@test.local`;
+    const wrong = await api('POST', '/api/auth/owner/password', { token: owner, body: { currentPassword: 'nope1234', newPassword: 'newsecret123' } });
+    const short = await api('POST', '/api/auth/owner/password', { token: owner, body: { currentPassword: 'secret123', newPassword: '123' } });
+    const changed = await api('POST', '/api/auth/owner/password', { token: owner, body: { currentPassword: 'secret123', newPassword: 'newsecret123' } });
+    const oldLogin = await api('POST', '/api/auth/owner/login', { body: { email, password: 'secret123' } });
+    const newLogin = await api('POST', '/api/auth/owner/login', { body: { email, password: 'newsecret123' } });
+    const bySeller = await api('POST', '/api/auth/owner/password', { token: seller, body: { currentPassword: 'x', newPassword: 'yyyyyyyy' } });
+    check('пароль: неверный старый и короткий новый не принимаются, смена работает', () => {
+      assert.equal(wrong.status, 400);
+      assert.equal(short.status, 400);
+      assert.equal(changed.status, 200, JSON.stringify(changed.body));
+      assert.equal(oldLogin.status, 401);
+      assert.equal(newLogin.status, 200);
+      assert.equal(bySeller.status, 403);
+    });
+
     const totals = await must('GET', '/api/warehouses/me/stock-sources', { token: owner });
     check('сверка перед сменой учёта: в ячейках 100, по 1С 0', () => {
       assert.equal(totals.cells, 100);

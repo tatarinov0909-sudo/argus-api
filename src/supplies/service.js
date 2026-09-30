@@ -622,7 +622,7 @@ async function stockCover(client, warehouseId, companyId = null) {
   return { shortInvoices, take, onHand, reserved };
 }
 
-async function list(client, warehouseId, { status = null, showShortages = false } = {}) {
+async function list(client, warehouseId, { status = null, showShortages = false, limit = null } = {}) {
   // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
   // в запросе роняло его целиком, и человек получал «внутреннюю ошибку»
   // там, где должен получить «такого статуса нет».
@@ -658,8 +658,9 @@ async function list(client, warehouseId, { status = null, showShortages = false 
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
       GROUP BY s.id, c.name, cb.actor_type, cb.actor_name
-      ORDER BY s.created_at DESC`,
-    [warehouseId, status, showShortages === true],
+      ORDER BY s.created_at DESC
+      LIMIT $4`,
+    [warehouseId, status, showShortages === true, limit],
   );
   // Сколько заказов поставки, по учёту, собрать не из чего.
   const { shortInvoices } = await stockCover(client, warehouseId);

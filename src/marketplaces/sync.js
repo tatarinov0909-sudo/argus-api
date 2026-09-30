@@ -96,6 +96,12 @@ async function pullWildberries(client, warehouseId, { companyId }) {
   await credentials.markUsed(client, warehouseId, companyId, 'wb');
   // Склады продавца: заказы складов других фулфилментов — не в работу.
   const warehouses = await optional(client, () => sellerWarehouses.refresh(client, warehouseId, companyId, token, { orders }));
+  // Пункты приёмки, если ещё не решены: Аргус добавляет их сам по складам с
+  // именем фулфилмента — в том числе на складе, только что обновлённом.
+  await optional(client, () => sellerWarehouses.ensureOffices(client, warehouseId));
+  // Вернуть заказы складов, ставших нашими, — до приёма очереди: иначе заказ
+  // из очереди завёлся бы заново рядом со своим снимком.
+  const restored = await optional(client, () => sellerWarehouses.settle(client, warehouseId, companyId, { importOrders }));
   const policy = await sellerWarehouses.policy(client, warehouseId, companyId);
   const foreign = orders.filter((o) => policy.isForeign(o.warehouseId));
   const imported = await importOrders(client, warehouseId, {
@@ -108,7 +114,9 @@ async function pullWildberries(client, warehouseId, { companyId }) {
   // Чего нет в матрице, связываем по штрихкоду — и новое, и зависшее раньше.
   const autoLinked = await mapping.autoLink(client, warehouseId, companyId, 'wb');
   return {
-    ...imported, seen: orders.length, foreign: foreign.length, warehouses, history, settled, stocks,
+    ...imported, seen: orders.length, foreign: foreign.length, warehouses, history,
+    settled: { hidden: (restored?.hidden || 0) + (settled?.hidden || 0), restored: (restored?.restored || 0) + (settled?.restored || 0),
+      error: restored?.error || settled?.error }, stocks,
     autoLinked, statuses: await statuses.reconcile(client, warehouseId, companyId, token),
   };
 }
@@ -246,6 +254,32 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
   };
 }
 
+// Каждый продавец — в своей короткой транзакции, по нескольку одновременно
+// (аудит 30.09.2026): одна транзакция на весь склад держала заказы всех его
+// продавцов, пока WB отвечал по каждому, — у менеджеров подвисали кнопки, а
+// при 10 складах проход растягивался на десятки минут. run(fn) — выполнить
+// fn(client) в контексте склада (withTenantContext).
+// ponytail: запросы к WB всё ещё внутри транзакции продавца; следующий шаг —
+// читать WB до транзакции, как в supplies/wbHandoff.js.
+const PARALLEL = 4;
+async function pullSellers(run, warehouseId, companyIds) {
+  const results = new Array(companyIds.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < companyIds.length) {
+      const k = next++;
+      try {
+        results[k] = { companyId: companyIds[k],
+          ...await run((client) => pullWildberries(client, warehouseId, { companyId: companyIds[k] })) };
+      } catch (err) {
+        results[k] = { companyId: companyIds[k], marketplace: 'wb', error: err.message };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL, companyIds.length) }, worker));
+  return results;
+}
+
 // Проход по всем подключённым продавцам склада. Ошибка у одного не должна
 // останавливать остальных: ключ мог протухнуть у кого-то одного.
 async function pullAll(client, warehouseId) {
@@ -269,4 +303,4 @@ async function pullAll(client, warehouseId) {
   return results;
 }
 
-module.exports = { pullWildberries, importOrders, pullAll, loadMapping };
+module.exports = { pullWildberries, importOrders, pullAll, pullSellers, loadMapping };

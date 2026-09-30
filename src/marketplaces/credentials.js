@@ -86,7 +86,7 @@ async function setWriteEnabled(client, warehouseId, companyId, marketplace, enab
 async function list(client, warehouseId) {
   const r = await client.query(
     `SELECT mc.id, mc.company_id, c.name AS company_name, mc.marketplace,
-            mc.write_enabled, mc.last_used_at, mc.created_at
+            mc.write_enabled, mc.last_used_at, mc.created_at, mc.wb_seller_name, mc.wb_seller_inn
      FROM marketplace_credentials mc
      JOIN companies c ON c.id = mc.company_id AND c.archived_at IS NULL
      WHERE mc.warehouse_id = $1
@@ -101,6 +101,9 @@ async function list(client, warehouseId) {
     writeEnabled: x.write_enabled,
     lastUsedAt: x.last_used_at,
     createdAt: x.created_at,
+    // Чей кабинет WB подключён — как его называет сам WB.
+    sellerName: x.wb_seller_name || null,
+    sellerInn: x.wb_seller_inn || null,
   }));
 }
 

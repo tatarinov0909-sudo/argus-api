@@ -213,7 +213,26 @@ async function loginSellerKey({ keyCode, name }) {
   });
 }
 
+// Смена пароля владельцем: старый пароль обязателен — вход могли оставить
+// открытым на чужом компьютере. Хеш меняется, только если старый не успел
+// смениться параллельно (set_owner_password сверяет его).
+async function changeOwnerPassword(ownerId, { currentPassword, newPassword } = {}) {
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+    throw new HttpError(400, 'Введите нынешний и новый пароль');
+  }
+  if (newPassword.length < 8 || newPassword.length > 200) throw new HttpError(400, 'Новый пароль — не меньше 8 символов');
+  return withoutTenantContext(async (client) => {
+    const oldHash = (await client.query('SELECT owner_password_hash($1) AS h', [ownerId])).rows[0]?.h;
+    if (!oldHash || !(await bcrypt.compare(currentPassword, oldHash))) throw new HttpError(400, 'Нынешний пароль неверный');
+    const newHash = await bcrypt.hash(newPassword, 12);
+    const ok = (await client.query('SELECT set_owner_password($1, $2, $3) AS ok', [ownerId, oldHash, newHash])).rows[0]?.ok;
+    if (!ok) throw new HttpError(409, 'Пароль только что поменяли в другом месте — войдите заново');
+    return { changed: true };
+  });
+}
+
 module.exports = {
+  changeOwnerPassword,
   registerOwner,
   loginOwner,
   loginStaffKey,

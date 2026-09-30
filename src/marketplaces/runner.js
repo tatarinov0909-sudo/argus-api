@@ -37,9 +37,11 @@ async function runOnce() {
   let done = 0;
   for (const warehouseId of ids) {
     try {
-      const results = await withTenantContext({ warehouseId }, (client) => (
-        sync.pullAll(client, warehouseId)
-      ));
+      const pairs = (await withTenantContext({ warehouseId }, (client) => credentials.list(client, warehouseId)))
+        .filter((p) => p.marketplace === 'wb');
+      const names = new Map(pairs.map((p) => [p.companyId, p.company]));
+      const results = (await sync.pullSellers((fn) => withTenantContext({ warehouseId }, fn), warehouseId,
+        pairs.map((p) => p.companyId))).map((r) => ({ ...r, company: names.get(r.companyId) }));
       for (const r of results) {
         if (r.error) {
           console.error(`маркетплейсы: ${r.company} — ${r.error}`);
@@ -57,8 +59,7 @@ async function runOnce() {
         if (r.statuses?.closed) console.log(`маркетплейсы: ${r.company} — закрыто по WB ${r.statuses.closed}, на сверку ${r.statuses.conflicts}`);
       }
       // Separate transactions: a catalog failure cannot roll back received orders.
-      const pairs = await withTenantContext({ warehouseId }, client => credentials.list(client, warehouseId));
-      for (const pair of pairs.filter(p => p.marketplace === 'wb')) {
+      for (const pair of pairs) {
         try { await withTenantContext({ warehouseId }, client => syncPhotos(client, warehouseId, pair.companyId)); }
         catch { console.error('маркетплейсы: не удалось обновить кэш фотографий'); }
         // Без категории «Контент» у ключа — фото из открытого хранилища WB.

@@ -71,6 +71,15 @@ router.get('/wb/offices', async (req, res, next) => {
 
 // Пункт приёмки влияет на то, чьи заказы Аргус берёт в работу у всех
 // продавцов сразу, — поэтому за тем же правом, что и ключи площадок.
+router.put('/wb/offices', requireGrant('marketplaces'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    if (typeof req.body?.on !== 'boolean') throw new HttpError(400, 'Передайте on: true или false');
+    res.json(await withTenantContext({ warehouseId }, async (c) => sellerWarehouses.setOffices(
+      c, warehouseId, req.body.ids, req.body.on, await staffActor(c, req.auth), { importOrders: sync.importOrders })));
+  } catch (err) { next(err); }
+});
+
 router.put('/wb/offices/:officeId', requireGrant('marketplaces'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
@@ -177,10 +186,18 @@ router.post('/credentials', requireGrant('marketplaces'), async (req, res, next)
 
     const who = await wb.sellerInfo(token);
 
-    const saved = await withTenantContext({ warehouseId }, (c) => (
-      credentials.save(c, warehouseId, { companyId, marketplace, token })
-    ));
-    res.status(201).json({ ...saved, seller: who });
+    const saved = await withTenantContext({ warehouseId }, async (c) => {
+      const out = await credentials.save(c, warehouseId, { companyId, marketplace, token });
+      await c.query(`UPDATE marketplace_credentials SET wb_seller_name = $3, wb_seller_inn = $4
+        WHERE warehouse_id = $1 AND company_id = $2 AND marketplace = 'wb'`,
+      [warehouseId, companyId, who.name || null, who.inn || null]);
+      return out;
+    });
+    // Склады продавца — сразу, а не через пять минут: сразу после ключа
+    // человек идёт отмечать, куда возит. Сбой здесь не отменяет подключение.
+    const warehouses = await withTenantContext({ warehouseId }, (c) => sellerWarehouses.refresh(
+      c, warehouseId, companyId, token, { force: true })).catch((err) => ({ error: err.message }));
+    res.status(201).json({ ...saved, seller: who, warehouses });
   } catch (err) { next(err); }
 });
 
@@ -225,6 +242,9 @@ router.get('/:companyId/wb/check', async (req, res, next) => {
       const token = await credentials.tokenFor(c, warehouseId, companyId, 'wb');
       const [seller, whs] = await Promise.all([wb.sellerInfo(token), wb.warehouses(token)]);
       await credentials.markUsed(c, warehouseId, companyId, 'wb');
+      await c.query(`UPDATE marketplace_credentials SET wb_seller_name = $3, wb_seller_inn = $4
+        WHERE warehouse_id = $1 AND company_id = $2 AND marketplace = 'wb'`,
+      [warehouseId, companyId, seller.name || null, seller.inn || null]);
       return { seller, warehouses: whs };
     });
     res.json(out);
@@ -237,11 +257,17 @@ router.post('/sync', async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     const { companyId } = req.body || {};
-    const out = await withTenantContext({ warehouseId }, (c) => (
-      companyId
-        ? sync.pullWildberries(c, warehouseId, { companyId })
-        : sync.pullAll(c, warehouseId)
-    ));
+    let out;
+    if (companyId) {
+      out = await withTenantContext({ warehouseId }, (c) => sync.pullWildberries(c, warehouseId, { companyId }));
+    } else {
+      // Все продавцы — каждый в своей транзакции, как в фоновом обмене.
+      const pairs = (await withTenantContext({ warehouseId }, (c) => credentials.list(c, warehouseId)))
+        .filter((p) => p.marketplace === 'wb');
+      const names = new Map(pairs.map((p) => [p.companyId, p.company]));
+      out = (await sync.pullSellers((fn) => withTenantContext({ warehouseId }, fn), warehouseId,
+        pairs.map((p) => p.companyId))).map((r) => ({ ...r, company: names.get(r.companyId) }));
+    }
     res.json(out);
   } catch (err) { next(err); }
 });
