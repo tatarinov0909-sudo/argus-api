@@ -11,6 +11,8 @@ const { loadStock, BUCKET_SQL } = require('./stock');
 const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
+const sellerWarehouses = require('../marketplaces/sellerWarehouses');
+const sync = require('../marketplaces/sync');
 const router = express.Router();
 
 // A seller receives only the quantities needed to run the shop. Accounting
@@ -203,6 +205,60 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
       ORDER BY s.sku,l.nm_id`, [companyId])).rows;
     });
     res.set('Cache-Control', 'no-store').json({ products: combineCatalog(rows) });
+  } catch (err) { next(err); }
+});
+
+// Склады продавца на WB: какие из них у нашего фулфилмента и сколько он
+// выставил на WB по каждому (только чтение WB, кэш обмена — в WB отсюда не
+// ходим). Продавец сам отмечает, какие склады наши.
+//
+// Строки пунктов приёмки и ключей продавцу по изоляции не видны, поэтому,
+// убедившись, что компания своя, читаем в контексте её склада — только по
+// этой компании.
+async function sellerWarehouseOf(req) {
+  const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+  if (!companyId) throw new HttpError(400, 'Укажите продавца');
+  const company = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => (
+    await c.query('SELECT id, name, warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0]);
+  if (!company) throw new HttpError(404, 'Компания не найдена');
+  return company;
+}
+
+router.get('/wb-warehouses', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const company = await sellerWarehouseOf(req);
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
+      const info = await sellerWarehouses.list(c, company.warehouse_id, company.id);
+      // Размер WB → наш товар: по заказам, где размер записан; у размера,
+      // встречавшегося под разными кодами, — самый частый.
+      const levels = (await c.query(
+        `WITH sizes AS (
+           SELECT DISTINCT ON (ii.mp_chrt_id) ii.mp_chrt_id AS chrt_id, ii.sku
+             FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
+            WHERE ii.warehouse_id = $1 AND ii.company_id = $2 AND i.source = 'wb' AND ii.mp_chrt_id IS NOT NULL
+            GROUP BY ii.mp_chrt_id, ii.sku
+            ORDER BY ii.mp_chrt_id, count(*) DESC)
+         SELECT s.sku, l.mp_warehouse_id, sum(l.amount)::int AS amount, max(l.fetched_at) AS fetched_at
+           FROM wb_stock_levels l JOIN sizes s ON s.chrt_id = l.chrt_id
+          WHERE l.warehouse_id = $1 AND l.company_id = $2
+          GROUP BY s.sku, l.mp_warehouse_id`, [company.warehouse_id, company.id])).rows;
+      const stock = {};
+      for (const l of levels) (stock[l.sku] ||= {})[l.mp_warehouse_id] = l.amount;
+      return { ...info, stock };
+    });
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+
+router.patch('/wb-warehouses/:mpWarehouseId', requireAuth, requireRole('seller'), async (req, res, next) => {
+  try {
+    if (typeof req.body?.ours !== 'boolean') throw new HttpError(400, 'Передайте ours: true или false');
+    const company = await sellerWarehouseOf(req);
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, (c) => sellerWarehouses.setOurs(
+      c, company.warehouse_id, company.id, req.params.mpWarehouseId, req.body.ours,
+      { name: `Продавец «${company.name}»`, type: 'seller', id: req.auth.sellerKeyId || null },
+      { importOrders: sync.importOrders }));
+    res.json(out);
   } catch (err) { next(err); }
 });
 
@@ -447,9 +503,12 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
                 ii.id AS item_id, ii.name, ii.sku, ii.declared_qty AS qty, ii.mp_rid, ii.mp_nm_id, ii.mp_article,
                 ii.mp_barcode, i.mp_created_at,
                 -- Поставка заказа — по ней продавец ищет и фильтрует заказы.
-                s.number AS supply_number, s.destination AS supply_destination
+                s.number AS supply_number, s.destination AS supply_destination,
+                -- Склад продавца на WB, с которого заказ.
+                i.mp_warehouse_id, w.name AS mp_warehouse_name
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          LEFT JOIN supplies s ON s.id = i.supply_id AND s.company_id = $1
+         LEFT JOIN seller_wb_warehouses w ON w.company_id = $1 AND w.mp_warehouse_id = i.mp_warehouse_id
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
            AND ($2::text IS NULL OR ii.sku = $2)
          ORDER BY (i.status = 'shipped' OR i.mp_closed_at IS NOT NULL), i.created_at DESC, i.id, ii.id

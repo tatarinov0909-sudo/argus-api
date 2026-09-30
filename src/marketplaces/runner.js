@@ -48,6 +48,12 @@ async function runOnce() {
             + `, не сопоставлено ${r.unmapped.length}`);
         }
         if (r.statuses?.error) console.error(`маркетплейсы: ${r.company} — ${r.statuses.error}`);
+        if (r.settled?.hidden || r.settled?.restored) {
+          console.log(`маркетплейсы: ${r.company} — склады WB: убрано чужих заказов ${r.settled.hidden}, возвращено ${r.settled.restored}`);
+        }
+        for (const step of ['warehouses', 'history', 'settled', 'stocks']) {
+          if (r[step]?.error) console.error(`маркетплейсы: ${r.company} — склады WB (${step}): ${r[step].error}`);
+        }
         if (r.statuses?.closed) console.log(`маркетплейсы: ${r.company} — закрыто по WB ${r.statuses.closed}, на сверку ${r.statuses.conflicts}`);
       }
       // Separate transactions: a catalog failure cannot roll back received orders.

@@ -27,6 +27,8 @@ const DOC_TYPES = new Set(['act', 'document']);
 // который запись ссылается как на сущность: «отменил привоз» без invoice_id).
 function categoryOf(e) {
   const type = e.entity_type;
+  // Склады продавца на WB: кто бы ни отметил — обмен или человек.
+  if (type === 'wb_warehouse') return 'wb';
   if (e.agent === 'Обмен с 1С') return 'onec';
   if (e.agent === 'Обмен с WB' || e.agent === 'Сверка заказов WB') return type === 'supply' ? 'wb' : 'orders';
   // Сам приход (машина приехала, документы, переписка) — «Приходы», кто бы

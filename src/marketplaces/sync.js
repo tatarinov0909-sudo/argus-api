@@ -2,6 +2,7 @@ const wb = require('./wb');
 const credentials = require('./credentials');
 const statuses = require('./statuses');
 const mapping = require('./mapping');
+const sellerWarehouses = require('./sellerWarehouses');
 
 // Забрать заказы с площадки и превратить их в накладные склада.
 //
@@ -93,10 +94,38 @@ async function pullWildberries(client, warehouseId, { companyId }) {
   const token = await credentials.tokenFor(client, warehouseId, companyId, 'wb');
   const orders = await wb.newOrders(token);
   await credentials.markUsed(client, warehouseId, companyId, 'wb');
-  const imported = await importOrders(client, warehouseId, { companyId, orders });
+  // Склады продавца: заказы складов других фулфилментов — не в работу.
+  const warehouses = await optional(client, () => sellerWarehouses.refresh(client, warehouseId, companyId, token, { orders }));
+  const policy = await sellerWarehouses.policy(client, warehouseId, companyId);
+  const foreign = orders.filter((o) => policy.isForeign(o.warehouseId));
+  const imported = await importOrders(client, warehouseId, {
+    companyId, orders: orders.filter((o) => !policy.isForeign(o.warehouseId)),
+  });
+  await sellerWarehouses.hideOrders(client, warehouseId, companyId, foreign);
+  const history = await optional(client, () => sellerWarehouses.backfillHistory(client, warehouseId, companyId, token));
+  const settled = await optional(client, () => sellerWarehouses.settle(client, warehouseId, companyId, { importOrders }));
+  const stocks = await optional(client, () => sellerWarehouses.refreshStocks(client, warehouseId, companyId, token));
   // Чего нет в матрице, связываем по штрихкоду — и новое, и зависшее раньше.
   const autoLinked = await mapping.autoLink(client, warehouseId, companyId, 'wb');
-  return { ...imported, autoLinked, statuses: await statuses.reconcile(client, warehouseId, companyId, token) };
+  return {
+    ...imported, seen: orders.length, foreign: foreign.length, warehouses, history, settled, stocks,
+    autoLinked, statuses: await statuses.reconcile(client, warehouseId, companyId, token),
+  };
+}
+
+// Шаг, без которого заказы всё равно надо принять: ошибка в нём откатывается
+// до точки сохранения и возвращается текстом, а не роняет весь обмен.
+async function optional(client, fn) {
+  await client.query('SAVEPOINT wb_optional');
+  try {
+    const out = await fn();
+    await client.query('RELEASE SAVEPOINT wb_optional');
+    return out;
+  } catch (err) {
+    await client.query('ROLLBACK TO SAVEPOINT wb_optional');
+    await client.query('RELEASE SAVEPOINT wb_optional');
+    return { error: err.message };
+  }
 }
 
 // Сохранение заказов отдельно от их получения.
@@ -132,12 +161,13 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
 
     const inserted = await client.query(
       `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, external_id,
-                             mp_created_at, mp_offices, mp_sale_price_kopecks)
-       VALUES ($1, $2, $3, 'out', 'wb', $4, $5, $6, $7)
+                             mp_created_at, mp_offices, mp_sale_price_kopecks, mp_warehouse_id)
+       VALUES ($1, $2, $3, 'out', 'wb', $4, $5, $6, $7, $8)
        ON CONFLICT DO NOTHING
        RETURNING id`,
       [warehouseId, companyId, `WB-${order.externalId}`, order.externalId,
-        order.createdAt || null, order.offices || [], order.salePriceKopecks ?? null],
+        order.createdAt || null, order.offices || [], order.salePriceKopecks ?? null,
+        order.warehouseId || null],
     );
     if (!inserted.rows[0]) {
       existed += 1;
@@ -149,13 +179,15 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
         `UPDATE invoices
             SET mp_created_at = COALESCE(mp_created_at, $3::timestamptz),
                 mp_offices = COALESCE(mp_offices, $4::text[]),
-                mp_sale_price_kopecks = COALESCE(mp_sale_price_kopecks, $5::bigint)
+                mp_sale_price_kopecks = COALESCE(mp_sale_price_kopecks, $5::bigint),
+                mp_warehouse_id = COALESCE(mp_warehouse_id, $6::text)
           WHERE warehouse_id = $1 AND external_id = $2 AND source = 'wb'
             AND ((mp_created_at IS NULL AND $3::timestamptz IS NOT NULL)
                  OR mp_offices IS NULL
-                 OR (mp_sale_price_kopecks IS NULL AND $5::bigint IS NOT NULL))`,
+                 OR (mp_sale_price_kopecks IS NULL AND $5::bigint IS NOT NULL)
+                 OR (mp_warehouse_id IS NULL AND $6::text IS NOT NULL))`,
         [warehouseId, order.externalId, order.createdAt || null, order.offices || [],
-          order.salePriceKopecks ?? null],
+          order.salePriceKopecks ?? null, order.warehouseId || null],
       );
       // Заказ уже заведён — но, возможно, ещё до того, как мы стали сохранять
       // поля площадки. Дозаполняем, пока он в очереди: уйдёт из неё — взять
@@ -166,14 +198,16 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
             SET mp_rid     = COALESCE(ii.mp_rid, $3),
                 mp_article = COALESCE(ii.mp_article, $4),
                 mp_barcode = COALESCE(ii.mp_barcode, $5),
-                mp_nm_id   = COALESCE(ii.mp_nm_id, $6)
+                mp_nm_id   = COALESCE(ii.mp_nm_id, $6),
+                mp_chrt_id = COALESCE(ii.mp_chrt_id, $7)
           FROM invoices i
          WHERE i.id = ii.invoice_id
            AND ii.warehouse_id = $1
            AND i.external_id = $2
            AND i.source = 'wb'
            AND (ii.mp_rid IS NULL OR ii.mp_article IS NULL
-                OR ii.mp_barcode IS NULL OR ii.mp_nm_id IS NULL)
+                OR ii.mp_barcode IS NULL OR ii.mp_nm_id IS NULL
+                OR (ii.mp_chrt_id IS NULL AND $7::text IS NOT NULL))
            -- Только когда в накладной ровно одна позиция. Номер отправления
            -- уникален на складе, и записать его в две позиции сразу значит
            -- нарушить индекс и уронить весь проход обмена, а не одну строку.
@@ -181,7 +215,7 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
            -- честно ничего не заполнится, а не сломается молча.
            AND (SELECT count(*) FROM invoice_items x WHERE x.invoice_id = i.id) = 1`,
         [warehouseId, order.externalId, order.rid || null, order.article || null,
-          (order.barcodes && order.barcodes[0]) || null, order.nmId || null],
+          (order.barcodes && order.barcodes[0]) || null, order.nmId || null, order.chrtId || null],
       );
       continue;
     }
@@ -194,11 +228,11 @@ async function importOrders(client, warehouseId, { companyId, orders }) {
     await client.query(
       `INSERT INTO invoice_items
          (invoice_id, warehouse_id, company_id, name, sku, declared_qty,
-          mp_rid, mp_article, mp_barcode, mp_nm_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          mp_rid, mp_article, mp_barcode, mp_nm_id, mp_chrt_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [inserted.rows[0].id, warehouseId, companyId, lineName, lineSku, QTY_PER_ORDER,
         order.rid || null, order.article || null,
-        (order.barcodes && order.barcodes[0]) || null, order.nmId || null],
+        (order.barcodes && order.barcodes[0]) || null, order.nmId || null, order.chrtId || null],
     );
     created += 1;
   }

@@ -106,13 +106,16 @@ const FAKE_TOKEN = 'eyJhbGciOiJFUzI1NiJ9.fake-token-for-tests.signature';
       const present = forbidden.filter((n) => typeof wb[n] === 'function');
       assert.deepEqual(present, [], `появились методы записи: ${present.join(', ')}`);
     });
-    check('в исходнике нет PUT, PATCH и DELETE; POST только для чтения каталога и статусов', () => {
+    check('в исходнике нет PUT, PATCH и DELETE; POST только для чтения каталога, статусов и остатков', () => {
       const src = require('fs').readFileSync(require.resolve('../src/marketplaces/wb.js'), 'utf8');
       const calls = src.match(/method:\s*'(PUT|PATCH|DELETE)'/g) || [];
       assert.deepEqual(calls, [], `найдены изменяющие вызовы: ${calls.join(', ')}`);
-      assert.equal((src.match(/method:\s*'POST'/g)||[]).length, 2);
+      assert.equal((src.match(/method:\s*'POST'/g)||[]).length, 3);
       assert.ok(src.includes("'/content/v2/get/cards/list'"));
       assert.ok(src.includes("'/api/v3/orders/status'"));
+      // Остатки: POST /api/v3/stocks/{склад} — «получить»; менять их WB
+      // позволяет только PUT (обновить) и DELETE (удалить).
+      assert.ok(src.includes('`/api/v3/stocks/${warehouseId}`'));
     });
 
     // ---------- Подготовка склада ----------

@@ -7,6 +7,7 @@ const mapping = require('./mapping');
 const sync = require('./sync');
 const wb = require('./wb');
 const reconciliation = require('./reconciliation');
+const sellerWarehouses = require('./sellerWarehouses');
 
 const router = express.Router();
 
@@ -50,6 +51,63 @@ router.get('/', async (req, res, next) => {
     res.json(rows);
   } catch (err) { next(err); }
 });
+
+/* ============ Склады WB ============
+   Пункты приёмки, куда возит фулфилмент, и склады продавцов на WB. Всё —
+   только чтение WB: меняется лишь то, какие заказы Аргус берёт в работу. */
+
+const staffActor = async (c, auth) => {
+  if (auth.role === 'owner') return { name: 'Руководитель склада', type: 'owner', id: auth.ownerId || null };
+  const s = (await c.query('SELECT name FROM staff_keys WHERE id = $1', [auth.staffKeyId])).rows[0];
+  return { name: s ? `Менеджер ${s.name}` : 'Менеджер склада', type: 'manager', id: auth.staffKeyId || null };
+};
+
+router.get('/wb/offices', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, (c) => sellerWarehouses.listOffices(c, warehouseId)));
+  } catch (err) { next(err); }
+});
+
+// Пункт приёмки влияет на то, чьи заказы Аргус берёт в работу у всех
+// продавцов сразу, — поэтому за тем же правом, что и ключи площадок.
+router.put('/wb/offices/:officeId', requireGrant('marketplaces'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    if (typeof req.body?.on !== 'boolean') throw new HttpError(400, 'Передайте on: true или false');
+    res.json(await withTenantContext({ warehouseId }, async (c) => sellerWarehouses.setOffice(
+      c, warehouseId, req.params.officeId, req.body.on, await staffActor(c, req.auth),
+      { importOrders: sync.importOrders })));
+  } catch (err) { next(err); }
+});
+
+router.get('/:companyId/wb/warehouses', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, async (c) => {
+      await companyOfWarehouse(c, warehouseId, req.params.companyId);
+      return sellerWarehouses.list(c, warehouseId, req.params.companyId);
+    }));
+  } catch (err) { next(err); }
+});
+
+router.patch('/:companyId/wb/warehouses/:mpWarehouseId', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    if (typeof req.body?.ours !== 'boolean') throw new HttpError(400, 'Передайте ours: true или false');
+    res.json(await withTenantContext({ warehouseId }, async (c) => {
+      await companyOfWarehouse(c, warehouseId, req.params.companyId);
+      return sellerWarehouses.setOurs(c, warehouseId, req.params.companyId, req.params.mpWarehouseId,
+        req.body.ours, await staffActor(c, req.auth), { importOrders: sync.importOrders });
+    }));
+  } catch (err) { next(err); }
+});
+
+async function companyOfWarehouse(c, warehouseId, companyId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(companyId))) throw new HttpError(404, 'Продавец не найден');
+  const r = await c.query('SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2', [companyId, warehouseId]);
+  if (!r.rows[0]) throw new HttpError(404, 'Продавец не найден');
+}
 
 /* ============ Сопоставление артикулов ============
    Объявлено выше `/:companyId/:marketplace`: у `DELETE /mapping/<id>`

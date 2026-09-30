@@ -157,7 +157,9 @@ async function create(client, warehouseId, {
 
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
-            i.source, i.external_id, c.name AS company_name,
+            i.source, i.external_id, c.name AS company_name, i.mp_warehouse_id,
+            (SELECT w.name FROM seller_wb_warehouses w WHERE w.company_id = i.company_id
+               AND w.mp_warehouse_id = i.mp_warehouse_id) AS mp_warehouse_name,
             ${WB_CONFIRMED_SQL} AS wb_confirmed,
             (NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
              OR EXISTS (SELECT 1 FROM invoice_items ii
@@ -189,6 +191,15 @@ async function create(client, warehouseId, {
   const companies = [...new Set(orders.rows.map((o) => o.company_id))];
   if (companies.length > 1) {
     throw new HttpError(400, 'В одной поставке заказы только одного продавца');
+  }
+  // WB принимает в поставку заказы только одного склада продавца — иначе
+  // заказы другого склада не добавятся в поставку на WB. Склад, которого мы
+  // ещё не знаем (null), не спорит ни с одним.
+  const wbWarehouses = [...new Map(orders.rows.filter((o) => o.mp_warehouse_id)
+    .map((o) => [o.mp_warehouse_id, o.mp_warehouse_name || `склад WB ${o.mp_warehouse_id}`])).values()];
+  if (wbWarehouses.length > 1) {
+    throw new HttpError(400, `В одной поставке WB — заказы только одного склада WB, а выбраны заказы `
+      + `${wbWarehouses.length} складов: ${wbWarehouses.map((n) => `«${n}»`).join(', ')}. Составьте поставку на каждый склад.`);
   }
   // Несобираемый заказ в поставку не берём — и решает это сервер, а не экран.
   // Экран уже фильтровал такие заказы и всё равно пропустил 36: он спрашивал
@@ -720,12 +731,14 @@ async function pendingOrders(client, warehouseId, companyId) {
     `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
             i.mp_created_at, i.mp_offices, i.mp_sale_price_kopecks,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
-            ii.mp_nm_id, ii.mp_rid,
+            ii.mp_nm_id, ii.mp_rid, i.mp_warehouse_id, w.name AS mp_warehouse_name,
             CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
             ${WB_CONFIRMED_SQL} AS wb_confirmed
        FROM invoices i
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+       LEFT JOIN seller_wb_warehouses w ON w.warehouse_id = i.warehouse_id
+             AND w.company_id = i.company_id AND w.mp_warehouse_id = i.mp_warehouse_id
       WHERE i.warehouse_id = $1
         AND i.company_id = $2
         AND i.direction = 'out'
@@ -778,6 +791,9 @@ async function pendingOrders(client, warehouseId, companyId) {
     barcode: x.mp_barcode,
     nmId: x.mp_nm_id,
     rid: x.mp_rid,
+    // Склад продавца на WB, с которого заказ (null — ещё не узнали).
+    wbWarehouseId: x.mp_warehouse_id,
+    wbWarehouse: x.mp_warehouse_name || (x.mp_warehouse_id ? `Склад WB ${x.mp_warehouse_id}` : null),
     // Собирать нечего, пока товар не сопоставлен с номенклатурой склада.
     //
     // Проверяется наличие товара в номенклатуре, а не наличие строки `sku`.

@@ -85,8 +85,35 @@ async function sellerInfo(token) {
 async function warehouses(token) {
   const r = await call(token, 'marketplace', '/api/v3/warehouses');
   return (r || []).map((w) => ({
-    id: w.id, name: w.name, officeId: w.officeId, cargoType: w.cargoType,
+    id: w.id, name: w.name, officeId: w.officeId, cargoType: w.cargoType, deliveryType: w.deliveryType,
   }));
+}
+
+// Пункты приёмки WB — куда привязан склад продавца: город и адрес.
+async function offices(token) {
+  const r = await call(token, 'marketplace', '/api/v3/offices');
+  return (r || []).map((o) => ({ id: o.id, name: o.name, city: o.city, address: o.address }));
+}
+
+// История заказов за период (не больше 30 дней, не старше 3 месяцев):
+// у заказов, заведённых до 30.09.2026, не сохранён склад — узнаём его здесь.
+// Постранично: next из ответа — курсор следующей страницы.
+async function ordersHistory(token, { dateFrom, dateTo, next = 0, limit = 1000 }) {
+  const q = new URLSearchParams({ limit: String(limit), next: String(next),
+    dateFrom: String(dateFrom), dateTo: String(dateTo) });
+  const r = await call(token, 'marketplace', `/api/v3/orders?${q}`);
+  return { next: r?.next ?? 0, orders: (r?.orders || []).map(normalizeOrder) };
+}
+
+// Остатки продавца на его складе WB — ЧТЕНИЕ. У WB тот же адрес и для
+// записи, но другим методом: PUT меняет остатки, DELETE обнуляет. Здесь
+// только POST «получить остатки», и другого метода в этом модуле нет.
+async function stocks(token, warehouseId, chrtIds) {
+  if (!/^\d+$/.test(String(warehouseId))) throw new HttpError(400, 'Неверный номер склада WB');
+  const r = await call(token, 'marketplace', `/api/v3/stocks/${warehouseId}`, {
+    method: 'POST', body: { chrtIds: chrtIds.map(Number) },
+  });
+  return (r?.stocks || []).map((s) => ({ chrtId: String(s.chrtId), amount: Number(s.amount) || 0 }));
 }
 
 // Новые сборочные задания — то, ради чего всё и делается.
@@ -119,6 +146,8 @@ function normalizeOrder(o) {
     // заказ, без захода в кабинет площадки.
     offices: Array.isArray(o.offices) ? o.offices.map(String).filter(Boolean) : [],
     warehouseId: o.warehouseId == null ? null : String(o.warehouseId),
+    // Размер карточки: по нему WB отдаёт остаток склада.
+    chrtId: o.chrtId == null ? null : String(o.chrtId),
     deliveryType: o.deliveryType || null,
     // Требования площадки к позиции: маркировка «Честного ЗНАКа» и прочее.
     // Не используем, но сохраняем: по ним видно, какие товары мы физически не
@@ -168,5 +197,6 @@ async function shippingPoints(token, { city = 'Москва', cargoType = 1 } = 
 }
 
 module.exports = {
-  sellerInfo, warehouses, newOrders, productCards, orderStatuses, shippingPoints, call, HOSTS,
+  sellerInfo, warehouses, offices, newOrders, ordersHistory, stocks, productCards, orderStatuses,
+  shippingPoints, normalizeOrder, call, HOSTS,
 };
