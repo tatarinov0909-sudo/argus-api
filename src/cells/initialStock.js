@@ -32,6 +32,7 @@ const { refreshCellFill } = require('./fill');
 const { formatBlockLabel } = require('./label');
 const { plural } = require('../journal/plural');
 const journal = require('../journal/repository');
+const { zoneOf } = require('../warehouses/time');
 
 // Столько строк за раз. У склада ячеек несколько тысяч; больше — частями,
 // и каждая часть атомарна.
@@ -267,7 +268,8 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
       [warehouseId, cellIds],
     );
     const busy = new Set(counting.rows.map((c) => c.cell_block_id));
-    const day = (at) => new Date(at).toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' });
+    const zone = await zoneOf(client, warehouseId);
+    const day = (at) => new Date(at).toLocaleDateString('ru-RU', { timeZone: zone });
     for (const l of lines) {
       if (l.error || !l.cellId) continue;
       const key = keyOf(l.cellId, l.sku, l.quality);
@@ -510,7 +512,7 @@ async function undo(client, warehouseId, batch, { ownerId }) {
   for (const id of cellIds) await refreshCellFill(client, id);
 
   const units = ops.rows.reduce((s, o) => s + Number(o.qty), 0);
-  const when = new Date(ops.rows[0].created_at).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow',
+  const when = new Date(ops.rows[0].created_at).toLocaleString('ru-RU', { timeZone: await zoneOf(client, warehouseId),
     day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   await journal.createEntry(client, {
     warehouseId,

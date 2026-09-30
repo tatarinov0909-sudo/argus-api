@@ -10,13 +10,15 @@ const { HttpError } = require('../middleware/errorHandler');
 // отмеченных «наш»; заказы чужих складов не удаляются, а лежат в
 // wb_foreign_orders и возвращаются, если склад отметят нашим.
 //
-// «Наш» ставит человек (менеджер склада или продавец) или правило: склад
-// стоит на пункте приёмки, куда возит фулфилмент (ff_wb_offices), и в его
-// названии есть имя фулфилмента. Решение человека правило не трогает.
+// «Наш» ставит человек (менеджер склада или продавец) или правило (autoOurs).
+// Решение человека правило не трогает.
 //
-// Пока у продавца ни один склад не отмечен нашим, Аргус забирает заказы со
-// всех складов, как раньше, — иначе новый продавец молча остался бы без
-// заказов, пока кто-то не расставит галочки.
+// Заказы берутся только со складов, отмеченных нашими (владелец 30.09.2026):
+// иначе новый фулфилмент, подключив продавца, работающего с несколькими ФФ,
+// видел и собирал бы чужие заказы. Пока пункты приёмки не указаны, заказов
+// нет — и кабинет просит их указать. Чтобы это не было лишним шагом, при
+// первом чтении складов Аргус сам добавляет пункты, где у продавцов стоят
+// склады с именем фулфилмента (autoOffices).
 
 const HOUR = 60 * 60 * 1000;
 const REFRESH_MS = 6 * HOUR;          // список складов меняется редко
@@ -30,20 +32,30 @@ const BATCH = 2000;
 const norm = (s) => ` ${String(s || '').toLowerCase().replace(/ё/g, 'е')
   .replace(/[^a-zа-я0-9]+/g, ' ').trim()} `;
 
-// Правило «наш склад». Одного признака мало: пункт приёмки у многих
-// фулфилментов общий (Коледино), а название продавец пишет сам.
-function autoOurs(w, { ffName, officeIds }) {
-  const name = norm(ffName);
-  if (name.trim().length < 3) return false;
-  return officeIds.has(String(w.office_id)) && norm(w.name).includes(name);
+// Есть ли в названии склада продавца имя фулфилмента (название склада в
+// Аргусе или одно из имён «как нас называют продавцы»).
+const nameMatches = (name, { names }) => names.some((n) => norm(name).includes(n));
+
+// Правило «наш склад»: склад стоит на пункте приёмки, куда возит фулфилмент,
+// и либо в названии есть его имя, либо у продавца на наших пунктах нет ни
+// одного склада с нашим именем. Пример: у Авезова на Коледино «ФФ Восход ЮГ»
+// и ещё чей-то склад — наш только первый (пункт общий у многих ФФ); у
+// «Слим Тим» на Коледино один склад «ФФ Восток» — значит, наш.
+// ponytail: эвристика по названию; ошиблась — человек ставит галочку, и
+// правило больше этот склад не трогает.
+function autoOurs(w, ctx, sellerHasNamed) {
+  if (!ctx.officeIds.has(String(w.office_id))) return false;
+  return nameMatches(w.name, ctx) || !sellerHasNamed;
 }
 
 async function ffContext(client, warehouseId) {
   const [wh, offices] = await Promise.all([
-    client.query('SELECT name FROM warehouses WHERE id = $1', [warehouseId]),
+    client.query('SELECT name, wb_names FROM warehouses WHERE id = $1', [warehouseId]),
     client.query('SELECT office_id FROM ff_wb_offices WHERE warehouse_id = $1', [warehouseId]),
   ]);
-  return { ffName: wh.rows[0]?.name || '', officeIds: new Set(offices.rows.map((r) => String(r.office_id))) };
+  const ffName = wh.rows[0]?.name || '';
+  const names = [...new Set([ffName, ...(wh.rows[0]?.wb_names || [])].map(norm).filter((n) => n.trim().length >= 3))];
+  return { ffName, names, officeIds: new Set(offices.rows.map((r) => String(r.office_id))) };
 }
 
 const companyName = async (client, companyId) => (
@@ -62,14 +74,49 @@ const quoted = (names, max = 6) => names.slice(0, max).map((n) => `«${n}»`).jo
 async function applyAuto(client, warehouseId, companyId = null) {
   const ctx = await ffContext(client, warehouseId);
   const rows = (await client.query(
-    `SELECT id, company_id, name, office_id, ours FROM seller_wb_warehouses
-      WHERE warehouse_id = $1 AND decided_by IS NULL AND ($2::uuid IS NULL OR company_id = $2)`,
+    `SELECT id, company_id, name, office_id, ours, decided_by, gone_at FROM seller_wb_warehouses
+      WHERE warehouse_id = $1 AND ($2::uuid IS NULL OR company_id = $2)`,
     [warehouseId, companyId])).rows;
-  const changed = rows.filter((r) => autoOurs(r, ctx) !== r.ours).map((r) => ({ ...r, ours: !r.ours }));
+  const named = new Set(rows.filter((r) => !r.gone_at && ctx.officeIds.has(String(r.office_id)) && nameMatches(r.name, ctx))
+    .map((r) => r.company_id));
+  const changed = rows.filter((r) => r.decided_by == null && autoOurs(r, ctx, named.has(r.company_id)) !== r.ours)
+    .map((r) => ({ ...r, ours: !r.ours }));
   for (const r of changed) {
     await client.query('UPDATE seller_wb_warehouses SET ours = $2 WHERE id = $1', [r.id, r.ours]);
   }
   return changed;
+}
+
+// Пункты приёмки, куда возит фулфилмент, Аргус при первом чтении складов
+// добавляет сам: те, где у продавцов стоят склады с его именем. Один раз:
+// убрал человек пункт — Аргус его обратно не вернёт. Возвращает число
+// добавленных пунктов.
+async function autoOffices(client, warehouseId) {
+  const wh = (await client.query('SELECT wb_offices_auto_at FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
+  if (!wh || wh.wb_offices_auto_at) return 0;
+  const has = (await client.query('SELECT 1 FROM ff_wb_offices WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
+  const ctx = await ffContext(client, warehouseId);
+  const rows = has ? [] : (await client.query(
+    `SELECT office_id, max(office_name) AS name, max(office_city) AS city, max(office_address) AS address,
+            array_agg(name) AS names
+       FROM seller_wb_warehouses WHERE warehouse_id = $1 AND gone_at IS NULL AND office_id IS NOT NULL
+      GROUP BY office_id`, [warehouseId])).rows.filter((o) => o.names.some((n) => nameMatches(n, ctx)));
+  // Нечего добавить — не ставим отметку: продавец может завести склад позже.
+  if (!has && !rows.length) return 0;
+  for (const o of rows) {
+    await client.query(
+      `INSERT INTO ff_wb_offices (warehouse_id, office_id, name, city, address, added_by)
+       VALUES ($1, $2, $3, $4, $5, 'Аргус — по складам продавцов с вашим именем')
+       ON CONFLICT (warehouse_id, office_id) DO NOTHING`, [warehouseId, o.office_id, o.name, o.city, o.address]);
+  }
+  await client.query('UPDATE warehouses SET wb_offices_auto_at = now() WHERE id = $1', [warehouseId]);
+  if (rows.length) {
+    await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system', entityType: 'wb_warehouse',
+      actionText: `Аргус сам добавил пункты приёмки WB, куда вы возите, — там у продавцов склады с вашим именем: `
+        + `${quoted(rows.map((o) => [o.city, o.address || o.name].filter(Boolean).join(', ')))}. `
+        + 'Проверьте на экране «Продавцы и площадки»: лишний пункт можно убрать, недостающий — добавить.' });
+  }
+  return rows.length;
 }
 
 // Прочитать склады продавца у WB. Раз в 6 часов или сразу, если в заказах
@@ -129,7 +176,8 @@ async function refresh(client, warehouseId, companyId, token, {
     `UPDATE seller_wb_warehouses SET gone_at = COALESCE(gone_at, now())
       WHERE warehouse_id = $1 AND company_id = $2 AND NOT (mp_warehouse_id = ANY($3::text[]))`,
     [warehouseId, companyId, rows.map((r) => r.mp_warehouse_id)]);
-  const changed = await applyAuto(client, warehouseId, companyId);
+  const autoAdded = await autoOffices(client, warehouseId);
+  const changed = await applyAuto(client, warehouseId, autoAdded ? null : companyId);
   await client.query(`UPDATE marketplace_credentials SET wb_warehouses_at = now(), wb_warehouses_error = NULL
     WHERE id = $1`, [cred.id]);
 
@@ -145,10 +193,10 @@ async function refresh(client, warehouseId, companyId, token, {
       + `склад(ов) на WB${created.length ? `, новых — ${created.length}` : ''}. `
       + (ctx.officeIds.size
         ? `На ваших пунктах приёмки — ${atOurs.length}, отмечены вашими — ${ours.length}`
-          + (ours.length ? `: ${quoted(ours)}.` : '.')
-          + (ours.length ? ' Заказы забираются только с них.' : ' Пока ни один не отмечен — заказы забираются со всех складов продавца.')
-        : 'Пункты приёмки WB, куда вы возите, ещё не указаны («Площадки» → «Куда вы возите на WB») — '
-          + 'пока заказы забираются со всех складов продавца.');
+          + (ours.length ? `: ${quoted(ours)}. Заказы забираются только с них.`
+            : '. Заказы этого продавца не забираются, пока вы или он не отметите его склады у вас («Продавцы и площадки» → «Склады WB»).')
+        : 'Пункты приёмки WB, куда вы возите, не указаны — заказы не забираются. '
+          + 'Укажите их: «Продавцы и площадки» → «Куда вы возите на WB».');
     await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
       entityType: 'wb_warehouse', entityId: companyId, actionText: text });
   }
@@ -161,11 +209,10 @@ async function policy(client, warehouseId, companyId) {
     [warehouseId, companyId])).rows;
   const ours = new Set(rows.filter((r) => r.ours).map((r) => r.mp_warehouse_id));
   const known = new Set(rows.map((r) => r.mp_warehouse_id));
-  const active = ours.size > 0;
-  // Склад, которого мы не знаем (WB не отдал список), считаем своим: лучше
-  // лишний заказ, который уберётся на следующем обмене, чем потерянный.
-  const isForeign = (id) => active && Boolean(id) && known.has(String(id)) && !ours.has(String(id));
-  return { active, ours, known, isForeign, foreignIds: [...known].filter((id) => !ours.has(id)) };
+  // Склад, которого мы не знаем (WB не отдал список складов), считаем своим:
+  // лучше лишний заказ, который уберётся на следующем обмене, чем потерянный.
+  const isForeign = (id) => Boolean(id) && known.has(String(id)) && !ours.has(String(id));
+  return { ours, known, isForeign, foreignIds: [...known].filter((id) => !ours.has(id)) };
 }
 
 // Заказы чужих складов из очереди WB — в сторону, не в работу.
@@ -194,7 +241,7 @@ async function hideOrders(client, warehouseId, companyId, orders) {
 async function settle(client, warehouseId, companyId, { importOrders }) {
   const p = await policy(client, warehouseId, companyId);
   let hidden = 0;
-  if (p.active && p.foreignIds.length) {
+  if (p.foreignIds.length) {
     const r = await client.query(
       `WITH victims AS (
          SELECT i.id, i.external_id, i.mp_warehouse_id, i.mp_created_at,
@@ -227,9 +274,9 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
   }
   const back = (await client.query(
     `SELECT id, wb_order FROM wb_foreign_orders
-      WHERE warehouse_id = $1 AND company_id = $2 AND ($3::boolean OR NOT (mp_warehouse_id = ANY($4::text[])))
+      WHERE warehouse_id = $1 AND company_id = $2 AND NOT (mp_warehouse_id = ANY($3::text[]))
       ORDER BY mp_created_at NULLS LAST LIMIT ${BATCH}`,
-    [warehouseId, companyId, !p.active, p.foreignIds])).rows;
+    [warehouseId, companyId, p.foreignIds])).rows;
   if (back.length) {
     await importOrders(client, warehouseId, { companyId, orders: back.map((r) => r.wb_order) });
     await client.query('DELETE FROM wb_foreign_orders WHERE id = ANY($1::uuid[])', [back.map((r) => r.id)]);
@@ -241,8 +288,7 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
       actionText: `Склады WB «${name}»: `
         + (hidden ? `${hidden} заказ(ов) со складов, не отмеченных вашими, убраны из работы — их собирает другой фулфилмент. `
           + 'Заказы не удалены: отметите склад вашим — вернутся. ' : '')
-        + (back.length ? `${back.length} заказ(ов) вернулись в работу: их склад теперь отмечен вашим`
-          + (p.active ? '.' : ' (или ни один склад продавца не отмечен).') : '') });
+        + (back.length ? `${back.length} заказ(ов) вернулись в работу: их склад теперь отмечен вашим.` : '') });
   }
   return { hidden, restored: back.length };
 }
@@ -378,7 +424,7 @@ async function list(client, warehouseId, companyId) {
     warehouses: shown.map((r) => ({
       id: r.mp_warehouse_id, name: r.name, ours: r.ours, auto: r.decided_by == null,
       decidedBy: r.decided_by, decidedAt: r.decided_at, gone: Boolean(r.gone_at),
-      nameMatches: norm(r.name).includes(norm(ctx.ffName)) && norm(ctx.ffName).trim().length >= 3,
+      nameMatches: nameMatches(r.name, ctx),
       office: { id: r.office_id == null ? null : String(r.office_id), name: r.office_name, city: r.office_city, address: r.office_address },
       openOrders: r.open_orders, hidden: r.hidden,
     })),
@@ -424,8 +470,7 @@ async function listOffices(client, warehouseId) {
        FROM seller_wb_warehouses w
       WHERE w.warehouse_id = $1 AND w.office_id IS NOT NULL AND w.gone_at IS NULL
       GROUP BY w.office_id`, [warehouseId])).rows;
-  const ff = norm(ctx.ffName);
-  const matching = (names) => (ff.trim().length >= 3 ? names.filter((n) => norm(n).includes(ff)) : []);
+  const matching = (names) => names.filter((n) => nameMatches(n, ctx));
   const offices = new Map();
   for (const s of seen) {
     offices.set(String(s.office_id), { id: String(s.office_id), name: s.name, city: s.city, address: s.address,
@@ -489,5 +534,5 @@ async function setOffice(client, warehouseId, officeId, on, actor, { importOrder
 
 module.exports = {
   autoOurs, norm, applyAuto, refresh, policy, hideOrders, settle, backfillHistory, refreshStocks,
-  list, setOurs, listOffices, setOffice,
+  list, setOurs, listOffices, setOffice, afterRuleChange,
 };

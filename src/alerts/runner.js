@@ -1,5 +1,6 @@
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const { collect } = require('./rules');
+const { zoneOf, todayIn, hourIn } = require('../warehouses/time');
 
 // Проход сторожа по одному складу.
 //
@@ -57,18 +58,13 @@ async function checkWarehouse(client, warehouseId) {
 // Утренняя сводка — одно сообщение в день перед сменой, и только если есть о
 // чём. «Всё хорошо» не пишем: молчание и должно означать, что всё хорошо.
 //
-// Часового пояса у склада в базе нет, поэтому считаем по Москве — почти все
-// клиенты в ней и живут. Появится поле — заменить здесь одну строку.
-const DIGEST_HOUR_MSK = 7;
-
-function mskNow() {
-  return new Date(Date.now() + 3 * 3600000);
-}
+// В 7 утра по поясу склада (анкета склада, 30.09.2026).
+const DIGEST_HOUR = 7;
 
 async function maybeDigest(client, warehouseId) {
-  const now = mskNow();
-  if (now.getUTCHours() < DIGEST_HOUR_MSK) return null;
-  const today = now.toISOString().slice(0, 10);
+  const zone = await zoneOf(client, warehouseId);
+  if (hourIn(zone) < DIGEST_HOUR) return null;
+  const today = todayIn(zone);
 
   // Дату читаем строкой, а не через JS-Date. Колонка типа DATE приезжает в
   // node-postgres как полночь ПО МЕСТНОМУ времени, и toISOString() сдвигает её

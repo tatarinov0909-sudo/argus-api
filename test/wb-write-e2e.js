@@ -251,7 +251,7 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
       const set = after.findIndex((c) => c[0] === 'setShipping');
       const dlv = after.findIndex((c) => c[0] === 'deliverSupply');
       assert.ok(set >= 0 && dlv > set, JSON.stringify(after));
-      assert.equal(after[set][3], service.moscowToday());
+      assert.equal(after[set][3], require('../src/warehouses/time').todayIn('Europe/Moscow'));
     });
     const afterDeliver = await run((c) => c.query('SELECT mp_delivered_at, mp_barcode FROM supplies WHERE id=$1', [supply.id]));
     check('поставка отмечена переданной в доставку, и теперь у неё есть QR для ворот', () => {

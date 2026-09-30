@@ -78,6 +78,19 @@ function sellerStockResponse(rows) {
   };
 }
 
+// Где склад продавца ведёт учёт остатков (анкета склада). Строку склада
+// продавцу по изоляции не видно: узнаём склад компании в контексте
+// запроса, а настройку — в контексте этого склада.
+async function stockSourceOf(req, companyId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(companyId))) return '1c';
+  const company = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => (
+    await c.query('SELECT warehouse_id FROM companies WHERE id = $1', [companyId])).rows[0]);
+  if (!company) return '1c';
+  const wh = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => (
+    await c.query('SELECT stock_source FROM warehouses WHERE id = $1', [company.warehouse_id])).rows[0]);
+  return wh?.stock_source === 'argus' ? 'argus' : '1c';
+}
+
 async function requireActiveCompany(client, companyId) {
   const company = (await client.query(
     'SELECT id FROM companies WHERE id=$1 AND archived_at IS NULL',
@@ -275,8 +288,10 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
     // Название склада — в шапке кабинета продавца («Восход · фулфилмент»).
     // Строку склада продавцу читать нельзя, поэтому берём её в контексте склада.
     const wh = await withTenantContext({ warehouseId: profile.warehouseId },
-      (c) => c.query('SELECT name FROM warehouses WHERE id = $1', [profile.warehouseId]));
+      (c) => c.query('SELECT name, timezone FROM warehouses WHERE id = $1', [profile.warehouseId]));
     profile.warehouseName = wh.rows[0]?.name || null;
+    // Пояс склада: «сегодня» и «вчера» в кабинете продавца — по дню склада.
+    profile.timezone = wh.rows[0]?.timezone || 'Europe/Moscow';
     res.set('Cache-Control','no-store').json(profile);
   } catch (err) { next(err); }
 });
@@ -522,9 +537,10 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const source = await stockSourceOf(req, companyId);
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
-      return loadStock(client, companyId);
+      return loadStock(client, companyId, { source });
     });
     // Keep real warehouse-only products visible, but do not create inventory
     // rows from unresolved order lines that have neither a product nor stock.

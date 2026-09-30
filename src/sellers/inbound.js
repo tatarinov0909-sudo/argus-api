@@ -8,6 +8,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const { parseStockSheet } = require('../cells/stockAlign');
 const journal = require('../journal/repository');
+const { warehouseToday } = require('../warehouses/time');
 
 // Ключ продавца — внешний пользователь: файл без предела держал бы соединение
 // с базой, пока разбираются десятки тысяч строк (проверка 25.09.2026).
@@ -240,9 +241,9 @@ async function lockEditable(client, warehouseId, invoiceId, companyId) {
 // Следующий свободный номер прихода за сегодня — как у прихода, заведённого
 // складом: ПР-ДДММГГ-N. Год — чтобы через год номера не пошли по кругу.
 async function nextNumber(client, warehouseId) {
-  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
-  const prefix = `ПР-${String(d.getDate()).padStart(2, '0')}${String(d.getMonth() + 1).padStart(2, '0')}`
-    + `${String(d.getFullYear()).slice(2)}-`;
+  // День — по поясу склада (анкета склада, 30.09.2026).
+  const [y, m, d] = (await warehouseToday(client, warehouseId)).split('-');
+  const prefix = `ПР-${d}${m}${y.slice(2)}-`;
   const taken = new Set((await client.query(
     `SELECT number FROM invoices WHERE warehouse_id = $1 AND number LIKE $2
      UNION SELECT number FROM inbound_canceled_numbers WHERE warehouse_id = $1 AND number LIKE $2`,

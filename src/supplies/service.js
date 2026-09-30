@@ -17,9 +17,9 @@ const STATUS_NAMES = {
   shipped: 'уехала',
 };
 
-// Сегодня по Москве, ГГГГ-ММ-ДД: и дата отгрузки, и номер поставки считаются
-// по дню склада, а не по часовому поясу сервера.
-const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' });
+// Сегодня по поясу склада, ГГГГ-ММ-ДД (анкета склада, 30.09.2026): и дата
+// отгрузки, и номер поставки считаются по дню склада, а не по поясу сервера.
+const { warehouseToday } = require('../warehouses/time');
 
 // Номер поставки человеку, а не машине: дату видно глазами, счётчик внутри
 // дня короткий. Его называют вслух по телефону и пишут на коробке, поэтому
@@ -36,7 +36,7 @@ const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Eu
 // попытки давали один и тот же, и менеджер до полуночи получал «не удалось
 // выдать номер поставки».
 //
-// День берём по Москве — тот же день, что и у даты отгрузки. Раньше число
+// День берём по поясу склада — тот же день, что и у даты отгрузки. Раньше число
 // в номере бралось из часового пояса процесса, а счётчик — из пояса базы:
 // на UTC-сервере ночью по Москве это разные сутки.
 //
@@ -44,7 +44,7 @@ const moscowToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Eu
 // номера пошли бы по второму кругу, и ПС-2609-01 этого года не отличить от
 // прошлогодней.
 async function nextNumber(client, warehouseId) {
-  const [y, m, d] = moscowToday().split('-');
+  const [y, m, d] = (await warehouseToday(client, warehouseId)).split('-');
   const stamp = d + m + y.slice(2);
   const prefix = `ПС-${stamp}-`;
   const r = await client.query(
@@ -126,14 +126,14 @@ function cleanDestination(value) {
 
 // Плановая дата отгрузки. Прошедшую WB не примет — отказываем сразу, а не
 // когда машина уже у ворот.
-function cleanShipDate(value) {
+function cleanShipDate(value, today) {
   if (value === undefined || value === null || value === '') return null;
   const text = String(value);
   const d = new Date(`${text}T00:00:00Z`);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== text) {
     throw new HttpError(400, 'Дата отгрузки — в виде ГГГГ-ММ-ДД');
   }
-  if (text < moscowToday()) throw new HttpError(400, 'Дата отгрузки уже прошла');
+  if (text < today) throw new HttpError(400, 'Дата отгрузки уже прошла');
   return text;
 }
 
@@ -152,7 +152,7 @@ async function create(client, warehouseId, {
     throw new HttpError(400, 'Не указано ни одного заказа');
   }
   const destination = cleanDestination(rawDestination);
-  const shipDate = cleanShipDate(rawShipDate);
+  const shipDate = cleanShipDate(rawShipDate, await warehouseToday(client, warehouseId));
   const shippingPointId = cleanShippingPoint(rawPoint);
 
   const orders = await client.query(
@@ -986,5 +986,5 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
 }
 
 module.exports = {
-  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, moscowToday, stockCover, STATUS_NAMES,
+  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, stockCover, STATUS_NAMES,
 };

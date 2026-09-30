@@ -2,7 +2,7 @@ const wbWrite = require('../marketplaces/wbWrite');
 const credentials = require('../marketplaces/credentials');
 const journal = require('../journal/repository');
 const { plural } = require('../journal/plural');
-const { moscowToday } = require('./service');
+const { warehouseToday } = require('../warehouses/time');
 
 // Передача поставки на Wildberries и обратно.
 //
@@ -277,7 +277,7 @@ async function deliver({
   // а не мы — молча.
   if (supply.mp_shipping_point_id) {
     try {
-      await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: moscowToday() });
+      await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: await withTx((client) => warehouseToday(client, warehouseId)) });
     } catch (err) {
       if (!supply.mp_shipping_set_at) return complain(err.message);
       // Параметры на площадке остались прежними: дата там будет плановая, а

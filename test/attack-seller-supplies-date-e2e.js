@@ -5,7 +5,8 @@
 // продавца, чей часовой пояс западнее сервера (Калининград при сервере по
 // Москве), дата отгрузки показывается на день раньше.
 const { startApp, warehouse, assert } = require('./attack-helpers');
-const { moscowToday } = require('../src/supplies/service');
+const { todayIn } = require('../src/warehouses/time');
+const moscowToday = () => todayIn('Europe/Moscow');   // склад по умолчанию — Москва
 
 let failed = 0;
 function check(name, fn) {

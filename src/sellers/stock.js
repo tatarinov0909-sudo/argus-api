@@ -16,7 +16,9 @@ const BUCKET_SQL = `CASE WHEN ${TRANSIT_SQL} THEN 'transit'
                          WHEN ${DEMAND_SQL} THEN CASE WHEN ${IN_ASSEMBLY_SQL} THEN 'assembly' ELSE 'ordered' END
                     END`;
 
-async function loadStock(client, companyId) {
+// source — где склад ведёт учёт остатков (анкета склада, warehouses.stock_source):
+// '1c' — «Всего» из 1С; 'argus' — по ячейкам Аргуса (склад без 1С).
+async function loadStock(client, companyId, { source = '1c' } = {}) {
       const result = await client.query(
         `WITH cells AS (
            SELECT sku,
@@ -163,7 +165,14 @@ async function loadStock(client, companyId) {
       // freeze the cabinet after a newer automatic 1C exchange arrives.
       const accountingTotal = r.stock_qty_1c === null || r.stock_qty_1c === undefined
         ? null : Number(r.stock_qty_1c);
-      const total = accountingTotal === null ? null : Math.max(0, accountingTotal);
+      // Склад без 1С (владелец 30.09.2026): учёт склада — это ячейки Аргуса.
+      // «Всего» — годное в ячейках плюс собранное, но ещё не уехавшее: так же,
+      // как у 1С, где товар списывается только при отгрузке. Товар, которого
+      // склад ещё ни разу не видел, — «не знаем», а не ноль.
+      const byCells = source === 'argus';
+      const total = byCells
+        ? (stockKnown ? Math.max(0, onHand) : null)
+        : (accountingTotal === null ? null : Math.max(0, accountingTotal));
       // Четыре числа продавца (решение владельца 17.09.2026):
       // «в сборке» — заказы, переданные складу поставкой (или уже
       // отобранные), «заказано» — купленное на площадке, чего в поставке
@@ -209,7 +218,7 @@ async function loadStock(client, companyId) {
       // quantities; it does not reveal 1C, cells, or reconciliation details.
       total,
       totalKnown: total !== null,
-      totalUpdatedAt: accountingTotal === null ? null : (r.stock_at || null),
+      totalUpdatedAt: byCells ? (r.counted_at || null) : (accountingTotal === null ? null : (r.stock_at || null)),
       inAssembly,
       orderedNotInSupply,
       inTransit: Number(r.transit_qty || 0),

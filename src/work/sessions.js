@@ -19,6 +19,7 @@
 const { HttpError } = require('../middleware/errorHandler');
 const journal = require('../journal/repository');
 const { plural } = require('../journal/plural');
+const { zoneOf } = require('../warehouses/time');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Сколько идущий заход может жить после того, как работа сделана (settle).
@@ -485,7 +486,7 @@ function createWork(kind) {
       )).rows[0];
       // Ушёл заметно раньше, чем об этом узнал сервер, — время ухода в тексте.
       const when = Date.now() - new Date(paused.paused_at).getTime() > 60000
-        ? ` в ${new Date(paused.paused_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' })}`
+        ? ` в ${new Date(paused.paused_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: await zoneOf(client, warehouseId) })}`
         : '';
       text = exit ? T.text.exited(name, doc, when, taken) : T.text.paused(name, doc, why, taken);
     } else if (note) {
