@@ -15,3 +15,11 @@ test('WB identifiers remain separate from internal codes and preserve multiple l
 test('non-WB internal IDs cannot appear as nmID',()=>{
   assert.deepEqual(combineCatalog([{sku:'PB001',nm_id:'PB001'}])[0].cards,[]);
 });
+test('WB barcodes are collected per product for the WB stock file',()=>{
+  const [p]=combineCatalog([
+    {sku:'PB001',nm_id:'123456',article:'a',barcode:' 2049583883141 '},
+    {sku:'PB001',nm_id:'123456',article:'a',barcode:'2049583883141'},
+    {sku:'PB001',nm_id:'123456',article:'a',barcode:null},
+  ]);
+  assert.deepEqual(p.wbBarcodes,['2049583883141']);
+});

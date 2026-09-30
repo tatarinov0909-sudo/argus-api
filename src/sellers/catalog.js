@@ -2,8 +2,11 @@
 function combineCatalog(rows) {
   const products = new Map();
   for (const r of rows) {
-    if (!products.has(r.sku)) products.set(r.sku, { sku: r.sku, category: r.category || 'Без категории', cards: [] });
+    if (!products.has(r.sku)) products.set(r.sku, { sku: r.sku, category: r.category || 'Без категории', cards: [], wbBarcodes: [] });
     const product = products.get(r.sku);
+    // Баркод WB — для файла остатков, который продавец загружает в WB.
+    const barcode = String(r.barcode || '').trim();
+    if (barcode && !product.wbBarcodes.includes(barcode)) product.wbBarcodes.push(barcode);
     if (!r.nm_id || !/^\d+$/.test(r.nm_id)) continue;
     if (product.cards.some(c => c.nmId === r.nm_id && c.vendorCode === (r.article || null))) continue;
     product.cards.push({ nmId: r.nm_id, vendorCode: r.article || null, photoUrl: r.photo_url || null });

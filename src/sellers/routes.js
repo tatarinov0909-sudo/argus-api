@@ -186,8 +186,8 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
       const company = (await c.query('SELECT id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
       if (!company) throw new HttpError(404, 'Компания не найдена');
       return (await c.query(`WITH links AS (
-        SELECT sku,mp_sku AS nm_id,mp_article AS article FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb'
-        UNION SELECT sku,mp_nm_id,mp_article FROM invoice_items WHERE company_id=$1 AND mp_nm_id IS NOT NULL
+        SELECT sku,mp_sku AS nm_id,mp_article AS article,mp_barcode AS barcode FROM product_marketplace_skus WHERE company_id=$1 AND marketplace='wb'
+        UNION SELECT sku,mp_nm_id,mp_article,NULL FROM invoice_items WHERE company_id=$1 AND mp_nm_id IS NOT NULL
       ), skus AS (
         SELECT sku FROM products WHERE company_id=$1 AND active=true
         UNION
@@ -197,7 +197,7 @@ router.get('/catalog', requireAuth, requireRole('seller', 'owner', 'manager'), a
           WHERE hidden.company_id=$1 AND hidden.sku=l.sku AND hidden.active=false
         )
       )
-      SELECT s.sku,p.category,l.nm_id,l.article,m.photo_url FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1 AND p.active=true
+      SELECT s.sku,p.category,l.nm_id,l.article,l.barcode,m.photo_url FROM skus s LEFT JOIN products p ON p.sku=s.sku AND p.company_id=$1 AND p.active=true
       LEFT JOIN links l ON l.sku=s.sku
       LEFT JOIN marketplace_product_media m ON m.company_id=$1 AND m.nm_id=l.nm_id
       ORDER BY s.sku,l.nm_id`, [companyId])).rows;
