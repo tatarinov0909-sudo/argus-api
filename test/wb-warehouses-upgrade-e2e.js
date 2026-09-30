@@ -22,11 +22,11 @@ const realFetch = global.fetch;
 const order = (id, wh) => ({ externalId: String(id), article: 'ART', nmId: '1', barcodes: [], rid: `r${id}`,
   salePriceKopecks: 100, createdAt: new Date().toISOString(), offices: [], warehouseId: String(wh), chrtId: null });
 wb.sellerInfo = async () => ({ name: 'ИП Тест', inn: '1' });
-wb.warehouses = async () => [
+wb.warehouses = async (token) => (String(token).includes('slim') ? [{ id: 9, name: 'ФФ Восток', officeId: 15 }] : [
   { id: 1, name: 'ФФ Восход ЮГ', officeId: 15 },
   { id: 2, name: 'ФФ Восход СПБ', officeId: 10999 },
   { id: 3, name: 'ФФ УФФ Самара', officeId: 128 },
-];
+]);
 wb.offices = async () => [];
 wb.newOrders = async () => [];
 wb.ordersHistory = async () => ({ next: 0, orders: [] });
@@ -114,6 +114,36 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
       assert.equal(off.body.hidden, 2);
       assert.equal(onAgain.body.restored, 2);
       assert.deepEqual(final, ['11', '12', '13']);
+    });
+
+    // ---------- Как на рабочем сервере 30.09: пункты добавлены руками, у
+    // второго продавца единственный склад «ФФ Восток» на нашем пункте, по
+    // старому правилу не отмечен. Обновление не должно спрятать его заказы.
+    const reg2 = await api('POST', '/api/auth/owner/register', { body: {
+      name: 'O2', email: `upg2${stamp}@test.local`, password: 'secret123', warehouseName: 'Восход' } });
+    const owner2 = reg2.body.token;
+    const wh2 = JSON.parse(Buffer.from(owner2.split('.')[1], 'base64').toString('utf8')).warehouseId;
+    const run2 = (fn) => withTenantContext({ warehouseId: wh2 }, fn);
+    const av = (await api('POST', '/api/sellers/companies', { token: owner2, body: { name: 'Авезов' } })).body.id;
+    const slim = (await api('POST', '/api/sellers/companies', { token: owner2, body: { name: 'Слим' } })).body.id;
+    await api('POST', '/api/marketplaces/credentials', { token: owner2, body: { companyId: av, marketplace: 'wb', token: 'eyJ.av.y' } });
+    await api('POST', '/api/marketplaces/credentials', { token: owner2, body: { companyId: slim, marketplace: 'wb', token: 'eyJ.slim.y' } });
+    await run2(async (c) => {
+      await c.query('UPDATE warehouses SET wb_offices_auto_at = NULL WHERE id = $1', [wh2]);
+      await c.query(`UPDATE seller_wb_warehouses SET ours = (name ILIKE '%восход%') WHERE warehouse_id = $1`, [wh2]);
+      await c.query(`INSERT INTO ff_wb_offices (warehouse_id, office_id, added_by) VALUES ($1, 15, 'Руководитель склада'), ($1, 10999, 'Руководитель склада')
+                     ON CONFLICT DO NOTHING`, [wh2]);
+      await sync.importOrders(c, wh2, { companyId: slim, orders: [order(91, 9), order(92, 9)] });
+    });
+    const tick2 = await api('POST', '/api/marketplaces/sync', { token: owner2, body: { companyId: slim } });
+    const slimWork = await run2(async (c) => (await c.query(
+      `SELECT external_id FROM invoices WHERE company_id = $1 AND source = 'wb' ORDER BY 1`, [slim])).rows.map((r) => r.external_id));
+    const slimWh = await run2(async (c) => (await c.query(
+      `SELECT ours FROM seller_wb_warehouses WHERE company_id = $1`, [slim])).rows[0]);
+    check('обновление на складе с пунктами: единственный склад продавца на нашем пункте стал нашим, заказы на месте', () => {
+      assert.equal(tick2.status, 200, JSON.stringify(tick2.body));
+      assert.equal(slimWh.ours, true);
+      assert.deepEqual(slimWork, ['91', '92']);
     });
   } catch (err) {
     failures.push({ name: 'тест упал', message: err.stack });

@@ -90,13 +90,17 @@ async function applyAuto(client, warehouseId, companyId = null) {
 // Пункты приёмки, куда возит фулфилмент, Аргус при первом чтении складов
 // продавцов добавляет сам: те, где у продавцов стоят склады с его именем.
 // Один раз (отметка wb_offices_auto_at): убрал человек пункт — Аргус его
-// обратно не вернёт. Возвращает число добавленных пунктов.
+// обратно не вернёт. Возвращает { added — сколько добавил, first — решал
+// ли сейчас впервые }: в первый раз отметки складов у всех продавцов
+// пересчитываются по нынешнему правилу (склад, обновлённый с прошлой версии,
+// мог хранить отметки по старому правилу).
 async function autoOffices(client, warehouseId) {
+  const none = { added: 0, first: false };
   const wh = (await client.query('SELECT wb_offices_auto_at FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
-  if (!wh || wh.wb_offices_auto_at) return 0;
+  if (!wh || wh.wb_offices_auto_at) return none;
   // Складов продавцов ещё не знаем — решать не по чему, ждём первого чтения.
   const known = (await client.query('SELECT 1 FROM seller_wb_warehouses WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
-  if (!known) return 0;
+  if (!known) return none;
   const has = (await client.query('SELECT 1 FROM ff_wb_offices WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
   const ctx = await ffContext(client, warehouseId);
   const rows = has ? [] : (await client.query(
@@ -117,7 +121,7 @@ async function autoOffices(client, warehouseId) {
         + `${quoted(rows.map((o) => [o.city, o.address || o.name].filter(Boolean).join(', ')))}. `
         + 'Проверьте на экране «Продавцы и площадки»: лишний пункт можно убрать, недостающий — добавить.' });
   }
-  return rows.length;
+  return { added: rows.length, first: true };
 }
 
 // Прочитать склады продавца у WB. Раз в 6 часов или сразу, если в заказах
@@ -177,8 +181,8 @@ async function refresh(client, warehouseId, companyId, token, {
     `UPDATE seller_wb_warehouses SET gone_at = COALESCE(gone_at, now())
       WHERE warehouse_id = $1 AND company_id = $2 AND NOT (mp_warehouse_id = ANY($3::text[]))`,
     [warehouseId, companyId, rows.map((r) => r.mp_warehouse_id)]);
-  const autoAdded = await autoOffices(client, warehouseId);
-  const changed = await applyAuto(client, warehouseId, autoAdded ? null : companyId);
+  const auto = await autoOffices(client, warehouseId);
+  const changed = await applyAuto(client, warehouseId, auto.first ? null : companyId);
   await client.query(`UPDATE marketplace_credentials SET wb_warehouses_at = now(), wb_warehouses_error = NULL
     WHERE id = $1`, [cred.id]);
 
@@ -583,9 +587,9 @@ async function setOffice(client, warehouseId, officeId, on, actor, { importOrder
 // Каждый обмен, до правила: если пункты ещё не решены, а склады продавцов
 // уже известны, — добавить пункты сами и пересчитать отметки.
 async function ensureOffices(client, warehouseId) {
-  const added = await autoOffices(client, warehouseId);
-  if (added) await applyAuto(client, warehouseId, null);
-  return added;
+  const auto = await autoOffices(client, warehouseId);
+  if (auto.first) await applyAuto(client, warehouseId, null);
+  return auto.added;
 }
 
 module.exports = {
