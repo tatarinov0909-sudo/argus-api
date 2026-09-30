@@ -100,6 +100,17 @@ router.get('/:companyId/wb/warehouses', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+router.post('/:companyId/wb/warehouses/refresh', async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, async (c) => {
+      await companyOfWarehouse(c, warehouseId, req.params.companyId);
+      const token = await credentials.tokenFor(c, warehouseId, req.params.companyId, 'wb');
+      return sellerWarehouses.refreshNow(c, warehouseId, req.params.companyId, token, { importOrders: sync.importOrders });
+    }));
+  } catch (err) { next(err); }
+});
+
 router.patch('/:companyId/wb/warehouses/:mpWarehouseId', async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;

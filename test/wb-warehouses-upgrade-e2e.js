@@ -79,9 +79,9 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
 
     const tick = await api('POST', '/api/marketplaces/sync', { token: owner, body: { companyId } });
     check('первый обмен после обновления прошёл', () => assert.equal(tick.status, 200, JSON.stringify(tick.body)));
-    const offices = (await api('GET', '/api/marketplaces/wb/offices', { token: owner })).body.offices;
-    check('Аргус сам добавил пункты складов с именем склада', () => {
-      assert.deepEqual(offices.filter((o) => o.configured).map((o) => o.id).sort(), ['10999', '15']);
+    const marks = (await api('GET', `/api/marketplaces/${companyId}/wb/warehouses`, { token: owner })).body.warehouses;
+    check('на первом обмене Аргус сам отметил склады с именем склада', () => {
+      assert.deepEqual(marks.filter((w) => w.ours).map((w) => w.id).sort(), ['1', '2']);
     });
     const left = await inWork();
     check('ушёл только заказ склада другого фулфилмента', () => assert.deepEqual(left, ['11', '12']));
@@ -104,17 +104,6 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
       assert.ok(back.mp_closed_at, 'заказ снова открыт');
     });
     check('обмен не закрывал его заново — журнал не засыпан', () => assert.equal(journalAfter, journalBefore));
-
-    // Пункты пачкой: убрать оба и вернуть оба — без промежуточных состояний.
-    const off = await api('PUT', '/api/marketplaces/wb/offices', { token: owner, body: { on: false, ids: ['15', '10999'] } });
-    const onAgain = await api('PUT', '/api/marketplaces/wb/offices', { token: owner, body: { on: true, ids: ['15', '10999'] } });
-    const final = await inWork();
-    check('пункты пачкой: убрали — заказы ушли, вернули — все на месте', () => {
-      assert.equal(off.status, 200, JSON.stringify(off.body));
-      assert.equal(off.body.hidden, 2);
-      assert.equal(onAgain.body.restored, 2);
-      assert.deepEqual(final, ['11', '12', '13']);
-    });
 
     // ---------- Как на рабочем сервере 30.09: пункты добавлены руками, у
     // второго продавца единственный склад «ФФ Восток» на нашем пункте, по

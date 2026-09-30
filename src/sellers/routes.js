@@ -263,6 +263,18 @@ router.get('/wb-warehouses', requireAuth, requireRole('seller', 'owner', 'manage
   } catch (err) { next(err); }
 });
 
+// «Обновить из WB» из кабинета продавца: прочитать его склады сейчас.
+router.post('/wb-warehouses/refresh', requireAuth, requireRole('seller'), async (req, res, next) => {
+  try {
+    const company = await sellerWarehouseOf(req);
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
+      const token = await require('../marketplaces/credentials').tokenFor(c, company.warehouse_id, company.id, 'wb');
+      return sellerWarehouses.refreshNow(c, company.warehouse_id, company.id, token, { importOrders: sync.importOrders });
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 router.patch('/wb-warehouses/:mpWarehouseId', requireAuth, requireRole('seller'), async (req, res, next) => {
   try {
     if (typeof req.body?.ours !== 'boolean') throw new HttpError(400, 'Передайте ours: true или false');

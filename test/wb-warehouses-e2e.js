@@ -127,7 +127,7 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
       .map((r) => r.external_id));
     const ids = (rows) => rows.map((r) => r.external_id);
 
-    // ---------- 1. Первый обмен: пункт с нашим именем Аргус добавил сам ----------
+    // ---------- 1. Первый обмен: склад с нашим именем отмечен сам ----------
     WB.queue = [order(2001, 11), order(2002, 99)];
     const first = await api('POST', '/api/marketplaces/sync', { token: owner, body: { companyId } });
     check('склады продавца прочитаны у WB сразу при подключении ключа', () => {
@@ -154,38 +154,27 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
     const notes = await run(async (c) => (await c.query(
       `SELECT action_text FROM journal_entries WHERE warehouse_id = $1 AND entity_type = 'wb_warehouse'
         ORDER BY created_at`, [warehouseId])).rows.map((r) => r.action_text).join(' | '));
-    check('в журнале — что Аргус сам добавил пункт приёмки', () => assert.match(notes, /сам добавил пункты приёмки/));
+    check('в журнале — какие склады отмечены вашими', () => assert.match(notes, /вашими отмечены 1: «ФФ Восход СПБ/));
 
-    // ---------- 2. Пункты приёмки ----------
-    const offices = await api('GET', '/api/marketplaces/wb/offices', { token: owner });
-    check('пункт с нашим именем уже добавлен, Самара — нет', () => {
-      assert.equal(offices.status, 200, JSON.stringify(offices.body));
-      const byId = Object.fromEntries(offices.body.offices.map((o) => [o.id, o]));
-      assert.equal(byId['500'].configured, true);
-      assert.match(byId['500'].addedBy, /Аргус/);
-      assert.equal(byId['900'].configured, false);
-    });
-    check('названия складов других фулфилментов в подсказке не показываются', () => {
-      assert.ok(!JSON.stringify(offices.body).includes('УФФ'));
-    });
+    // ---------- 2. Все склады продавца — для выбора галочками ----------
     const listA = await api('GET', `/api/marketplaces/${companyId}/wb/warehouses`, { token: owner });
-    check('у Авезова наш — склад с нашим именем; «ФФ Восток» на том же пункте — нет (у продавца есть склад с нашим именем)', () => {
+    check('видны все склады продавца; наш — с нашим именем, остальные не отмечены', () => {
       assert.equal(listA.status, 200, JSON.stringify(listA.body));
+      assert.deepEqual(listA.body.warehouses.map((w) => w.id).sort(), ['11', '12', '99']);
       const byId = Object.fromEntries(listA.body.warehouses.map((w) => [w.id, w]));
       assert.equal(byId['11'].ours, true);
       assert.equal(byId['11'].auto, true);
       assert.equal(byId['12'].ours, false);
-      assert.equal(byId['99'], undefined, 'склад другого фулфилмента показан');
-      assert.equal(listA.body.otherCount, 1);
+      assert.equal(byId['99'].ours, false);
     });
 
-    // ---------- 3. «Слим Тим»: один склад на нашем пункте без нашего имени ----------
+    // ---------- 3. «Слим Тим»: единственный склад без нашего имени ----------
     const conn2 = await api('POST', '/api/marketplaces/credentials', { token: owner,
       body: { companyId: otherId, marketplace: 'wb', token: 'eyJ.other.token' } });
     assert.equal(conn2.status, 201, JSON.stringify(conn2.body));
     await api('POST', '/api/marketplaces/sync', { token: owner, body: { companyId: otherId } });
     const listB = await api('GET', `/api/marketplaces/${otherId}/wb/warehouses`, { token: owner });
-    check('у продавца единственный склад на нашем пункте без нашего имени — он наш', () => {
+    check('у продавца единственный склад без нашего имени — он наш', () => {
       assert.equal(listB.body.warehouses.length, 1);
       assert.equal(listB.body.warehouses[0].ours, true);
     });
@@ -209,9 +198,9 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
     const seller2 = (await api('POST', '/api/auth/seller/login', { body: { name: 'Другой', keyCode: sk2.body.key_code } })).body.token;
     assert.ok(seller && seller2, 'продавцы не вошли');
     const mine = await api('GET', '/api/sellers/wb-warehouses', { token: seller });
-    check('продавец видит свои склады у нашего фулфилмента', () => {
+    check('продавец видит все свои склады на WB', () => {
       assert.equal(mine.status, 200, JSON.stringify(mine.body));
-      assert.deepEqual(mine.body.warehouses.map((w) => w.id).sort(), ['11', '12']);
+      assert.deepEqual(mine.body.warehouses.map((w) => w.id).sort(), ['11', '12', '99']);
       assert.equal(mine.body.ffName, 'Восход');
     });
     const theirs = await api('GET', '/api/sellers/wb-warehouses', { token: seller2 });
@@ -274,22 +263,27 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
     });
     WB.warehousesFail = false;
 
-    // ---------- 8. Пункт убран: заказов с него нет; Аргус его сам не вернёт ----------
-    const removed = await api('PUT', '/api/marketplaces/wb/offices/500', { token: owner, body: { on: false } });
-    check('пункт убран — склады на нём больше не наши, их заказы отложены', () => {
-      assert.equal(removed.status, 200, JSON.stringify(removed.body));
-      assert.equal(removed.body.hidden, 4);   // 1001, 2001, 2004, 2005; у 1003 — комментарий
+    // ---------- 8. «Обновить из WB»: новый склад продавца — сразу ----------
+    WB.warehouses.avezov.push({ id: 13, name: 'ФФ Восход Пермь / МСК', officeId: 700, cargoType: 1, deliveryType: 1 });
+    // Прошлое чтение было на шаге 7 — «минуту спустя».
+    await run((c) => c.query(`UPDATE marketplace_credentials SET wb_warehouses_at = now() - interval '2 minutes' WHERE company_id = $1`, [companyId]));
+    const fresh = await api('POST', `/api/marketplaces/${companyId}/wb/warehouses/refresh`, { token: owner });
+    check('кнопка «Обновить из WB» сразу показывает новый склад, с нашим именем — отмечен', () => {
+      assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+      const w13 = fresh.body.warehouses.find((w) => w.id === '13');
+      assert.ok(w13, 'нового склада нет');
+      assert.equal(w13.ours, true);
     });
-    inv = await invoicesOf();
-    check('в работе остался только заказ с работой склада', () => assert.deepEqual(ids(inv), ['1003']));
-    await run((c) => c.query(`UPDATE marketplace_credentials SET wb_warehouses_at = NULL WHERE company_id = $1`, [companyId]));
-    await api('POST', '/api/marketplaces/sync', { token: owner, body: { companyId } });
-    const again = await api('GET', '/api/marketplaces/wb/offices', { token: owner });
-    check('убранный человеком пункт Аргус обратно не добавляет', () => {
-      assert.equal(again.body.offices.find((o) => o.id === '500').configured, false);
+    const again = await api('POST', `/api/marketplaces/${companyId}/wb/warehouses/refresh`, { token: owner });
+    check('повтор сразу же не дёргает WB второй раз (не чаще раза в минуту), но отвечает списком', () => {
+      assert.equal(again.status, 200);
+      assert.equal(again.body.warehouses.length, 4);
     });
-    const back = await api('PUT', '/api/marketplaces/wb/offices/500', { token: owner, body: { on: true } });
-    check('пункт вернули — заказы вернулись', () => assert.equal(back.body.restored, 4));
+    const sellerFresh = await api('POST', '/api/sellers/wb-warehouses/refresh', { token: seller });
+    check('продавец тоже может обновить свои склады из WB', () => {
+      assert.equal(sellerFresh.status, 200, JSON.stringify(sellerFresh.body));
+      assert.equal(sellerFresh.body.warehouses.length, 4);
+    });
 
     // ---------- 9. «Как нас называют продавцы» ----------
     const renamed = await api('PATCH', '/api/warehouses/me', { token: owner, body: { wbNames: ['Восток'] } });
@@ -326,7 +320,7 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
     const staff = await api('POST', '/api/staff', { token: owner, body: { name: 'Грузчик' } });
     const worker = (await api('POST', '/api/auth/staff/login', { body: { keyCode: staff.body.key_code } })).body.token;
     const w1 = await api('GET', `/api/marketplaces/${companyId}/wb/warehouses`, { token: worker });
-    const w2 = await api('PUT', '/api/marketplaces/wb/offices/500', { token: worker, body: { on: true } });
+    const w2 = await api('POST', `/api/marketplaces/${companyId}/wb/warehouses/refresh`, { token: worker });
     const w3 = await api('PATCH', '/api/warehouses/me', { token: worker, body: { stockSource: '1c' } });
     check('грузчик не видит и не меняет склады WB и настройки склада', () => {
       assert.equal(w1.status, 403);

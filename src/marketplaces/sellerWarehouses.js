@@ -21,7 +21,7 @@ const { HttpError } = require('../middleware/errorHandler');
 // склады с именем фулфилмента (autoOffices).
 
 const HOUR = 60 * 60 * 1000;
-const REFRESH_MS = 6 * HOUR;          // список складов меняется редко
+const REFRESH_MS = HOUR;              // список складов меняется редко
 const RETRY_UNKNOWN_MS = 15 * 60 * 1000;
 const STOCKS_MS = 30 * 60 * 1000;
 const STOCKS_DENIED_MS = 6 * HOUR;    // у ключа нет доступа — не долбить WB
@@ -36,16 +36,15 @@ const norm = (s) => ` ${String(s || '').toLowerCase().replace(/ё/g, 'е')
 // Аргусе или одно из имён «как нас называют продавцы»).
 const nameMatches = (name, { names }) => names.some((n) => norm(name).includes(n));
 
-// Правило «наш склад»: склад стоит на пункте приёмки, куда возит фулфилмент,
-// и либо в названии есть его имя, либо у продавца на наших пунктах нет ни
-// одного склада с нашим именем. Пример: у Авезова на Коледино «ФФ Восход ЮГ»
-// и ещё чей-то склад — наш только первый (пункт общий у многих ФФ); у
-// «Слим Тим» на Коледино один склад «ФФ Восток» — значит, наш.
+// Правило «наш склад» (владелец 01.10.2026: склады выбирают галочками у
+// продавца, пункты приёмки не нужны): в названии есть имя фулфилмента — наш;
+// у продавца всего один склад и ни одного с нашим именем — тоже наш (у
+// «Слим Тим» один склад «ФФ Восток»). Остальное решает человек галочкой.
 // ponytail: эвристика по названию; ошиблась — человек ставит галочку, и
 // правило больше этот склад не трогает.
-function autoOurs(w, ctx, sellerHasNamed) {
-  if (!ctx.officeIds.has(String(w.office_id))) return false;
-  return nameMatches(w.name, ctx) || !sellerHasNamed;
+function autoOurs(w, ctx, sellerHasNamed, sellerActive) {
+  if (w.gone_at) return false;
+  return nameMatches(w.name, ctx) || (!sellerHasNamed && sellerActive === 1);
 }
 
 async function ffContext(client, warehouseId) {
@@ -77,9 +76,11 @@ async function applyAuto(client, warehouseId, companyId = null) {
     `SELECT id, company_id, name, office_id, ours, decided_by, gone_at FROM seller_wb_warehouses
       WHERE warehouse_id = $1 AND ($2::uuid IS NULL OR company_id = $2)`,
     [warehouseId, companyId])).rows;
-  const named = new Set(rows.filter((r) => !r.gone_at && ctx.officeIds.has(String(r.office_id)) && nameMatches(r.name, ctx))
-    .map((r) => r.company_id));
-  const changed = rows.filter((r) => r.decided_by == null && autoOurs(r, ctx, named.has(r.company_id)) !== r.ours)
+  const named = new Set(rows.filter((r) => !r.gone_at && nameMatches(r.name, ctx)).map((r) => r.company_id));
+  const active = new Map();
+  for (const r of rows) if (!r.gone_at) active.set(r.company_id, (active.get(r.company_id) || 0) + 1);
+  const changed = rows.filter((r) => r.decided_by == null
+      && autoOurs(r, ctx, named.has(r.company_id), active.get(r.company_id) || 0) !== r.ours)
     .map((r) => ({ ...r, ours: !r.ours }));
   for (const r of changed) {
     await client.query('UPDATE seller_wb_warehouses SET ours = $2 WHERE id = $1', [r.id, r.ours]);
@@ -87,47 +88,24 @@ async function applyAuto(client, warehouseId, companyId = null) {
   return changed;
 }
 
-// Пункты приёмки, куда возит фулфилмент, Аргус при первом чтении складов
-// продавцов добавляет сам: те, где у продавцов стоят склады с его именем.
-// Один раз (отметка wb_offices_auto_at): убрал человек пункт — Аргус его
-// обратно не вернёт. Возвращает { added — сколько добавил, first — решал
-// ли сейчас впервые }: в первый раз отметки складов у всех продавцов
-// пересчитываются по нынешнему правилу (склад, обновлённый с прошлой версии,
-// мог хранить отметки по старому правилу).
+// Первый раз, когда склады продавцов известны, отметки складов у всех
+// продавцов считаются по правилу (отметка wb_offices_auto_at — «правило
+// применено»). До этого заказы берутся как раньше: обновление не должно само
+// спрятать заказы склада. Возвращает { first — применено ли сейчас впервые }.
 async function autoOffices(client, warehouseId) {
   const none = { added: 0, first: false };
   const wh = (await client.query('SELECT wb_offices_auto_at FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
   if (!wh || wh.wb_offices_auto_at) return none;
-  // Складов продавцов ещё не знаем — решать не по чему, ждём первого чтения.
   const known = (await client.query('SELECT 1 FROM seller_wb_warehouses WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
   if (!known) return none;
-  const has = (await client.query('SELECT 1 FROM ff_wb_offices WHERE warehouse_id = $1 LIMIT 1', [warehouseId])).rows[0];
-  const ctx = await ffContext(client, warehouseId);
-  const rows = has ? [] : (await client.query(
-    `SELECT office_id, max(office_name) AS name, max(office_city) AS city, max(office_address) AS address,
-            array_agg(name) AS names
-       FROM seller_wb_warehouses WHERE warehouse_id = $1 AND gone_at IS NULL AND office_id IS NOT NULL
-      GROUP BY office_id`, [warehouseId])).rows.filter((o) => o.names.some((n) => nameMatches(n, ctx)));
-  for (const o of rows) {
-    await client.query(
-      `INSERT INTO ff_wb_offices (warehouse_id, office_id, name, city, address, added_by)
-       VALUES ($1, $2, $3, $4, $5, 'Аргус — по складам продавцов с вашим именем')
-       ON CONFLICT (warehouse_id, office_id) DO NOTHING`, [warehouseId, o.office_id, o.name, o.city, o.address]);
-  }
   await client.query('UPDATE warehouses SET wb_offices_auto_at = now() WHERE id = $1', [warehouseId]);
-  if (rows.length) {
-    await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system', entityType: 'wb_warehouse',
-      actionText: `Аргус сам добавил пункты приёмки WB, куда вы возите, — там у продавцов склады с вашим именем: `
-        + `${quoted(rows.map((o) => [o.city, o.address || o.name].filter(Boolean).join(', ')))}. `
-        + 'Проверьте на экране «Продавцы и площадки»: лишний пункт можно убрать, недостающий — добавить.' });
-  }
-  return { added: rows.length, first: true };
+  return { added: 0, first: true };
 }
 
-// Прочитать склады продавца у WB. Раз в 6 часов или сразу, если в заказах
-// встретился склад, которого мы не знаем.
+// Прочитать склады продавца у WB. Раз в час, сразу — если в заказах
+// встретился незнакомый склад, и по кнопке «Обновить из WB».
 async function refresh(client, warehouseId, companyId, token, {
-  orders = [], force = false, fetchWarehouses = wb.warehouses, fetchOffices = wb.offices,
+  orders = [], force = false, throttleMs = 0, fetchWarehouses = wb.warehouses, fetchOffices = wb.offices,
 } = {}) {
   const cred = await credentialRow(client, warehouseId, companyId);
   if (!cred) return { skipped: true };
@@ -137,6 +115,8 @@ async function refresh(client, warehouseId, companyId, token, {
   const unknown = orders.some((o) => o.warehouseId && !known.has(o.warehouseId));
   const age = cred.wb_warehouses_at ? Date.now() - new Date(cred.wb_warehouses_at).getTime() : Infinity;
   if (!force && age < REFRESH_MS && !(unknown && age > RETRY_UNKNOWN_MS)) return { skipped: true };
+  // Кнопка «Обновить из WB»: не чаще раза в throttleMs — WB ограничивает частоту.
+  if (force && age < throttleMs) return { skipped: true };
 
   let list;
   let offices = [];
@@ -188,20 +168,14 @@ async function refresh(client, warehouseId, companyId, token, {
 
   const created = saved.rows.filter((r) => r.created);
   if (created.length || changed.length) {
-    const ctx = await ffContext(client, warehouseId);
     const all = (await client.query(
-      `SELECT name, office_id, ours FROM seller_wb_warehouses
+      `SELECT name, ours FROM seller_wb_warehouses
         WHERE warehouse_id = $1 AND company_id = $2 AND gone_at IS NULL`, [warehouseId, companyId])).rows;
-    const atOurs = all.filter((w) => ctx.officeIds.has(String(w.office_id)));
     const ours = all.filter((w) => w.ours).map((w) => w.name);
     const text = `Склады WB «${await companyName(client, companyId)}»: у продавца ${all.length} `
-      + `склад(ов) на WB${created.length ? `, новых — ${created.length}` : ''}. `
-      + (ctx.officeIds.size
-        ? `На ваших пунктах приёмки — ${atOurs.length}, отмечены вашими — ${ours.length}`
-          + (ours.length ? `: ${quoted(ours)}. Заказы забираются только с них.`
-            : '. Заказы этого продавца не забираются, пока вы или он не отметите его склады у вас («Продавцы и площадки» → «Склады WB»).')
-        : 'Пункты приёмки WB, куда вы возите, не указаны — заказы не забираются. '
-          + 'Укажите их: «Продавцы и площадки» → «Куда вы возите на WB».');
+      + `склад(ов) на WB${created.length ? `, новых — ${created.length}` : ''}, вашими отмечены ${ours.length}`
+      + (ours.length ? `: ${quoted(ours)}. Заказы забираются только с них.`
+        : '. Заказы этого продавца не забираются, пока вы или он не отметите склады галочкой («Продавцы и площадки» → продавец).');
     await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
       entityType: 'wb_warehouse', entityId: companyId, actionText: text });
   }
@@ -453,8 +427,9 @@ async function list(client, warehouseId, companyId) {
   const stocksAt = (await client.query(
     'SELECT max(fetched_at) AS at FROM wb_stock_levels WHERE warehouse_id = $1 AND company_id = $2',
     [warehouseId, companyId])).rows[0].at;
-  const shown = rows.filter((r) => r.ours || ctx.officeIds.has(String(r.office_id)));
-  const other = rows.filter((r) => !shown.includes(r));
+  // Все склады продавца — выбирает человек (владелец 01.10.2026).
+  const shown = rows;
+  const other = [];
   return {
     ffName: ctx.ffName,
     officesConfigured: ctx.officeIds.size,
@@ -592,8 +567,18 @@ async function ensureOffices(client, warehouseId) {
   return auto.added;
 }
 
+// «Обновить из WB» — прочитать склады продавца сейчас, пересчитать отметки
+// и заказы. token — ключ продавца (читается вызывающим).
+async function refreshNow(client, warehouseId, companyId, token, { importOrders }) {
+  const read = await refresh(client, warehouseId, companyId, token, { force: true, throttleMs: 60 * 1000 });
+  if (read.error) throw new HttpError(502, `WB не отдал список складов: ${read.error}`);
+  await ensureOffices(client, warehouseId);
+  await settle(client, warehouseId, companyId, { importOrders });
+  return list(client, warehouseId, companyId);
+}
+
 module.exports = {
-  ensureOffices, officesDecided,
+  ensureOffices, officesDecided, refreshNow,
   autoOurs, norm, applyAuto, refresh, policy, hideOrders, settle, backfillHistory, refreshStocks,
   list, setOurs, listOffices, setOffice, setOffices, afterRuleChange,
 };
