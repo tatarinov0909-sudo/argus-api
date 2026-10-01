@@ -243,14 +243,20 @@ router.get('/wb-warehouses', requireAuth, requireRole('seller', 'owner', 'manage
     const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
       const info = await sellerWarehouses.list(c, company.warehouse_id, company.id);
       // Размер WB → наш товар: по заказам, где размер записан; у размера,
-      // встречавшегося под разными кодами, — самый частый.
+      // встречавшегося под разными кодами, — сначала настоящий товар продавца,
+      // потом самый частый. Заказы, пришедшие до сопоставления с WB и
+      // закрытые на WB, так и записаны артикулом WB; раньше они перевешивали,
+      // и у товара «На WB» было пусто (проверка 02.10, находка 7).
       const levels = (await c.query(
         `WITH sizes AS (
            SELECT DISTINCT ON (ii.mp_chrt_id) ii.mp_chrt_id AS chrt_id, ii.sku
              FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
             WHERE ii.warehouse_id = $1 AND ii.company_id = $2 AND i.source = 'wb' AND ii.mp_chrt_id IS NOT NULL
             GROUP BY ii.mp_chrt_id, ii.sku
-            ORDER BY ii.mp_chrt_id, count(*) DESC)
+            ORDER BY ii.mp_chrt_id,
+                     EXISTS (SELECT 1 FROM products p
+                              WHERE p.warehouse_id = $1 AND p.company_id = $2 AND p.sku = ii.sku) DESC,
+                     count(*) DESC)
          SELECT s.sku, l.mp_warehouse_id, sum(l.amount)::int AS amount, max(l.fetched_at) AS fetched_at
            FROM wb_stock_levels l JOIN sizes s ON s.chrt_id = l.chrt_id
           WHERE l.warehouse_id = $1 AND l.company_id = $2
@@ -312,11 +318,14 @@ router.get('/export/1c', requireAuth, requireRole('owner', 'manager'), async (re
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400,'Укажите продавца');
+    // Учёт — там же, где у экрана остатков (анкета склада): иначе у склада,
+    // который ведёт учёт в Аргусе, файл не совпадал с экраном (проверка 02.10).
+    const source = await stockSourceOf(req, companyId);
     const prepared = await withTenantContext(tenantContextFromAuth(req.auth), async c => {
       // All quantities come from one loadStock SQL statement (one MVCC snapshot).
       const company = (await c.query('SELECT id,name,warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL',[companyId])).rows[0];
       if (!company) throw new HttpError(404,'Компания не найдена');
-      return prepareInventoryExport((await loadStock(c,companyId)).filter(row => row.listed || row.stockKnown), {
+      return prepareInventoryExport((await loadStock(c,companyId,{ source })).filter(row => row.listed || row.stockKnown), {
         seller: { id:company.id,name:company.name }, warehouse: { id:company.warehouse_id },
       });
     });
