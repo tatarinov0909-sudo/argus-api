@@ -622,7 +622,9 @@ async function stockCover(client, warehouseId, companyId = null) {
   return { shortInvoices, take, onHand, reserved };
 }
 
-async function list(client, warehouseId, { status = null, showShortages = false, limit = null } = {}) {
+// recentOnly — грузчику: уехавшие больше двух недель назад не нужны, как и
+// закрытые документы в /api/invoices (проверка 01.10.2026).
+async function list(client, warehouseId, { status = null, showShortages = false, limit = null, recentOnly = false } = {}) {
   // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
   // в запросе роняло его целиком, и человек получал «внутреннюю ошибку»
   // там, где должен получить «такого статуса нет».
@@ -657,10 +659,11 @@ async function list(client, warehouseId, { status = null, showShortages = false,
           ORDER BY je.created_at LIMIT 1) cb ON true
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
+        AND (NOT $5::boolean OR s.status <> 'shipped' OR COALESCE(s.shipped_at, s.created_at) > now() - interval '14 days')
       GROUP BY s.id, c.name, cb.actor_type, cb.actor_name
       ORDER BY s.created_at DESC
       LIMIT $4`,
-    [warehouseId, status, showShortages === true, limit],
+    [warehouseId, status, showShortages === true, limit, recentOnly === true],
   );
   // Сколько заказов поставки, по учёту, собрать не из чего.
   const { shortInvoices } = await stockCover(client, warehouseId);

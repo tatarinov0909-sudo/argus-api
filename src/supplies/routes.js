@@ -135,7 +135,8 @@ router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller')
       // ?limit= — последние N поставок (экрану актов не нужна вся история).
       const limit = /^\d{1,4}$/.test(String(req.query.limit || '')) ? Math.min(Number(req.query.limit), 1000) : null;
       const list = await service.list(
-        client, req.auth.warehouseId, { status: req.query.status || null, showShortages: seesShortages(req.auth), limit },
+        client, req.auth.warehouseId,
+        { status: req.query.status || null, showShortages: seesShortages(req.auth), limit, recentOnly: req.auth.role === 'worker' },
       );
       // Ход сборки — строкой у поставки: «На паузе · Дима · взято 3 из 7».
       // Складу, не продавцу: имена грузчиков и их заметки — внутреннее дело.

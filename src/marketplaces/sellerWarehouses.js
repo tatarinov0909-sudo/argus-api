@@ -40,6 +40,10 @@ const nameMatches = (name, { names }) => names.some((n) => norm(name).includes(n
 // продавца, пункты приёмки не нужны): в названии есть имя фулфилмента — наш;
 // у продавца всего один склад и ни одного с нашим именем — тоже наш (у
 // «Слим Тим» один склад «ФФ Восток»). Остальное решает человек галочкой.
+// Правило только ставит отметку, а снимает её только человек (проверка
+// 01.10.2026): иначе заказы, которые склад уже вёл, молча уходили из работы,
+// стоило переименовать склад, продавцу завести второй склад или WB раз
+// ответить пустым списком.
 // ponytail: эвристика по названию; ошиблась — человек ставит галочку, и
 // правило больше этот склад не трогает.
 function autoOurs(w, ctx, sellerHasNamed, sellerActive) {
@@ -68,8 +72,8 @@ const credentialRow = async (client, warehouseId, companyId) => (await client.qu
 const quoted = (names, max = 6) => names.slice(0, max).map((n) => `«${n}»`).join(', ')
   + (names.length > max ? ` и ещё ${names.length - max}` : '');
 
-// Переоценить правило у складов, которые не решал человек. companyId = null —
-// у всех продавцов склада (поменялся список пунктов приёмки).
+// Отметить по правилу склады, которые не решал человек (только отметить —
+// см. autoOurs). companyId = null — у всех продавцов склада.
 async function applyAuto(client, warehouseId, companyId = null) {
   const ctx = await ffContext(client, warehouseId);
   const rows = (await client.query(
@@ -79,11 +83,11 @@ async function applyAuto(client, warehouseId, companyId = null) {
   const named = new Set(rows.filter((r) => !r.gone_at && nameMatches(r.name, ctx)).map((r) => r.company_id));
   const active = new Map();
   for (const r of rows) if (!r.gone_at) active.set(r.company_id, (active.get(r.company_id) || 0) + 1);
-  const changed = rows.filter((r) => r.decided_by == null
-      && autoOurs(r, ctx, named.has(r.company_id), active.get(r.company_id) || 0) !== r.ours)
-    .map((r) => ({ ...r, ours: !r.ours }));
+  const changed = rows.filter((r) => r.decided_by == null && !r.ours
+      && autoOurs(r, ctx, named.has(r.company_id), active.get(r.company_id) || 0))
+    .map((r) => ({ ...r, ours: true }));
   for (const r of changed) {
-    await client.query('UPDATE seller_wb_warehouses SET ours = $2 WHERE id = $1', [r.id, r.ours]);
+    await client.query('UPDATE seller_wb_warehouses SET ours = true WHERE id = $1', [r.id]);
   }
   return changed;
 }
@@ -109,9 +113,10 @@ async function refresh(client, warehouseId, companyId, token, {
 } = {}) {
   const cred = await credentialRow(client, warehouseId, companyId);
   if (!cred) return { skipped: true };
-  const known = new Set((await client.query(
-    'SELECT mp_warehouse_id FROM seller_wb_warehouses WHERE warehouse_id = $1 AND company_id = $2',
-    [warehouseId, companyId])).rows.map((r) => r.mp_warehouse_id));
+  const knownRows = (await client.query(
+    'SELECT mp_warehouse_id, gone_at FROM seller_wb_warehouses WHERE warehouse_id = $1 AND company_id = $2',
+    [warehouseId, companyId])).rows;
+  const known = new Set(knownRows.map((r) => r.mp_warehouse_id));
   const unknown = orders.some((o) => o.warehouseId && !known.has(o.warehouseId));
   const age = cred.wb_warehouses_at ? Date.now() - new Date(cred.wb_warehouses_at).getTime() : Infinity;
   if (!force && age < REFRESH_MS && !(unknown && age > RETRY_UNKNOWN_MS)) return { skipped: true };
@@ -122,6 +127,9 @@ async function refresh(client, warehouseId, companyId, token, {
   let offices = [];
   try {
     list = await fetchWarehouses(token);
+    // Пустой список, когда склады у продавца были, — сбой WB, а не «все
+    // склады удалены» (как с пунктами отгрузки в supplies/routes.js).
+    if (!list.length && knownRows.some((r) => !r.gone_at)) throw new Error('WB вернул пустой список складов');
     // Адрес пункта — для людей, не для правила: без него работаем дальше.
     try { offices = await fetchOffices(token); } catch { offices = []; }
   } catch (err) {
@@ -216,10 +224,14 @@ async function hideOrders(client, warehouseId, companyId, orders) {
       WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.source = 'wb'
         AND i.external_id = o->>'externalId' AND i.mp_warehouse_id IS NULL`,
     [warehouseId, companyId, JSON.stringify(orders)]);
+  // Заказ, который уже в работе (в поставке, с отбором — settle его не
+  // убирает), в отложенные не кладём: иначе он числится и там, и там.
   const r = await client.query(
     `INSERT INTO wb_foreign_orders (warehouse_id, company_id, external_id, mp_warehouse_id, mp_created_at, wb_order)
      SELECT $1, $2, o->>'externalId', o->>'warehouseId', (o->>'createdAt')::timestamptz, o
        FROM jsonb_array_elements($3::jsonb) AS o
+      WHERE NOT EXISTS (SELECT 1 FROM invoices i
+                         WHERE i.warehouse_id = $1 AND i.source = 'wb' AND i.external_id = o->>'externalId')
      ON CONFLICT (warehouse_id, external_id) DO NOTHING`,
     [warehouseId, companyId, JSON.stringify(orders)]);
   return r.rowCount;
@@ -231,6 +243,12 @@ async function hideOrders(client, warehouseId, companyId, orders) {
 // комментарием или документом заказ остаётся, как бы ни стояла галочка.
 async function settle(client, warehouseId, companyId, { importOrders }) {
   const p = await policy(client, warehouseId, companyId);
+  // Отложенный заказ, который есть и в работе, — лишняя строка (так клал
+  // hideOrders до 01.10.2026): иначе счётчики «не в работе» и «вернулось» врут.
+  await client.query(
+    `DELETE FROM wb_foreign_orders f WHERE f.warehouse_id = $1 AND f.company_id = $2
+        AND EXISTS (SELECT 1 FROM invoices i WHERE i.warehouse_id = $1 AND i.source = 'wb' AND i.external_id = f.external_id)`,
+    [warehouseId, companyId]);
   let hidden = 0;
   if (p.foreignIds.length) {
     const r = await client.query(
@@ -243,7 +261,11 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
                   'salePriceKopecks', i.mp_sale_price_kopecks, 'warehouseId', i.mp_warehouse_id,
                   'chrtId', ii.mp_chrt_id) AS wb_order,
                 to_jsonb(i.*) AS invoice_row,
-                (SELECT jsonb_agg(to_jsonb(x.*)) FROM invoice_items x WHERE x.invoice_id = i.id) AS item_rows
+                (SELECT jsonb_agg(to_jsonb(x.*)) FROM invoice_items x WHERE x.invoice_id = i.id) AS item_rows,
+                -- Записи журнала о заказе: при удалении ссылка обнулится
+                -- (ON DELETE SET NULL), при возврате её вернёт relink_journal_invoice.
+                (SELECT array_agg(je.id) FROM journal_entries je
+                  WHERE je.warehouse_id = $1 AND je.invoice_id = i.id) AS journal_ids
            FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
           WHERE i.warehouse_id = $1 AND i.company_id = $2 AND i.source = 'wb' AND i.direction = 'out'
             AND i.mp_warehouse_id = ANY($3::text[])
@@ -258,52 +280,63 @@ async function settle(client, warehouseId, companyId, { importOrders }) {
           LIMIT ${BATCH}
        ), saved AS (
          INSERT INTO wb_foreign_orders (warehouse_id, company_id, external_id, mp_warehouse_id, mp_created_at,
-                                        wb_order, invoice_row, item_rows)
-         SELECT $1, $2, external_id, mp_warehouse_id, mp_created_at, wb_order, invoice_row, item_rows FROM victims
+                                        wb_order, invoice_row, item_rows, journal_ids)
+         SELECT $1, $2, external_id, mp_warehouse_id, mp_created_at, wb_order, invoice_row, item_rows, journal_ids
+           FROM victims
          ON CONFLICT (warehouse_id, external_id) DO UPDATE SET
            mp_warehouse_id = EXCLUDED.mp_warehouse_id, wb_order = EXCLUDED.wb_order,
-           invoice_row = EXCLUDED.invoice_row, item_rows = EXCLUDED.item_rows
+           invoice_row = EXCLUDED.invoice_row, item_rows = EXCLUDED.item_rows, journal_ids = EXCLUDED.journal_ids
        )
        DELETE FROM invoices WHERE id IN (SELECT id FROM victims)`,
       [warehouseId, companyId, p.foreignIds]);
     hidden = r.rowCount;
   }
   const back = (await client.query(
-    `SELECT id, wb_order, invoice_row IS NOT NULL AS whole FROM wb_foreign_orders
+    `SELECT id, wb_order, invoice_row IS NOT NULL AS whole, invoice_row->>'id' AS invoice_id,
+            journal_ids::text[] AS journal_ids FROM wb_foreign_orders
       WHERE warehouse_id = $1 AND company_id = $2 AND NOT (mp_warehouse_id = ANY($3::text[]))
       ORDER BY mp_created_at NULLS LAST LIMIT ${BATCH}`,
     [warehouseId, companyId, p.foreignIds])).rows;
+  let restored = 0;
   if (back.length) {
     // Заказ, который был в работе, — его же строкой (номер записи, статус WB,
-    // даты); заказ, который в работу не попадал, — дорогой нового заказа.
+    // даты) и с его историей в журнале; заказ, который в работу не попадал, —
+    // дорогой нового заказа.
     // ponytail: снимок — все колонки на момент убирания; новая NOT NULL
     // колонка в invoices без значения в снимке сломает возврат — добавлять
     // её вместе с дозаполнением снимков в wb_foreign_orders.
     const whole = back.filter((r) => r.whole).map((r) => r.id);
     if (whole.length) {
-      await client.query(
+      const ins = await client.query(
         `WITH src AS (SELECT invoice_row, item_rows FROM wb_foreign_orders WHERE id = ANY($1::uuid[])),
               ins AS (INSERT INTO invoices SELECT (jsonb_populate_record(NULL::invoices, src.invoice_row)).* FROM src
-                      ON CONFLICT DO NOTHING RETURNING id)
-         INSERT INTO invoice_items
-         SELECT (jsonb_populate_record(NULL::invoice_items, it)).*
-           FROM src, jsonb_array_elements(src.item_rows) AS it
-          WHERE (it->>'invoice_id')::uuid IN (SELECT id FROM ins)`, [whole]);
+                      ON CONFLICT DO NOTHING RETURNING id),
+              items AS (INSERT INTO invoice_items
+                        SELECT (jsonb_populate_record(NULL::invoice_items, it)).*
+                          FROM src, jsonb_array_elements(src.item_rows) AS it
+                         WHERE (it->>'invoice_id')::uuid IN (SELECT id FROM ins))
+         SELECT count(*)::int AS n FROM ins`, [whole]);
+      restored += ins.rows[0].n;
+      const links = back.filter((r) => r.whole && r.journal_ids?.length);
+      if (links.length) {
+        await client.query('SELECT relink_journal_invoice($1::uuid[], $2::uuid[])',
+          [links.flatMap((r) => r.journal_ids), links.flatMap((r) => r.journal_ids.map(() => r.invoice_id))]);
+      }
     }
     const fresh = back.filter((r) => !r.whole).map((r) => r.wb_order);
-    if (fresh.length) await importOrders(client, warehouseId, { companyId, orders: fresh });
+    if (fresh.length) restored += (await importOrders(client, warehouseId, { companyId, orders: fresh })).created;
     await client.query('DELETE FROM wb_foreign_orders WHERE id = ANY($1::uuid[])', [back.map((r) => r.id)]);
   }
-  if (hidden || back.length) {
+  if (hidden || restored) {
     const name = await companyName(client, companyId);
     await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
       entityType: 'wb_warehouse', entityId: companyId,
       actionText: `Склады WB «${name}»: `
         + (hidden ? `${hidden} заказ(ов) со складов, не отмеченных вашими, убраны из работы — их собирает другой фулфилмент. `
           + 'Заказы не удалены: отметите склад вашим — вернутся. ' : '')
-        + (back.length ? `${back.length} заказ(ов) вернулись в работу: их склад теперь отмечен вашим.` : '') });
+        + (restored ? `${restored} заказ(ов) вернулись в работу: их склад теперь отмечен вашим.` : '') });
   }
-  return { hidden, restored: back.length };
+  return { hidden, restored };
 }
 
 // У заказов, заведённых до 30.09.2026, склад WB не сохранён. Узнаём его из
@@ -452,8 +485,15 @@ async function list(client, warehouseId, companyId) {
   };
 }
 
+// Тот же замок, что берёт обмен с WB (sync.pullWildberries, без ожидания):
+// галочка и «Обновить из WB» ждут конца обмена этого продавца, а не
+// встречают его блокировки в обратном порядке (взаимная блокировка, 409).
+const lockSeller = (client, warehouseId, companyId) => client.query(
+  'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`wb-sync:${warehouseId}:${companyId}`]);
+
 // actor — кто решил: { name, type, id } (продавец, менеджер, руководитель).
 async function setOurs(client, warehouseId, companyId, mpWarehouseId, ours, actor, { importOrders }) {
+  await lockSeller(client, warehouseId, companyId);
   const r = (await client.query(
     `UPDATE seller_wb_warehouses SET ours = $4, decided_by = $5, decided_at = now()
       WHERE warehouse_id = $1 AND company_id = $2 AND mp_warehouse_id = $3 RETURNING name`,
@@ -498,7 +538,7 @@ async function listOffices(client, warehouseId) {
   const order = (o) => (o.configured ? 0 : o.ourNames.length ? 1 : 2);
   // Сводка по продавцам — для их карточек на экране «Площадки», одним запросом.
   const sellers = (await client.query(
-    `SELECT w.company_id, count(*) FILTER (WHERE w.gone_at IS NULL)::int AS total,
+    `SELECT w.company_id, count(*)::int AS total,
             count(*) FILTER (WHERE w.ours)::int AS ours,
             (SELECT count(*)::int FROM wb_foreign_orders f WHERE f.warehouse_id = $1 AND f.company_id = w.company_id) AS hidden
        FROM seller_wb_warehouses w WHERE w.warehouse_id = $1 GROUP BY w.company_id`, [warehouseId])).rows;
@@ -570,6 +610,7 @@ async function ensureOffices(client, warehouseId) {
 // «Обновить из WB» — прочитать склады продавца сейчас, пересчитать отметки
 // и заказы. token — ключ продавца (читается вызывающим).
 async function refreshNow(client, warehouseId, companyId, token, { importOrders }) {
+  await lockSeller(client, warehouseId, companyId);
   const read = await refresh(client, warehouseId, companyId, token, { force: true, throttleMs: 60 * 1000 });
   if (read.error) throw new HttpError(502, `WB не отдал список складов: ${read.error}`);
   await ensureOffices(client, warehouseId);

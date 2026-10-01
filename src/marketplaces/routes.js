@@ -111,7 +111,9 @@ router.post('/:companyId/wb/warehouses/refresh', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.patch('/:companyId/wb/warehouses/:mpWarehouseId', async (req, res, next) => {
+// Галочка решает, чьи заказы склад берёт в работу, — как подключение ключа:
+// менеджеру только с правом «маркетплейсы» (проверка 01.10.2026).
+router.patch('/:companyId/wb/warehouses/:mpWarehouseId', requireGrant('marketplaces'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
     if (typeof req.body?.ours !== 'boolean') throw new HttpError(400, 'Передайте ours: true или false');

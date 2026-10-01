@@ -20,7 +20,15 @@ async function keyState(role, id) {
   if (hit && Date.now() - hit.at < KEY_CACHE_MS) return hit.state;
 
   let state;
-  if (role === 'seller') {
+  if (role === 'owner') {
+    // Ключа у владельца нет — есть пароль: жив тот вход, чей отпечаток пароля
+    // совпадает с нынешним (auth/service passwordStamp).
+    const r = await withoutTenantContext((client) => client.query(
+      'SELECT owner_password_hash($1) AS h', [id],
+    ));
+    const h = r.rows[0]?.h;
+    state = { active: Boolean(h), stamp: h ? require('../auth/service').passwordStamp(h) : null };
+  } else if (role === 'seller') {
     const r = await withoutTenantContext((client) => client.query(
       'SELECT seller_key_is_active($1) AS active', [id],
     ));
@@ -78,8 +86,12 @@ async function requireAuth(req, res, next) {
   // старым — и отзыв его ключа не действовал бы до конца жизни токена. Ровно
   // этот же промах у продавца уже стоил нам сорока пяти минут, за которые
   // отозванный ключ продолжал работать.
+  // Владелец — по паролю: после смены пароля входы, открытые до неё, не
+  // пускают (проверка 01.10.2026: вход, забытый на чужом компьютере, жил
+  // и продлевался дальше).
   const keyId = payload.role === 'seller' ? payload.sellerKeyId
-    : (payload.role === 'worker' || payload.role === 'manager') ? payload.staffKeyId : null;
+    : (payload.role === 'worker' || payload.role === 'manager') ? payload.staffKeyId
+      : payload.role === 'owner' ? payload.ownerId : null;
   if (keyId) {
     let state;
     try {
@@ -89,10 +101,13 @@ async function requireAuth(req, res, next) {
       // отзыв ключа для человека выглядят одинаково, а причины разные.
       return res.status(503).json({ error: 'Сервер временно недоступен, повторите' });
     }
-    if (!state.active) {
+    if (payload.role === 'owner') {
+      if (!state.active || !payload.pv || payload.pv !== state.stamp) {
+        return res.status(401).json({ error: 'Пароль сменили — войдите заново.' });
+      }
+    } else if (!state.active) {
       return res.status(401).json({ error: 'Ваш ключ отозван. Обратитесь к руководителю склада.' });
-    }
-    if (payload.role !== 'seller') {
+    } else if (payload.role !== 'seller') {
       // Руководитель перевёл ключ из менеджеров в работники или обратно —
       // старый вход в чужой кабинет не годится, нужен новый.
       const role = state.kind === 'manager' ? 'manager' : 'worker';
@@ -169,6 +184,10 @@ function allowWarehouseView(req, res, next) {
   });
 }
 
+// Забыть ответ из памяти сразу (сменили пароль): иначе пару секунд старые
+// входы ещё пускало бы.
+const forgetKey = (role, id) => keyCache.delete(role + ':' + id);
+
 module.exports = {
-  requireAuth, requireRole, requireGrant, allowWarehouseView, GRANTS,
+  requireAuth, requireRole, requireGrant, allowWarehouseView, GRANTS, forgetKey,
 };

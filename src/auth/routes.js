@@ -4,11 +4,14 @@ const service = require('./service');
 const { loginLimiter, keyLoginLimiter, registerLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, forgetKey } = require('../middleware/auth');
 
 router.post('/owner/password', loginLimiter, requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
-    res.json(await service.changeOwnerPassword(req.auth.ownerId, req.body));
+    // Новый вход — и в заголовке: кабинет подхватывает его, как продлённый.
+    const out = await service.changeOwnerPassword(req.auth, req.body);
+    forgetKey('owner', req.auth.ownerId);
+    res.set('X-Argus-Token', out.token).json(out);
   } catch (err) {
     next(err);
   }

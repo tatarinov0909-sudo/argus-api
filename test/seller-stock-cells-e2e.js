@@ -122,8 +122,15 @@ function check(name, fn) {
       assert.equal(newLogin.status, 200);
       assert.equal(bySeller.status, 403);
     });
+    // Вход, открытый до смены пароля, больше не пускает; сменивший пароль
+    // получает новый вход в ответе (проверка 01.10.2026).
+    const stale = await api('GET', '/api/warehouses/me', { token: owner });
+    check('после смены пароля старый вход не пускает, новый — в ответе', () => {
+      assert.equal(stale.status, 401);
+      assert.ok(changed.body.token);
+    });
 
-    const totals = await must('GET', '/api/warehouses/me/stock-sources', { token: owner });
+    const totals = await must('GET', '/api/warehouses/me/stock-sources', { token: changed.body.token });
     check('сверка перед сменой учёта: в ячейках 100, по 1С 0', () => {
       assert.equal(totals.cells, 100);
       assert.equal(totals.onec, 0);

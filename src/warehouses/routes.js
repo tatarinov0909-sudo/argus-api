@@ -36,15 +36,24 @@ router.get('/me/stock-sources', requireAuth, requireRole('owner'), async (req, r
       `SELECT (SELECT COALESCE(sum(GREATEST(stock_qty_1c, 0)), 0)::bigint FROM products
                 WHERE warehouse_id = $1 AND active AND company_id IS NOT NULL) AS onec,
               (SELECT COALESCE(sum(qty), 0)::bigint FROM cell_stock
-                WHERE warehouse_id = $1 AND quality = 'good' AND company_id IS NOT NULL) AS cells`,
+                WHERE warehouse_id = $1 AND quality = 'good' AND company_id IS NOT NULL) AS cells,
+              -- Собранное, но не уехавшее: из ячеек ушло, а «Всего» у
+              -- продавца его считает (sellers/stock.js, staged).
+              (SELECT COALESCE(sum(sr.picked_qty), 0)::bigint FROM shipping_records sr
+                 JOIN invoice_items ii ON ii.id = sr.invoice_item_id JOIN invoices i ON i.id = ii.invoice_id
+                WHERE i.warehouse_id = $1 AND sr.company_id IS NOT NULL AND i.direction = 'out'
+                  AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL) AS staged`,
       [warehouseId])).rows[0]);
-    res.json({ onec: Number(out.onec), cells: Number(out.cells) });
+    res.json({ onec: Number(out.onec), cells: Number(out.cells), staged: Number(out.staged) });
   } catch (err) {
     next(err);
   }
 });
 
+// Только имя пояса («Europe/Moscow», «UTC»): смещение вроде «+03:00» не
+// переходит на летнее время и не везде понятно браузеру (проверка 01.10.2026).
 const validTimezone = (tz) => {
+  if (!/^(UTC|[A-Za-z]+(\/[A-Za-z0-9_+-]+)+)$/.test(tz)) return false;
   try { new Intl.DateTimeFormat('ru-RU', { timeZone: tz }); return true; } catch { return false; }
 };
 
@@ -69,11 +78,16 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
     }
     let wbNames;
     if (body.wbNames !== undefined) {
-      if (!Array.isArray(body.wbNames)) throw new HttpError(400, 'wbNames — список названий');
-      wbNames = [...new Set(body.wbNames.map((n) => String(n).trim().slice(0, 60)).filter((n) => n.length >= 3))].slice(0, 10);
+      // Только строки: String({}) — «[object Object]», String(null) — «null», и
+      // такое «имя» отмечало бы чужие склады нашими (проверка 01.10.2026).
+      if (!Array.isArray(body.wbNames) || body.wbNames.some((n) => typeof n !== 'string')) {
+        throw new HttpError(400, 'wbNames — список названий');
+      }
+      wbNames = [...new Set(body.wbNames.map((n) => n.trim().slice(0, 60)).filter((n) => n.length >= 3))].slice(0, 10);
     }
     if (name !== undefined && !name) throw new HttpError(400, 'Название склада не может быть пустым');
     const warehouse = await withTenantContext({ warehouseId }, async (client) => {
+      const before = (await client.query('SELECT name, wb_names FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
       const result = await client.query(
         `UPDATE warehouses SET name = COALESCE($2, name), city = COALESCE($3, city),
                 legal_name = CASE WHEN $4::boolean THEN NULLIF($5, '') ELSE legal_name END,
@@ -88,8 +102,11 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
           body.setupDone === true],
       );
       // Имя склада и «как нас называют продавцы» решают, какие склады WB
-      // продавцов Аргус считает нашими: пересчитать отметки и заказы.
-      if (wbNames !== undefined || name !== undefined) {
+      // продавцов Аргус считает нашими: отметить новые совпадения. Экран шлёт
+      // оба поля при каждом сохранении — пересчёт только когда они изменились.
+      const after = result.rows[0];
+      if (before && after && (before.name !== after.name
+          || JSON.stringify(before.wb_names || []) !== JSON.stringify(after.wb_names || []))) {
         await sellerWarehouses.afterRuleChange(client, warehouseId, sync.importOrders);
       }
       return result.rows[0];

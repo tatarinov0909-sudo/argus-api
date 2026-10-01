@@ -38,6 +38,13 @@ function signToken(payload) {
   });
 }
 
+// Отпечаток пароля во входе владельца (проверка 01.10.2026): сменили пароль —
+// отпечаток другой, и входы, открытые до смены, перестают пускать
+// (requireAuth). HMAC, а не сам хеш: по токену о пароле ничего не узнать.
+function passwordStamp(hash) {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET).update(String(hash)).digest('base64url').slice(0, 16);
+}
+
 async function registerOwner({ name, email, password, warehouseName, city }) {
   if (!name || !email || !password || !warehouseName) {
     throw new HttpError(400, 'Заполните все обязательные поля');
@@ -78,6 +85,7 @@ async function registerOwner({ name, email, password, warehouseName, city }) {
 
       const token = signToken({
         role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name,
+        pv: passwordStamp(passwordHash),
       });
       return { token, owner, warehouse };
     });
@@ -121,7 +129,8 @@ async function loginOwner({ email, password }) {
     const warehouse = whResult.rows[0];
     if (!warehouse) throw new HttpError(404, 'У этого аккаунта пока нет склада');
 
-    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name });
+    const token = signToken({ role: 'owner', ownerId: owner.id, warehouseId: warehouse.id, ownerName: owner.name,
+      pv: passwordStamp(owner.password_hash) });
     return { token, owner: { id: owner.id, name: owner.name, email: owner.email }, warehouse };
   });
 }
@@ -216,7 +225,10 @@ async function loginSellerKey({ keyCode, name }) {
 // Смена пароля владельцем: старый пароль обязателен — вход могли оставить
 // открытым на чужом компьютере. Хеш меняется, только если старый не успел
 // смениться параллельно (set_owner_password сверяет его).
-async function changeOwnerPassword(ownerId, { currentPassword, newPassword } = {}) {
+// auth — вход, с которого меняют пароль: ему отдаём новый токен, остальные
+// входы владельца после смены не пускают.
+async function changeOwnerPassword(auth, { currentPassword, newPassword } = {}) {
+  const { ownerId } = auth;
   if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
     throw new HttpError(400, 'Введите нынешний и новый пароль');
   }
@@ -227,12 +239,15 @@ async function changeOwnerPassword(ownerId, { currentPassword, newPassword } = {
     const newHash = await bcrypt.hash(newPassword, 12);
     const ok = (await client.query('SELECT set_owner_password($1, $2, $3) AS ok', [ownerId, oldHash, newHash])).rows[0]?.ok;
     if (!ok) throw new HttpError(409, 'Пароль только что поменяли в другом месте — войдите заново');
-    return { changed: true };
+    const token = signToken({ role: 'owner', ownerId, warehouseId: auth.warehouseId, ownerName: auth.ownerName,
+      pv: passwordStamp(newHash) });
+    return { changed: true, token };
   });
 }
 
 module.exports = {
   changeOwnerPassword,
+  passwordStamp,
   registerOwner,
   loginOwner,
   loginStaffKey,

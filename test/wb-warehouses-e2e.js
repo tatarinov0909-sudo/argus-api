@@ -296,10 +296,13 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
 
     // ---------- 10. Настройки склада: анкета ----------
     const bad = await api('PATCH', '/api/warehouses/me', { token: owner, body: { timezone: 'Марс/Олимп' } });
+    // Смещение вместо имени пояса — не принимается (проверка 01.10.2026).
+    const offset = await api('PATCH', '/api/warehouses/me', { token: owner, body: { timezone: '+03:00' } });
     const setup = await api('PATCH', '/api/warehouses/me', { token: owner,
       body: { stockSource: 'argus', timezone: 'Asia/Novosibirsk', wbSuppliesBy: 'seller', setupDone: true } });
     check('анкета: неверный пояс не принят, ответы сохранены', () => {
       assert.equal(bad.status, 400);
+      assert.equal(offset.status, 400);
       assert.equal(setup.body.stock_source, 'argus');
       assert.equal(setup.body.timezone, 'Asia/Novosibirsk');
       assert.equal(setup.body.wb_supplies_by, 'seller');
@@ -326,6 +329,16 @@ wb.orderStatuses = async (_, ids) => ids.map((id) => ({ id: Number(id), supplier
       assert.equal(w1.status, 403);
       assert.equal(w2.status, 403);
       assert.equal(w3.status, 403);
+    });
+
+    // ---------- 13. Менеджер без права «маркетплейсы» галочки не ставит ----------
+    const mgrKey = await api('POST', '/api/staff', { token: owner, body: { name: 'Менеджер', kind: 'manager' } });
+    const mgr = (await api('POST', '/api/auth/staff/login', { body: { keyCode: mgrKey.body.key_code, as: 'manager' } })).body.token;
+    const m1 = await api('GET', `/api/marketplaces/${companyId}/wb/warehouses`, { token: mgr });
+    const m2 = await api('PATCH', `/api/marketplaces/${companyId}/wb/warehouses/12`, { token: mgr, body: { ours: false } });
+    check('менеджер без права «маркетплейсы» видит склады WB, но галочку не ставит', () => {
+      assert.equal(m1.status, 200, JSON.stringify(m1.body));
+      assert.equal(m2.status, 403, JSON.stringify(m2.body));
     });
   } catch (err) {
     failures.push({ name: 'тест упал', message: err.stack });
