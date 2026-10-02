@@ -85,9 +85,20 @@ const WORK_NOW_TOOL = {
   parameters: { type: 'object', properties: {} },
 };
 
+const SELLER_STOCK_TOOL = {
+  name: 'seller_stock',
+  description: 'Остатки продавцов, как в их кабинетах: всего, заказано, в сборке, в пути, доступно, брак, у скольких товаров заказов больше, чем товара. Без имени — по всем продавцам; с именем — итог продавца и чего не хватает.',
+  parameters: {
+    type: 'object',
+    properties: {
+      seller: { type: 'string', description: 'Название продавца' },
+    },
+  },
+};
+
 // Порядок важен только для читаемости — модель выбирает по описанию.
 const ALL_TOOLS = [
-  FIND_PRODUCTS_TOOL, SUPPLIES_TOOL, WORK_NOW_TOOL, LIST_INVOICES_TOOL,
+  FIND_PRODUCTS_TOOL, SELLER_STOCK_TOOL, SUPPLIES_TOOL, WORK_NOW_TOOL, LIST_INVOICES_TOOL,
   INVOICE_DETAILS_TOOL, WAREHOUSE_SUMMARY_TOOL, DISCREPANCIES_TOOL,
 ];
 

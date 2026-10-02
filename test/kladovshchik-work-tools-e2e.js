@@ -122,10 +122,10 @@ const { zoneOf, todayIn } = require('../src/warehouses/time');
 
     // ---- Убранное из чата ----
     assert.deepEqual(ALL_TOOLS.map((t) => t.name).sort(),
-      ['find_products', 'invoice_details', 'list_discrepancies', 'list_invoices', 'supplies', 'warehouse_summary', 'work_now']);
+      ['find_products', 'invoice_details', 'list_discrepancies', 'list_invoices', 'seller_stock', 'supplies', 'warehouse_summary', 'work_now']);
     assert.deepEqual(await tool('suggest_cell', { sku: 'NW-1' }), { error: 'неизвестный инструмент' });
     assert.deepEqual(await tool('pick_list'), { error: 'неизвестный инструмент' });
-    check('из чата убраны «подобрать ячейку» и «лист грузчика»; инструментов по-прежнему 7');
+    check('из чата убраны «подобрать ячейку» и «лист грузчика»');
 
     console.log(`\n${passed} checks passed`);
   } finally {

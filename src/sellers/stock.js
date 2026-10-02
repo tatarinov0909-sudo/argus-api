@@ -240,4 +240,63 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
     });
 }
 
-module.exports = { loadStock, BUCKET_SQL };
+// Итог по продавцу — одно правило для кабинета продавца, сводки владельца
+// «Остатки продавцов» и чата Кладовщика (владелец 02.10.2026).
+//
+// Только товары каталога продавца: строка заказа без товара не придумывает
+// ни товар, ни остаток. «Всего» и «Доступно» — по товарам, у которых есть
+// число учёта; товары без него названы отдельно (unknownNames), а не прячут
+// всё число прочерком: один тестовый товар, заведённый в Аргусе, гасил итог
+// по восьмидесяти (владелец 30.09.2026). Прочерк — когда не знаем ни одного.
+function summarize(rows) {
+  const inventoryRows = rows.filter((row) => row.listed);
+  const knownRows = inventoryRows.filter((row) => row.totalKnown);
+  const unknownRows = inventoryRows.filter((row) => !row.totalKnown);
+  const shortRows = inventoryRows.filter((row) => row.shortage);
+  const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
+  // Сортировка строк давала не самую свежую дату, а последнюю по алфавиту.
+  const updatedAt = inventoryRows
+    .map((row) => row.totalUpdatedAt)
+    .filter(Boolean)
+    .reduce((latest, value) => (!latest || new Date(value) > new Date(latest) ? value : latest), null);
+  return {
+    productCount: inventoryRows.length,
+    total: knownRows.length ? sum(knownRows, 'total') : null,
+    ordered: sum(inventoryRows, 'orderedNotInSupply'),
+    inAssembly: sum(inventoryRows, 'inAssembly'),
+    inTransit: sum(inventoryRows, 'inTransit'),
+    available: knownRows.length ? sum(knownRows, 'sellerAvailable') : null,
+    defect: sum(inventoryRows, 'defective') + sum(inventoryRows, 'packagingDefect'),
+    // Заказов больше, чем товара по учёту.
+    shortageCount: shortRows.length,
+    unknownCount: unknownRows.length,
+    unknownNames: unknownRows.slice(0, 5).map((row) => row.name || row.sku),
+    updatedAt,
+  };
+}
+
+// Сводка по всем продавцам склада: итог каждого — тем же summarize, что
+// видит сам продавец, — и сколько его товара лежит в ячейках (это видит
+// только склад). Продавцы по алфавиту, архивные не показываем.
+// ponytail: loadStock по каждому продавцу подряд (~0,1–0,3 с на продавца);
+// на сотне продавцов — один общий запрос по складу.
+async function stockBySeller(client, warehouseId) {
+  const source = (await client.query('SELECT stock_source FROM warehouses WHERE id = $1', [warehouseId]))
+    .rows[0]?.stock_source === 'argus' ? 'argus' : '1c';
+  const companies = (await client.query(
+    `SELECT id, name FROM companies WHERE warehouse_id = $1 AND archived_at IS NULL ORDER BY name`,
+    [warehouseId])).rows;
+  const out = [];
+  for (const c of companies) {
+    const rows = await loadStock(client, c.id, { source });
+    out.push({
+      companyId: c.id,
+      name: c.name,
+      ...summarize(rows),
+      inCells: rows.reduce((s, r) => s + Number(r.qty || 0) + Number(r.notForSale || 0), 0),
+    });
+  }
+  return { source, sellers: out };
+}
+
+module.exports = { loadStock, BUCKET_SQL, summarize, stockBySeller };

@@ -8,7 +8,7 @@ const { tenantContextFromAuth } = require('../auth/tenantContext');
 const inbound = require('./inbound');
 const defectsService = require('../defects/service');
 
-const { loadStock, BUCKET_SQL } = require('./stock');
+const { loadStock, BUCKET_SQL, summarize, stockBySeller } = require('./stock');
 const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
@@ -42,41 +42,8 @@ function sellerStockView(row) {
 }
 
 function sellerStockResponse(rows) {
-  // Only products with a current accounting quantity belong in the seller's
-  // inventory. Order-only lines stay visible on the orders page and cannot
-  // invent a product or a stock quantity.
-  // Строка без числа из 1С — это «остаток не получен», а не «товара нет»:
-  // раньше такие строки исчезали из кабинета вместе с товаром, который лежит
-  // в ячейках и по которому идут заказы. Поля totalKnown/unknownRows как раз
-  // для этого и заведены, и до сих пор были мертвы.
-  const inventoryRows = rows.filter(row => row.listed);
-  const unknownRows = inventoryRows.filter(row => !row.totalKnown);
-  const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
-  // Сортировка строк давала не самую свежую дату, а последнюю по алфавиту.
-  const updatedAt = inventoryRows
-    .map(row => row.totalUpdatedAt)
-    .filter(Boolean)
-    .reduce((latest, value) => (!latest || new Date(value) > new Date(latest) ? value : latest), null);
-
-  // «Всего» и «Доступно» — по товарам, у которых есть число учёта; товары
-  // без него названы отдельно (unknownNames), а не прячут всё число прочерком:
-  // один тестовый товар, заведённый в Аргусе, гасил итог по восьмидесяти
-  // (владелец 30.09.2026). Прочерк — когда не знаем ни одного.
-  const knownRows = inventoryRows.filter(row => row.totalKnown);
-  return {
-    rows: inventoryRows.map(sellerStockView),
-    summary: {
-      productCount: inventoryRows.length,
-      total: knownRows.length ? sum(knownRows, 'total') : null,
-      ordered: sum(inventoryRows, 'orderedNotInSupply'),
-      inAssembly: sum(inventoryRows, 'inAssembly'),
-      inTransit: sum(inventoryRows, 'inTransit'),
-      available: knownRows.length ? sum(knownRows, 'sellerAvailable') : null,
-      unknownCount: unknownRows.length,
-      unknownNames: unknownRows.slice(0, 5).map(row => row.name || row.sku),
-      updatedAt,
-    },
-  };
+  // Итог — одним правилом с владельцем и Кладовщиком (sellers/stock.js).
+  return { rows: rows.filter((row) => row.listed).map(sellerStockView), summary: summarize(rows) };
 }
 
 // Где склад продавца ведёт учёт остатков (анкета склада). Строку склада
@@ -571,6 +538,15 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
       // ?view=seller — владелец смотрит кабинет продавца его глазами.
       req.auth.role === 'seller' || req.query.view === 'seller' ? sellerStockResponse(rows) : visibleRows,
     );
+  } catch (err) { next(err); }
+});
+
+// «Остатки продавцов» в кабинете владельца (владелец 02.10.2026): одна строка
+// на продавца — те же числа, что он видит у себя, — и сколько лежит в ячейках.
+router.get('/stock-summary', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const out = await withTenantContext({ warehouseId: req.auth.warehouseId }, (c) => stockBySeller(c, req.auth.warehouseId));
+    res.set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }
 });
 

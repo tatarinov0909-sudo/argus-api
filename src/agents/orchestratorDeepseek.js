@@ -29,6 +29,7 @@ function taskLabel(name, args) {
     case 'find_products': return parseCellAddress(args.query) ? `посмотреть ячейку ${args.query}` : `найти «${args.query}»`;
     case 'supplies': return args.number ? `посмотреть поставку ${args.number}` : 'посмотреть поставки';
     case 'work_now': return 'посмотреть, что на складе сейчас';
+    case 'seller_stock': return args.seller ? `посмотреть остатки «${args.seller}»` : 'посмотреть остатки продавцов';
     case 'invoice_details': return `посмотреть накладную «${args.number}»`;
     case 'warehouse_summary': return 'проверить состояние склада';
     case 'list_discrepancies': return 'собрать расхождения';

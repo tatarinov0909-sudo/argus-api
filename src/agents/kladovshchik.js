@@ -10,7 +10,7 @@
 // товар и спрашивают, когда он потерялся.
 const { kitInfo } = require('../kits/kits');
 const { formatBlockLabel } = require('../cells/label');
-const { loadStock } = require('../sellers/stock');
+const { loadStock, stockBySeller } = require('../sellers/stock');
 
 // «Что лежит в 1.5.4?» (владелец 27.09.2026): Оркестратор искал адрес как
 // артикул, находил ноль и отвечал, что по ячейке искать не умеет. Отдельным
@@ -745,6 +745,37 @@ async function workNow(client, warehouseId) {
   };
 }
 
+// «Сколько у Слим Тим», «у кого не хватает товара под заказы» — остатки
+// продавцов теми же числами, что в их кабинетах и в сводке владельца
+// «Остатки продавцов» (02.10.2026). Без имени — сводка по всем; с именем —
+// итог продавца и товары, которым остатка не хватает под заказы.
+async function sellerStock(client, warehouseId, seller) {
+  const all = await stockBySeller(client, warehouseId);
+  const brief = (s) => ({
+    seller: s.name, products: s.productCount, total: s.total, ordered: s.ordered, inAssembly: s.inAssembly,
+    inTransit: s.inTransit, available: s.available, defect: s.defect, shortageProducts: s.shortageCount,
+    ...(s.unknownCount ? { withoutStockNumber: s.unknownCount } : {}),
+    ...(s.updatedAt ? { updatedAt: s.updatedAt } : {}),
+  });
+  const wanted = String(seller || '').trim().toLowerCase();
+  if (!wanted) return { sellers: all.sellers.map(brief) };
+  const found = all.sellers.filter((s) => s.name.toLowerCase().includes(wanted));
+  if (found.length !== 1) {
+    return { notFound: !found.length, choose: (found.length ? found : all.sellers).map((s) => s.name) };
+  }
+  const s = found[0];
+  const rows = (await loadStock(client, s.companyId, { source: all.source })).filter((r) => r.listed);
+  return {
+    ...brief(s),
+    shortages: rows.filter((r) => r.shortage).slice(0, 20).map((r) => ({
+      sku: r.sku, name: r.name, total: r.total, ordered: r.orderedNotInSupply, inAssembly: r.inAssembly,
+    })),
+    defectProducts: rows.filter((r) => r.defective + r.packagingDefect > 0).slice(0, 10).map((r) => ({
+      sku: r.sku, name: r.name, defect: r.defective + r.packagingDefect,
+    })),
+  };
+}
+
 // Единственное место, где имя инструмента превращается в вызов. Модель называет
 // имя и аргументы, а что выполнится — решает эта таблица: имя не из списка
 // просто не выполняется. Транзакцию открывает вызывающий (см. routes.js) —
@@ -772,6 +803,8 @@ function runTool(client, warehouseId, name, args = {}) {
       return suppliesInfo(client, warehouseId, args.number);
     case 'work_now':
       return workNow(client, warehouseId);
+    case 'seller_stock':
+      return sellerStock(client, warehouseId, args.seller);
     case 'list_discrepancies':
       return listDiscrepancies(client, warehouseId, {});
     default:
@@ -782,5 +815,5 @@ function runTool(client, warehouseId, name, args = {}) {
 module.exports = {
   parseCellAddress, cellContents,
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary, workQueue,
-  listDiscrepancies, suppliesInfo, workNow, runTool, recordSuggestion, recordSuggestionOutcome,
+  listDiscrepancies, suppliesInfo, workNow, sellerStock, runTool, recordSuggestion, recordSuggestionOutcome,
 };
