@@ -231,6 +231,9 @@ async function create(client, warehouseId, {
   } else {
     vw = await vwarehouses.requireVw(client, companies[0], virtualWarehouseId, { forWb: toWb });
   }
+  // С «Остального товара», а у продавца есть свой склад WB (владелец
+  // 03.10.2026): для продавца это товар с другого склада — уведомление.
+  const fromRest = toWb && !vw && (await vwarehouses.wbChoices(client, companies[0])).length > 1;
 
   await client.query('SAVEPOINT supply_number');
   const supply = await insertWithNumber(client, warehouseId, {
@@ -263,6 +266,14 @@ async function create(client, warehouseId, {
     actorType: actor?.type || 'owner',
     actorId: actor?.id || null,
   });
+  if (fromRest) {
+    const units = (await client.query(
+      'SELECT COALESCE(SUM(declared_qty), 0)::int AS n FROM invoice_items WHERE invoice_id = ANY($1::uuid[])',
+      [orders.rows.map((o) => o.id)])).rows[0].n;
+    await vwarehouses.notifySeller(client, { warehouseId, companyId: companies[0], kind: 'ff_decided', entityId: supply.id,
+      text: `Поставку ${number} на WB (${units} шт.) склад собирает из «Остального товара», а не с вашего склада WB — `
+        + `остаток «${vwarehouses.MAIN_NAME}» уменьшится. Обратите внимание.` });
+  }
 
   return {
     ...supply,
@@ -290,7 +301,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
   const head = await client.query(
     `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name,
             COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
-              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Основной' END) AS vw_name FROM supplies s
+              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
        LEFT JOIN virtual_warehouses vw ON vw.id = s.virtual_warehouse_id
       WHERE s.warehouse_id = $1 AND s.id = $2`,
@@ -670,7 +681,7 @@ async function list(client, warehouseId, { status = null, showShortages = false,
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             s.virtual_warehouse_id, COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
-              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Основной' END) AS vw_name,
+              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name,
             -- Кто составил: первая запись журнала о поставке. «Когда пришла»
             -- на склад — created_at.
             cb.actor_type AS created_by_role, cb.actor_name AS created_by,

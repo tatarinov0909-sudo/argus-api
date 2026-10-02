@@ -314,7 +314,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   // Товар другого склада продавца в той же ячейке — не для этой строки.
   const vwName = async () => (item.virtual_warehouse_id
     ? ((await client.query('SELECT name FROM virtual_warehouses WHERE id = $1', [item.virtual_warehouse_id])).rows[0] || {}).name || 'склад'
-    : 'Основной');
+    : 'Остальной товар');
   if (availableInCell <= 0) {
     const other = Number((await client.query(
       `SELECT COALESCE(SUM(qty), 0) AS n FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2 AND sku = $3

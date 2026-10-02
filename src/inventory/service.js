@@ -558,18 +558,19 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
     const candidates = c.cut.length
       ? had.map((x) => x.vw)
       : [null, ...vws.map((w) => w.id)];
-    const title = c.cut.length
-      ? `Пересчёт ячейки ${where}: «${name}»${bad} — не хватило ${shortQty} шт.`
-      : `Пересчёт ячейки ${where}: «${name}»${bad} — найдено лишних ${c.surplus} шт.`;
+    const what = c.cut.length ? `не хватило ${shortQty} шт.` : `найдено лишних ${c.surplus} шт.`;
+    const title = `Пересчёт ячейки ${where}: «${name}»${bad} — ${what}`;
+    // Продавцу — без адреса ячейки (владелец 03.10.2026).
+    const sellerTitle = `Пересчёт на складе: «${name}»${bad} — ${what}`;
     if (candidates.length < 2) {
       await vwarehouses.notifySeller(client, {
         warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus',
-        text: `${title}, ${c.cut.length ? 'списано с' : 'записаны на'} «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
+        text: `${sellerTitle.replace(/\.$/, '')}, ${c.cut.length ? 'списано с' : 'записаны на'} «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
       });
       continue;
     }
     await vwarehouses.splitSituation(client, {
-      warehouseId, companyId: c.line.companyId, kind: 'inventory', sku: c.line.sku, name, quality, title,
+      warehouseId, companyId: c.line.companyId, kind: 'inventory', sku: c.line.sku, name, quality, title, sellerTitle,
       parts: candidates.map((vw) => ({
         vw, before: was(vw), value: now(vw),
         min: c.cut.length ? 0 : was(vw),

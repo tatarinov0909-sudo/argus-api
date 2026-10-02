@@ -310,16 +310,16 @@ async function run(client, {
     const picked = warehouseByRow && typeof warehouseByRow === 'object' ? warehouseByRow[String(raw.row)] : undefined;
     if (typeof picked === 'string' && picked.trim()) line.warehouse = picked.trim().slice(0, 100);
     let vw = null;
-    if (vws.length && line.warehouse && low(line.warehouse) !== 'основной') {
+    if (vws.length && line.warehouse && !['основной', 'остальной товар', 'остальное', 'остальной'].includes(low(line.warehouse))) {
       vw = vwByName.get(low(line.warehouse)) || null;
       if (!vw && !line.error) {
-        line.error = `склада «${line.warehouse}» у вас нет — есть: «Основной», ${vws.map((w) => `«${w.name}»`).join(', ')}`;
+        line.error = `склада «${line.warehouse}» у вас нет — есть: ${vws.map((w) => `«${w.name}»`).join(', ')}, «Остальной товар»`;
       }
     }
     const { product, by } = line.error ? { product: null, by: null } : find(line);
     const item = {
       ...line, qty: line.qty || 0, sku: product ? product.sku : null, productName: product ? product.name : null, by,
-      ...(vws.length ? { vwName: vw ? vw.name : 'Основной' } : {}),
+      ...(vws.length ? { vwName: vw ? vw.name : 'Остальной товар' } : {}),
     };
     const vwKey = vw ? vw.id : '';
     if (!product && canBeNew(line)) {
@@ -399,7 +399,7 @@ async function run(client, {
     actionText: `Продавец «${company.name}» ${replaceId ? 'заменил список товаров в привозе' : 'оформил привоз'} ${inv.number}: `
       + `${perSku.size} товаров, ${units} шт. ${describe(d)}`.trim()
       + (vws.length && items.some((i) => i.vw)
-        ? ` По складам: ${[...new Set(items.map((i) => i.vw || ''))].map((id) => `«${id ? vws.find((w) => w.id === id).name : 'Основной'}» — ${
+        ? ` По складам: ${[...new Set(items.map((i) => i.vw || ''))].map((id) => `«${id ? vws.find((w) => w.id === id).name : 'Остальной товар'}» — ${
           items.filter((i) => (i.vw || '') === id).reduce((n, i) => n + i.qty, 0)} шт.`).join(', ')}.` : '')
       + (created.length ? ` Новые товары заведены в каталог из его файла (${created.length}): `
         + created.slice(0, 5).map((p) => `«${p.name}» (${p.sku})`).join(', ') + (created.length > 5 ? ' и другие' : '')

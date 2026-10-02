@@ -46,11 +46,11 @@ const kladovshchik = require('../src/agents/kladovshchik');
     const worker = (await api('POST', '/api/auth/staff/login', null, { keyCode: wk.key_code })).token;
     const ozon = await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Озон', marketplace: 'ozon' }, 201);
     const qty = async (quality = 'good') => Object.fromEntries((await db(
-      `SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+      `SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
          LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
         WHERE cs.company_id = $1 AND cs.quality::text = $2 AND cs.qty > 0 GROUP BY 1`, [company, quality])).rows.map((r) => [r.name, r.n]));
     const inCell = async (cell) => Object.fromEntries((await db(
-      `SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+      `SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
          LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
         WHERE cs.cell_block_id = $1 AND cs.qty > 0 GROUP BY 1`, [cell.id])).rows.map((r) => [r.name, r.n]));
     // Приход вручную: строки на склады, приёмка в указанные ячейки.
@@ -81,7 +81,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
     assert.ok(tasks[0].suggest.length && tasks[0].suggest.every((o) => o.blockId !== A.id));
     await api('POST', `/api/vwarehouses/move-tasks/${tasks[0].id}/step`, worker, { toCellBlockId: A.id, qty: 10 }, 400);
     await api('POST', `/api/vwarehouses/move-tasks/${tasks[0].id}/step`, worker, { toCellBlockId: B.id, qty: 20 });
-    assert.deepEqual(await inCell(A), { 'Основной': 100, 'Озон': 30 });
+    assert.deepEqual(await inCell(A), { 'Остальной товар': 100, 'Озон': 30 });
     const last = await api('POST', `/api/vwarehouses/move-tasks/${tasks[0].id}/step`, worker, { toCellBlockId: B.id, qty: 30 });
     assert.equal(last.status, 'done');
     assert.deepEqual(await inCell(B), { 'Озон': 50 });
@@ -95,7 +95,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
       acceptedQty: 5, cellBlockId: C.id }, 201);
     const moveBad = await call('POST', '/api/cells/move', worker, { sku: 'R-1', companyId: company, fromCellBlockId: A.id, toCellBlockId: B.id, qty: 1 });
     assert.equal(moveBad.status, 409);
-    check('товар «Основного» нельзя положить к отдельному «Озону» — ни приёмкой, ни перемещением');
+    check('товар «Остального товара» нельзя положить к отдельному «Озону» — ни приёмкой, ни перемещением');
 
     // ---- Зона ----
     const zoned = await api('PATCH', `/api/vwarehouses/${ozon.id}`, owner, { companyId: company, zone: { cells: [D.label] } });
@@ -125,7 +125,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
     assert.equal(tasks.reduce((n, x) => n + x.left, 0), 10);
     await api('POST', `/api/vwarehouses/move-tasks/${tasks[0].id}/step`, worker, { toCellBlockId: E.id, qty: 4 });
     const mid = await qty();
-    assert.equal(mid['Озон'], before['Озон'] + 4); assert.equal(mid['Основной'], before['Основной'] - 4);
+    assert.equal(mid['Озон'], before['Озон'] + 4); assert.equal(mid['Остальной товар'], before['Остальной товар'] - 4);
     for (const x of tasks) {
       const left = (await api('GET', '/api/vwarehouses/move-tasks', worker)).find((y) => y.id === x.id);
       if (left) await api('POST', `/api/vwarehouses/move-tasks/${x.id}/step`, worker, { toCellBlockId: E.id, qty: left.left });
@@ -160,9 +160,9 @@ const kladovshchik = require('../src/agents/kladovshchik');
 
     // ---- Начальные остатки: склад по умолчанию и столбец «Склад» ----
     const plan = await api('POST', '/api/cells/initial-stock', owner, { companyId: company, defaultVw: ozon.id,
-      rows: [{ line: 2, cell: F.label, sku: 'R-1', qty: 4 }, { line: 3, cell: F.label, sku: 'R-1', qty: 6, warehouse: 'Основной' },
+      rows: [{ line: 2, cell: F.label, sku: 'R-1', qty: 4 }, { line: 3, cell: F.label, sku: 'R-1', qty: 6, warehouse: 'Остальной товар' },
         { line: 4, cell: F.label, sku: 'R-1', qty: 1, warehouse: 'Луна' }] });
-    assert.deepEqual(plan.lines.map((l) => l.vwName || l.error.slice(0, 15)), ['Озон', 'Основной', 'склада «Луна» у']);
+    assert.deepEqual(plan.lines.map((l) => l.vwName || l.error.slice(0, 15)), ['Озон', 'Остальной товар', 'склада «Луна» у']);
     const applied = await api('POST', '/api/cells/initial-stock', owner, { companyId: company, defaultVw: ozon.id, apply: true,
       rows: [{ line: 2, cell: F.label, sku: 'R-1', qty: 4 }] });
     assert.equal(applied.applied, true);
@@ -175,10 +175,10 @@ const kladovshchik = require('../src/agents/kladovshchik');
     assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided' && n.text.includes(ret.number)));
     await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } });
     const denied = await call('POST', '/api/returns/manual', worker, { companyId: company, items: [{ sku: 'R-1', qty: 1 }], vw: ozon.id });
-    assert.equal(denied.status, 409); assert.match(denied.body.error, /ляжет на «Основной»/);
+    assert.equal(denied.status, 409); assert.match(denied.body.error, /ляжет на «Остальной товар»/);
     await api('POST', '/api/returns/manual', worker, { companyId: company, items: [{ sku: 'R-1', qty: 1 }] }, 201);
     await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: true } });
-    check('возврат: склад продавца выбирает склад (продавцу «обратите внимание»); продавец запретил — только «Основной»');
+    check('возврат: склад продавца выбирает склад (продавцу «обратите внимание»); продавец запретил — только «Остальной товар»');
 
     console.log(`\n${passed} checks passed`);
   } finally {

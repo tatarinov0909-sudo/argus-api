@@ -277,7 +277,8 @@ async function loadSplit(client, companyId) {
   return map;
 }
 
-// «Основной» — всё, что не на заведённых складах: при учёте в 1С это «Всего»
+// «Остальной товар» — всё, что не на заведённых складах (владелец 03.10.2026;
+// «Основной» — весь товар вместе): при учёте в 1С это «Всего»
 // из 1С минус остальные склады (1С о складах Аргуса не знает), при учёте в
 // Аргусе — его ячейки. «Заказано» (заказы вне поставки) склада не имеет —
 // оно только в общем итоге.
@@ -293,10 +294,11 @@ function splitOf(split, sku, vws, { total, source }) {
   const mainOnHand = source === 'argus'
     ? main.good + main.staged
     : (total === null ? null : Math.max(0, total - others.reduce((n, w) => n + w.onHand, 0)));
-  return [{
-    id: null, name: 'Основной', onHand: mainOnHand, inAssembly: main.assembly,
+  // «Остальной товар» — последним: сначала склады продавца.
+  return others.concat([{
+    id: null, name: 'Остальной товар', onHand: mainOnHand, inAssembly: main.assembly,
     available: mainOnHand === null ? null : Math.max(0, mainOnHand - main.assembly), defect: main.bad,
-  }].concat(others);
+  }]);
 }
 
 // Итог по продавцу — одно правило для кабинета продавца, сводки владельца

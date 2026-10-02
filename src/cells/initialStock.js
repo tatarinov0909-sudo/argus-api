@@ -181,16 +181,16 @@ async function plan(client, warehouseId, { companyId, rows, defaultVw }, { lock 
     line.quality = quality;
 
     const vwText = String(r.warehouse ?? '').trim();
-    if (vwText && vwText.toLowerCase() !== 'основной') {
+    if (vwText && !['основной', 'остальной товар', 'остальное', 'остальной'].includes(vwText.toLowerCase())) {
       if (!vwByName.has(vwText.toLowerCase())) {
-        line.error = `склада «${vwText}» у продавца нет — есть: «Основной»${vws.map((w) => `, «${w.name}»`).join('')}`;
+        line.error = `склада «${vwText}» у продавца нет — есть: ${vws.map((w) => `«${w.name}»`).join(', ')}, «Остальной товар»`;
         return;
       }
       line.vw = vwByName.get(vwText.toLowerCase());
     } else {
       line.vw = vwText ? null : fallbackVw;
     }
-    if (vws.length) line.vwName = line.vw ? vws.find((w) => w.id === line.vw).name : 'Основной';
+    if (vws.length) line.vwName = line.vw ? vws.find((w) => w.id === line.vw).name : 'Остальной товар';
 
     if (r.cellIsDate === true) {
       line.error = 'Excel превратил адрес ячейки в дату. Поставьте колонке «Ячейка» формат «Текстовый» и впишите адрес заново';

@@ -15,7 +15,7 @@ const { refreshCellFill } = require('../cells/fill');
 const { takeFromCell } = require('../cells/move');
 const journal = require('../journal/repository');
 
-const MAIN_NAME = 'Основной';
+const MAIN_NAME = 'Остальной товар';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isGood = (quality) => (quality || 'good') === 'good';
 
@@ -326,7 +326,8 @@ async function finishTransferIfDone(client, warehouseId, transferId) {
   });
   await client.query(
     `INSERT INTO seller_notifications (warehouse_id, company_id, kind, text, entity_id) VALUES ($1, $2, 'vw_moved', $3, $4)`,
-    [warehouseId, t.company_id, `Перенос ${t.number} закончен — грузчик переложил товар ${what}`, t.id]);
+    [warehouseId, t.company_id, `Перенос ${t.number} закончен: «${t.name || t.sku}» — «${lay.name(t.from_vw)}» → «${lay.name(t.to_vw)}», `
+      + `${left.moved} шт.${left.moved < Number(t.qty) ? ` (из ${Number(t.qty)} запрошенных)` : ''}`, t.id]);
 }
 
 // Руководитель снимает задание: непереложенное остаётся где было.

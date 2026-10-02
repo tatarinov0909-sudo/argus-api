@@ -1,6 +1,6 @@
 // Виртуальные склады продавца (схема одобрена владельцем 02.10.2026): склады
 // заводит склад; привоз по строкам на свои склады; поставка на WB — только с
-// «Основного» и складов WB, собирается только товаром своего склада; перенос
+// «Остального товара» и складов WB, собирается только товаром своего склада; перенос
 // складом сразу (продавцу уведомление) или с согласия продавца, если он
 // отключил право; заявка продавца — складу «очень важно»; пересчёт не
 // стирает склад; брак помнит склад. Только на отдельной тестовой базе.
@@ -45,7 +45,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const mk = await api('POST', '/api/staff', owner, { name: 'Оля', kind: 'manager' }, 201);
     const manager = (await api('POST', '/api/auth/staff/login', null, { keyCode: mk.key_code })).token;
     const vwQty = async () => Object.fromEntries((await db(
-      `SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+      `SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
          LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
         WHERE cs.company_id = $1 AND cs.quality = 'good' AND cs.qty > 0 GROUP BY 1`, [company])).rows.map((r) => [r.name, r.n]));
 
@@ -54,12 +54,13 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const ooo = await api('POST', '/api/vwarehouses', manager, { companyId: company, name: 'ООО БББ', marketplace: 'wb' }, 201);
     const opt = await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Опт', marketplace: 'other' }, 201);
     await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'озон', marketplace: 'wb' }, 409);
+    await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Остальной товар', marketplace: 'wb' }, 400);
     await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Основной', marketplace: 'wb' }, 400);
     await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Луна', marketplace: 'mars' }, 400);
     await api('POST', '/api/vwarehouses', seller, { companyId: company, name: 'Сам', marketplace: 'wb' }, 403);
     const seen = await api('GET', '/api/vwarehouses', seller);
     assert.deepEqual(seen.warehouses.map((w) => [w.name, w.marketplaceName]), [['Озон', 'Озон'], ['ООО БББ', 'WB'], ['Опт', 'иное']]);
-    assert.deepEqual(seen.wbChoices.map((w) => w.name), ['Основной', 'ООО БББ']);
+    assert.deepEqual(seen.wbChoices.map((w) => w.name), ['Остальной товар', 'ООО БББ']);
     assert.deepEqual(seen.rights, { decide: true });
     const notes = await api('GET', '/api/vwarehouses/notifications', seller);
     assert.equal(notes.filter((n) => n.kind === 'vw_created').length, 3);
@@ -87,26 +88,26 @@ const { pool, withTenantContext } = require('../src/db/pool');
     for (const it of inv.items) {
       await api('POST', '/api/receiving', worker, { invoiceItemId: it.id, acceptedQty: Number(it.declared_qty), cellBlockId: cells[0] }, 201);
     }
-    assert.deepEqual(await vwQty(), { 'Основной': 50, 'Озон': 100, 'ООО БББ': 30 });
+    assert.deepEqual(await vwQty(), { 'Остальной товар': 50, 'Озон': 100, 'ООО БББ': 30 });
     const stock = (await api('GET', `/api/sellers/stock?companyId=${company}`, owner)).find((r) => r.sku === 'R-1');
-    assert.deepEqual(stock.byWarehouse.map((w) => [w.name, w.onHand, w.available]), [['Основной', 50, 50], ['Озон', 100, 100], ['ООО БББ', 30, 30], ['Опт', 0, 0]]);
+    assert.deepEqual(stock.byWarehouse.map((w) => [w.name, w.onHand, w.available]), [['Озон', 100, 100], ['ООО БББ', 30, 30], ['Опт', 0, 0], ['Остальной товар', 50, 50]]);
     const sellerRow = (await api('GET', '/api/sellers/stock', seller)).rows.find((r) => r.sku === 'R-1');
     assert.equal(sellerRow.warehouses.length, 4);
     check('приёмка кладёт товар на склад строки; остаток по складам — и у склада, и у продавца');
 
-    // ---- Поставка на WB: только «Основной» и склады WB ----
+    // ---- Поставка на WB: только «Остальной товар» и склады WB ----
     const order = await api('POST', '/api/invoices', owner, { companyId: company, number: 'WB-VW1', direction: 'out',
       items: [{ sku: 'R-1', name: 'Резинки чёрные', declaredQty: 40 }] }, 201);
     await db("UPDATE invoices SET source = 'wb', external_id = 'WB-VW1' WHERE id = $1", [order.id]);
     await db("UPDATE invoice_items SET mp_rid = 'rid-' || id WHERE invoice_id = $1", [order.id]);
     const noChoice = await call('POST', '/api/supplies', owner, { invoiceIds: [order.id], marketplace: 'wb' });
-    assert.equal(noChoice.status, 400); assert.match(noChoice.body.error, /«Основной», «ООО БББ»/);
+    assert.equal(noChoice.status, 400); assert.match(noChoice.body.error, /«Остальной товар», «ООО БББ»/);
     const toOzon = await call('POST', '/api/supplies', owner, { invoiceIds: [order.id], marketplace: 'wb', virtualWarehouseId: ozon.id });
     assert.equal(toOzon.status, 400); assert.match(toOzon.body.error, /Озон/);
     const supply = await api('POST', '/api/supplies', owner, { invoiceIds: [order.id], marketplace: 'wb', virtualWarehouseId: ooo.id }, 201);
     assert.equal(supply.virtualWarehouseName, 'ООО БББ');
     assert.equal((await db('SELECT virtual_warehouse_id FROM invoice_items WHERE invoice_id = $1', [order.id])).rows[0].virtual_warehouse_id, ooo.id);
-    check('поставка на WB: склад выбирают из «Основного» и складов WB; заказы берут склад поставки');
+    check('поставка на WB: склад выбирают из «Остального товара» и складов WB; заказы берут склад поставки');
 
     // ---- Сборка — только товар склада поставки ----
     await api('POST', `/api/shipping/assembly/${supply.id}/start`, worker, {}, 201);
@@ -126,16 +127,19 @@ const { pool, withTenantContext } = require('../src/db/pool');
     // ---- Перенос складом: сразу, продавцу уведомление ----
     const t1 = await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 20, fromVw: null, toVw: ooo.id, note: 'под поставку' }, 201);
     assert.equal(t1.status, 'done');
-    assert.deepEqual(await vwQty(), { 'Основной': 30, 'Озон': 100, 'ООО БББ': 20 });
+    assert.deepEqual(await vwQty(), { 'Остальной товар': 30, 'Озон': 100, 'ООО БББ': 20 });
     await api('POST', '/api/shipping', worker, { invoiceItemId: itemId, pickedQty: 10, cellBlockId: cells[0], isFinal: true }, 201);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided' && /«Основной» → «ООО БББ»/.test(n.text) && /Обратите внимание/.test(n.text)));
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided' && /«Остальной товар» → «ООО БББ»/.test(n.text) && /Обратите внимание/.test(n.text)));
     await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 31, fromVw: null, toVw: ozon.id }, 409);
     // То, что ждёт сборки со склада, не переносится.
     const order2 = await api('POST', '/api/invoices', owner, { companyId: company, number: 'WB-VW2', direction: 'out',
       items: [{ sku: 'R-1', name: 'Резинки чёрные', declaredQty: 25 }] }, 201);
     await db("UPDATE invoices SET source = 'wb', external_id = 'WB-VW2' WHERE id = $1", [order2.id]);
     await db("UPDATE invoice_items SET mp_rid = 'rid-' || id WHERE invoice_id = $1", [order2.id]);
-    await api('POST', '/api/supplies', owner, { invoiceIds: [order2.id], marketplace: 'wb', virtualWarehouseId: null }, 201);
+    const restSupply = await api('POST', '/api/supplies', owner, { invoiceIds: [order2.id], marketplace: 'wb', virtualWarehouseId: null }, 201);
+    // С «Остального товара», хотя у продавца есть склад WB, — продавцу «обратите внимание».
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
+      && n.text.includes(restSupply.number) && /«Остальной товар»/.test(n.text)));
     await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 6, fromVw: null, toVw: ozon.id }, 409);
     check('перенос складом — сразу, продавцу уведомление; нельзя больше, чем свободно на складе');
 
@@ -189,12 +193,12 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal((await db("SELECT virtual_warehouse_id FROM cell_stock WHERE cell_block_id = $1 AND quality = 'good'", [cells[2]])).rows[0].virtual_warehouse_id, ozon.id);
     check('брак помнит склад; перепакованное возвращается на тот же склад');
 
-    // ---- Пересчёт не стирает склад: недостача с «Основного», потом с большего ----
-    const now = (await db(`SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+    // ---- Пересчёт не стирает склад: недостача с «Остального товара», потом с большего ----
+    const now = (await db(`SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
       LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
       WHERE cs.cell_block_id = $1 AND cs.quality = 'good' GROUP BY 1 ORDER BY 1`, [cells[0]])).rows;
     const total = now.reduce((n, r) => n + r.n, 0);
-    const main = now.find((r) => r.name === 'Основной').n;
+    const main = now.find((r) => r.name === 'Остальной товар').n;
     const taskId = await run(async (c) => {
       const r = await c.query('INSERT INTO inventory_runs(warehouse_id) VALUES($1) RETURNING id', [warehouseId]);
       return (await c.query(`INSERT INTO inventory_tasks(run_id,warehouse_id,cell_block_id,reason) VALUES($1,$2,$3,'тест') RETURNING id`,
@@ -204,20 +208,20 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await api('POST', `/api/inventory/tasks/${taskId}/count`, worker, {
       lines: [{ sku: 'R-1', companyId: company, quality: 'good', qty: total - main - 3 }], snapshotId: opened.snapshotId }, 200);
     await api('POST', `/api/inventory/tasks/${taskId}/resolve`, owner, { decision: 'apply' });
-    const after = Object.fromEntries((await db(`SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+    const after = Object.fromEntries((await db(`SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
       LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
       WHERE cs.cell_block_id = $1 AND cs.quality = 'good' GROUP BY 1`, [cells[0]])).rows.map((r) => [r.name, r.n]));
-    const largest = now.filter((r) => r.name !== 'Основной').sort((a, b) => b.n - a.n)[0];
-    assert.equal(after['Основной'], undefined);
+    const largest = now.filter((r) => r.name !== 'Остальной товар').sort((a, b) => b.n - a.n)[0];
+    assert.equal(after['Остальной товар'], undefined);
     assert.equal(after[largest.name], largest.n - 3);
     assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
-      && n.text.includes(`«Основной» — ${main} шт.`) && n.text.includes(`«${largest.name}» — 3 шт.`) && /Обратите внимание/.test(n.text)));
-    check('пересчёт: недостача сначала с «Основного», потом с самого большого склада; продавцу «обратите внимание»');
+      && n.text.includes(`«Остальной товар» — ${main} шт.`) && n.text.includes(`«${largest.name}» — 3 шт.`) && /Обратите внимание/.test(n.text)));
+    check('пересчёт: недостача сначала с «Остального товара», потом с самого большого склада; продавцу «обратите внимание»');
 
     // ---- Галочка «запретить складу решать без меня» (владелец 02.10.2026) ----
     assert.deepEqual((await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } })).rights, { decide: false });
     const qtyBy = async (quality) => Object.fromEntries((await db(
-      `SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+      `SELECT COALESCE(w.name, 'Остальной товар') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
          LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
         WHERE cs.company_id = $1 AND cs.quality::text = $2 AND cs.qty > 0 GROUP BY 1`, [company, quality])).rows.map((r) => [r.name, r.n]));
     const decisions = async () => api('GET', '/api/vwarehouses/decisions?open=1', seller);
@@ -225,7 +229,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
       for (const x of parts) assert.equal(q1[x.name] || 0, (q0[x.name] || 0) + sign * (chosenOf(x) - x.value), x.name);
     };
 
-    // Приёмка: 10 шт. заявлены на «Озон», 5 — на «Основной», приняли 10 и 3.
+    // Приёмка: 10 шт. заявлены на «Озон», 5 — на «Остальной товар», приняли 10 и 3.
     const inb = await api('POST', '/api/sellers/inbound', seller, { grid: [['Артикул', 'Количество', 'Склад'], ['R-1', 10, 'Озон'], ['R-1', 5, '']], apply: true });
     const inbDoc = await api('GET', `/api/invoices/${inb.invoice.id}`, owner);
     const lockedItem = await call('POST', '/api/vwarehouses/items', owner, { itemIds: [inbDoc.items[0].id], vw: opt.id });

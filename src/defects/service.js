@@ -156,7 +156,7 @@ async function markFromShelf(client, {
     // Позднее подключение: склады продавца сами берут номера документов отсюда.
     await require('../vwarehouses/service').splitSituation(client, {
       warehouseId, companyId, kind: 'defect', sku, name, quality: bucket,
-      title: `Брак ${amount} шт. «${name}» в ячейке ${fromLabel}`,
+      title: `Брак ${amount} шт. «${name}» в ячейке ${fromLabel}`, sellerTitle: `Брак ${amount} шт. «${name}»`,
       parts: had.map((h) => ({ vw: h.vw, before: h.qty, value: taken(h.vw), min: 0, max: Math.min(h.qty, amount) })),
     });
   }

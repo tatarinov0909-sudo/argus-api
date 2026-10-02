@@ -4,7 +4,9 @@
 // Виртуальный склад — часть товара продавца на живом складе под своё
 // назначение (площадка, юрлицо, «иное»). Товар лежит в тех же ячейках, у
 // строки остатка — отметка склада (cell_stock.virtual_warehouse_id).
-// «Основной» — NULL: всё, что не отнесено к заведённым складам.
+// Владелец 03.10.2026: «Основной» — ВЕСЬ товар продавца (без брака), склады
+// продавца — его части; то, что ни к одному складу не отнесено, — «Остальной
+// товар» (NULL в учёте).
 //
 // Здесь — склады (завести, переименовать, убрать), перенос товара между
 // ними, заявки продавца на перенос, «права склада» продавца и уведомления
@@ -15,7 +17,9 @@ const journal = require('../journal/repository');
 const { nextNumber, productName } = require('../defects/service');
 const separate = require('./separate');
 
-const MAIN_NAME = 'Основной';
+const MAIN_NAME = 'Остальной товар';
+// «Основной» — весь товар продавца: склад так назвать нельзя.
+const TOTAL_NAME = 'Основной';
 const MARKETPLACES = { wb: 'WB', ozon: 'Озон', yandex: 'Яндекс Маркет', other: 'иное' };
 // «Права склада» (вопрос 14): что склад может делать с товаром продавца без
 // его согласия. Нет ключа в ff_rights — право есть.
@@ -67,7 +71,9 @@ function cleanName(value) {
   const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
   if (!name) throw new HttpError(400, 'Назовите склад, например «Озон» или «ООО Ромашка»');
   if (name.length > 100) throw new HttpError(400, 'Название склада — не длиннее 100 знаков');
-  if (name.toLowerCase() === MAIN_NAME.toLowerCase()) throw new HttpError(400, `«${MAIN_NAME}» склад у продавца уже есть`);
+  if ([MAIN_NAME, TOTAL_NAME].some((n) => n.toLowerCase() === name.toLowerCase())) {
+    throw new HttpError(400, `«${name}» — так называется часть учёта продавца, назовите склад иначе`);
+  }
   return name;
 }
 function cleanMarketplace(value) {
@@ -359,7 +365,8 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
       entityType: 'vw_transfer', entityId: t.id, actorType: actorType(actor.role), actorId: actor.id || null,
     });
     await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', entityId: t.id,
-      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${dot(t.note)}` : ''}${byHand}${DECIDED_SELF}` });
+      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${dot(t.note)}` : ''}`
+        + `${t.status === 'to_move' ? ' Остатки складов меняются по мере переноса.' : ''}${DECIDED_SELF}` });
   } else if (status === 'waiting_seller') {
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
@@ -430,7 +437,7 @@ async function decide(client, { warehouseId, transferId, approve, reason, actor 
       [t.id, actor.role, actor.id || null, who, cleanNote(reason)])).rows[0];
   }
   const verdict = !approve ? `отказано${done.reject_reason ? ` (${done.reject_reason})` : ''}`
-    : done.status === 'to_move' ? 'принят — склад хранится отдельно, грузчик перекладывает товар' : 'выполнен';
+    : done.status === 'to_move' ? 'выполняется — остатки складов меняются по мере переноса' : 'выполнен';
   const text = `Перенос ${t.number} продавца «${company.name}» ${what} — ${verdict}. Решил: ${who}.`;
   // Заявка продавца висела «очень важно» в журнале — закрываем ответом.
   const pending = (await client.query(
@@ -629,7 +636,10 @@ function howText(kind, parts, rows) {
     .filter(Boolean).join('; ');
 }
 
-async function splitSituation(client, { warehouseId, companyId, kind, sku, name, quality = 'good', title, parts }) {
+// sellerTitle — то же для продавца, без ячеек: как лежит товар, продавцу
+// знать не нужно (владелец 03.10.2026); title — складу, с адресом.
+async function splitSituation(client, { warehouseId, companyId, kind, sku, name, quality = 'good', title, sellerTitle, parts }) {
+  const st = sellerTitle || title;
   const company = await companyRow(client, warehouseId, companyId);
   const rows = await list(client, companyId, { withArchived: true });
   if (!rows.length) return null;
@@ -638,15 +648,15 @@ async function splitSituation(client, { warehouseId, companyId, kind, sku, name,
   }));
   const how = howText(kind, clean, rows);
   if (rightsOf(company).decide) {
-    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${title}. Склад решил так — ${dot(how)}${DECIDED_SELF}` });
+    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${st}. Склад решил так — ${dot(how)}${DECIDED_SELF}` });
     return null;
   }
   const d = (await client.query(
     `INSERT INTO vw_decisions (warehouse_id, company_id, kind, sku, name, quality, title, parts)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id`,
-    [warehouseId, companyId, kind, sku, name || sku, quality, title.slice(0, 500), JSON.stringify(clean)])).rows[0];
+    [warehouseId, companyId, kind, sku, name || sku, quality, st.slice(0, 500), JSON.stringify(clean)])).rows[0];
   await notifySeller(client, { warehouseId, companyId, kind: 'vw_decision', entityId: d.id,
-    text: `${title}. Пока учёт записан по правилу склада — ${dot(how)} Вы запретили складу решать такое без вас: согласитесь или разделите по-своему на странице «Товары».` });
+    text: `${st}. Пока учёт записан по правилу склада — ${dot(how)} Вы запретили складу решать такое без вас: согласитесь или разделите по-своему на странице «Товары».` });
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик', status: 'auto',
     actionText: `${title} (продавец «${company.name}»). Учёт записан по правилу — ${dot(how)} Продавец запретил складу решать такое без него — решение за ним.`,
