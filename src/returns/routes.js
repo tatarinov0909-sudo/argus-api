@@ -8,6 +8,7 @@ const outbox = require('../sync/outbox');
 const { requireQty } = require('../middleware/qty');
 const defects = require('../defects/service');
 const { zoneOf, todayIn } = require('../warehouses/time');
+const vwarehouses = require('../vwarehouses/service');
 
 const router = express.Router();
 
@@ -91,6 +92,11 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         );
         if (!blockResult.rows[0]) throw new HttpError(404, 'Ячейка не найдена');
 
+        // Склад «хранить отдельно» и зоны складов продавца (02.10.2026).
+        await require('../vwarehouses/separate').checkPut(client, warehouseId, {
+          cellBlockId, companyId: item.company_id, quality: qualityBucket,
+          vw: (await client.query('SELECT virtual_warehouse_id FROM invoice_items WHERE id = $1', [item.id])).rows[0]?.virtual_warehouse_id || null,
+        });
         // Состояние едет в остаток вместе с количеством: брак на полке обязан
         // отличаться от годного, иначе отгрузка предложит его клиенту.
         await client.query(
@@ -192,9 +198,18 @@ router.post('/manual', requireAuth, requireRole('worker', 'owner', 'manager'), a
     if (b.items.length > 200) throw new HttpError(400, 'В одном возврате — не больше 200 строк');
     const out = await withTenantContext({ warehouseId }, async (client) => {
       const company = (await client.query(
-        'SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
+        'SELECT id, name, ff_rights FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
         [b.companyId, warehouseId])).rows[0];
       if (!company) throw new HttpError(404, 'Продавец не найден');
+      // Склад продавца, на который ляжет возврат (владелец 02.10.2026): по
+      // умолчанию склад заказа — заказа у ручного возврата нет, значит
+      // «Основной». Другой склад — решение склада: продавцу «обратите
+      // внимание», а запретил решать без него — нельзя.
+      const vw = await vwarehouses.requireVw(client, company.id, b.vw || null);
+      if (vw && !vwarehouses.rightsOf(company).decide) {
+        throw new HttpError(409, `Продавец «${company.name}» запретил складу решать без него, на какой склад его товар, — `
+          + `возврат ляжет на «${vwarehouses.MAIN_NAME}»`);
+      }
       const bySku = new Map();
       for (const it of b.items) {
         const sku = typeof it?.sku === 'string' ? it.sku.trim() : '';
@@ -220,14 +235,21 @@ router.post('/manual', requireAuth, requireRole('worker', 'owner', 'manager'), a
         [warehouseId, company.id, number])).rows[0];
       const items = [...bySku].map(([sku, qty]) => ({ sku, name: found.get(sku), qty }));
       await client.query(
-        `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
-         SELECT $1, $2, $3, x.name, x.sku, x.qty FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
-        [inv.id, warehouseId, company.id, JSON.stringify(items)]);
+        `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty, virtual_warehouse_id)
+         SELECT $1, $2, $3, x.name, x.sku, x.qty, $5 FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
+        [inv.id, warehouseId, company.id, JSON.stringify(items), vw ? vw.id : null]);
       const units = items.reduce((sum, i) => sum + i.qty, 0);
+      if (vw) {
+        await vwarehouses.notifySeller(client, { warehouseId, companyId: company.id, kind: 'ff_decided', entityId: inv.id,
+          text: `Возврат ${number} (${units} шт.: ${items.slice(0, 3).map((i) => `«${i.name}»`).join(', ')}${items.length > 3 ? ' и другие' : ''}) `
+            + `склад отнёс к вашему складу «${vw.name}». Обратите внимание: склад решил это сам. `
+            + 'Запретить складу решать такое без вас можно в «Правах склада».' });
+      }
       const comment = typeof b.comment === 'string' && b.comment.trim() ? b.comment.trim().slice(0, 300) : null;
       await journal.createEntry(client, {
         warehouseId, agent: 'Кладовщик', status: 'auto',
         actionText: `Заведён возврат ${number} продавца «${company.name}» вручную: ${items.length} товаров, ${units} шт.`
+          + (vw ? ` На склад продавца «${vw.name}».` : '')
           + (comment ? ` Комментарий: ${comment}` : '') + ' Возвраты из WB пока не приходят сами.',
         entityType: 'invoice', entityId: inv.id, invoiceId: inv.id,
         actorType: req.auth.role === 'seller' ? 'seller' : req.auth.role,

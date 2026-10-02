@@ -10,7 +10,7 @@ const router = express.Router();
 // Склад и его настройки — анкета фулфилмента (владелец 30.09.2026): как склад
 // работает, решает он сам ответами здесь, а не доработкой кода под него.
 const FIELDS = `id, name, city, warehouse_code, legal_name, created_at,
-  stock_source, timezone, wb_supplies_by, wb_names, setup_at`;
+  stock_source, timezone, wb_supplies_by, wb_names, setup_at, vw_reminders`;
 
 router.get('/me', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
@@ -86,6 +86,10 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
       wbNames = [...new Set(body.wbNames.map((n) => n.trim().slice(0, 60)).filter((n) => n.length >= 3))].slice(0, 10);
     }
     if (name !== undefined && !name) throw new HttpError(400, 'Название склада не может быть пустым');
+    // Кладовщик напоминает о складах продавцов — можно выключить (02.10.2026).
+    if (body.vwReminders !== undefined && typeof body.vwReminders !== 'boolean') {
+      throw new HttpError(400, 'Напоминания о складах продавцов — да или нет');
+    }
     const warehouse = await withTenantContext({ warehouseId }, async (client) => {
       const before = (await client.query('SELECT name, wb_names FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
       const result = await client.query(
@@ -95,11 +99,12 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
                 timezone = COALESCE($7, timezone),
                 wb_supplies_by = COALESCE($8, wb_supplies_by),
                 wb_names = COALESCE($9::text[], wb_names),
-                setup_at = CASE WHEN $10::boolean THEN COALESCE(setup_at, now()) ELSE setup_at END
+                setup_at = CASE WHEN $10::boolean THEN COALESCE(setup_at, now()) ELSE setup_at END,
+                vw_reminders = COALESCE($11, vw_reminders)
           WHERE id = $1 RETURNING ${FIELDS}`,
         [warehouseId, name ?? null, city ?? null, legal !== undefined, legal ?? null,
           stockSource ?? null, timezone ?? null, suppliesBy ?? null, wbNames ?? null,
-          body.setupDone === true],
+          body.setupDone === true, body.vwReminders ?? null],
       );
       // Имя склада и «как нас называют продавцы» решают, какие склады WB
       // продавцов Аргус считает нашими: отметить новые совпадения. Экран шлёт

@@ -480,7 +480,11 @@ async function putStep(client, {
   warehouseId, staffKeyId, recordId, item, cellBlockId, qty, pairId = null, quality = 'good',
 }) {
   // Товар ложится на склад строки привоза (виртуальный склад продавца,
-  // 02.10.2026); не выбран — «Основной».
+  // 02.10.2026); не выбран — «Основной». Склад «хранить отдельно» не
+  // смешивается с другими, зона склада — только его.
+  await require('../vwarehouses/separate').checkPut(client, warehouseId, {
+    cellBlockId, companyId: item.company_id, vw: await itemVw(client, item.id), quality,
+  });
   await client.query(
     `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
      VALUES ($1, $2, $3, $4, $5, $6, (SELECT virtual_warehouse_id FROM invoice_items WHERE id = $7))`,

@@ -771,6 +771,7 @@ async function pendingOrders(client, warehouseId, companyId) {
             i.mp_created_at, i.mp_offices, i.mp_sale_price_kopecks,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
             ii.mp_nm_id, ii.mp_rid, i.mp_warehouse_id, w.name AS mp_warehouse_name, ii.virtual_warehouse_id AS vw,
+            ii.id AS item_id,
             CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
             ${WB_CONFIRMED_SQL} AS wb_confirmed
@@ -840,6 +841,10 @@ async function pendingOrders(client, warehouseId, companyId) {
     salePriceKopecks: x.mp_sale_price_kopecks == null ? null : Number(x.mp_sale_price_kopecks),
     marketplace: x.marketplace,
     status: x.status,
+    // Строка заказа и склад продавца, с которого её соберут: у заказа из 1С
+    // склад выбирает менеджер до сборки (владелец 02.10.2026).
+    itemId: x.item_id,
+    vw: x.vw || null,
     sku: x.sku,
     name: x.name,
     qty: x.declared_qty === null ? null : Number(x.declared_qty),

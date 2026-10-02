@@ -1,6 +1,6 @@
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const { collect } = require('./rules');
-const { workQueue } = require('../agents/kladovshchik');
+const { workQueue, vwReminders } = require('../agents/kladovshchik');
 const { plural } = require('../journal/plural');
 const { zoneOf, todayIn, hourIn } = require('../warehouses/time');
 
@@ -104,6 +104,19 @@ async function maybeDigest(client, warehouseId) {
   }
   if (w.returnsToSort) parts.push(`${w.returnsToSort} ${plural(w.returnsToSort, 'возврат', 'возврата', 'возвратов')} на разбор`);
   if (w.defectTasks) parts.push(`${w.defectTasks} ${plural(w.defectTasks, 'задание', 'задания', 'заданий')} склада брака`);
+  // Склады продавцов (владелец 02.10.2026) — если напоминания не выключены.
+  const vw = await vwReminders(client, warehouseId);
+  if (vw) {
+    if (vw.sellerRequests.length) parts.push(`${vw.sellerRequests.length} ${plural(vw.sellerRequests.length, 'заявка', 'заявки', 'заявок')} продавцов на перенос ждут вас`);
+    if (vw.waitingSellerConsent + vw.waitingSellerDecision) {
+      const k = vw.waitingSellerConsent + vw.waitingSellerDecision;
+      parts.push(`${k} ${plural(k, 'перенос или решение ждёт', 'переноса или решения ждут', 'переносов или решений ждут')} продавцов`);
+    }
+    if (vw.moveTasks) parts.push(`${vw.moveTasks} ${plural(vw.moveTasks, 'задание', 'задания', 'заданий')} «переложить» не сделано`);
+    for (const z of vw.fullZones) {
+      parts.push(`зона склада «${z.warehouse}» продавца «${z.seller}» заполнена${z.incoming ? ` — едет ${z.incoming} шт.` : ''}`);
+    }
+  }
 
   // Ни работы, ни открытых тревог — писать не о чем. И день при этом НЕ
   // помечаем сделанным: проверки идут каждые десять минут круглосуточно, и

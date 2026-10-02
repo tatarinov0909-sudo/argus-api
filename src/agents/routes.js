@@ -46,10 +46,15 @@ router.get('/kladovshchik/suggest-cell', requireAuth, requireRole('owner', 'work
     // Компания необязательна, но с ней подсказка идёт туда, где у этого
     // продавца уже сложилась зона, а не куда попало.
     const companyId = req.query.companyId?.trim() || null;
+    // Склад продавца строки (02.10.2026): 'main' — «Основной», id — склад,
+    // не передан — неизвестен (подсказка как раньше).
+    const vwArg = req.query.vw?.trim();
+    const vw = !vwArg ? undefined : vwArg === 'main' ? null
+      : (/^[0-9a-f-]{36}$/i.test(vwArg) ? vwArg : undefined);
 
     const { warehouseId, staffKeyId } = req.auth;
     const result = await withTenantContext({ warehouseId }, async (client) => {
-      const options = await kladovshchik.suggestCells(client, warehouseId, sku, companyId);
+      const options = await kladovshchik.suggestCells(client, warehouseId, sku, companyId, 3, { vw });
       // Что предложили — записываем сразу: потом эту же подсказку уже не
       // пересчитать, склад изменится.
       const suggestionId = await kladovshchik.recordSuggestion(client, warehouseId, {

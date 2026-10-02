@@ -130,6 +130,7 @@ async function markFromShelf(client, {
     cellBlockId: fromCellBlockId, sku, companyId, quality: 'good', qty: amount, verb: 'отметить браком', vw,
   });
   for (const part of parts) {
+    await require('../vwarehouses/separate').checkPut(client, warehouseId, { cellBlockId: target, companyId, vw: part.vw, quality: bucket });
     await client.query(
       `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`, [target, warehouseId, companyId, sku, part.qty, bucket, part.vw]);
@@ -164,25 +165,38 @@ async function markFromShelf(client, {
 
 // Куда класть брак: сначала ячейки, где уже лежит брак этого продавца, потом
 // отмеченные руководителем ячейки брака, потом пустые.
-async function suggestCells(client, warehouseId, companyId, limit = 6) {
+async function suggestCells(client, warehouseId, companyId, limit = 6, opts = {}) {
   const rows = (await client.query(
     `WITH own AS (
        SELECT cs.cell_block_id AS id, 1 AS rank, 'здесь уже брак этого продавца' AS reason
          FROM cell_stock cs WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.quality <> 'good' AND cs.qty > 0
         GROUP BY cs.cell_block_id),
      zone AS (
-       SELECT cb.id, 2, 'ячейка брака' FROM cell_blocks cb WHERE cb.warehouse_id = $1 AND cb.defect_zone),
+       SELECT cb.id, 2, 'ячейка брака' FROM cell_blocks cb WHERE cb.warehouse_id = $1 AND cb.defect_zone AND cb.reserved_vw_id IS NULL),
      empty AS (
        SELECT cb.id, 3, 'свободная ячейка' FROM cell_blocks cb
-        WHERE cb.warehouse_id = $1 AND NOT EXISTS (SELECT 1 FROM cell_stock cs WHERE cs.cell_block_id = cb.id AND cs.qty > 0)),
+        WHERE cb.warehouse_id = $1 AND cb.reserved_vw_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM cell_stock cs WHERE cs.cell_block_id = cb.id AND cs.qty > 0)),
      pick AS (
        SELECT DISTINCT ON (x.id) x.id, x.rank, x.reason FROM (SELECT * FROM own UNION ALL SELECT * FROM zone UNION ALL SELECT * FROM empty) x
         ORDER BY x.id, x.rank)
      SELECT p.id, p.reason, ${blockLabelSql('cb', 'wr')} AS label
        FROM pick p JOIN cell_blocks cb ON cb.id = p.id JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
       ORDER BY p.rank, wr.row_num, cb.rack_start, cb.tier_start
-      LIMIT $3`, [warehouseId, companyId, limit])).rows;
-  return rows.map((r) => ({ cellBlockId: r.id, label: r.label, reason: r.reason }));
+      LIMIT $3`, [warehouseId, companyId, limit * 3])).rows;
+  // Склад брака известен (02.10.2026): не предлагать ячейку, куда его брак
+  // класть нельзя (брак склада «хранить отдельно» — отдельно).
+  const out = [];
+  if (opts.vw !== undefined && companyId) {
+    const separate = require('../vwarehouses/separate');
+    const lay = await separate.layout(client, companyId);
+    for (const r of rows) {
+      if (out.length >= limit) break;
+      if (lay.any && await separate.conflict(client, { cellBlockId: r.id, companyId, vw: opts.vw || null, quality: 'defective' }, lay)) continue;
+      out.push(r);
+    }
+  } else out.push(...rows.slice(0, limit));
+  return out.map((r) => ({ cellBlockId: r.id, label: r.label, reason: r.reason }));
 }
 
 // Склад брака продавца: что лежит (по товару и виду брака), сколько уже
@@ -341,6 +355,7 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
   if (backToSale) {
     toSku = d.action === 'markdown' ? await markdownProduct(client, warehouseId, d.company_id, d) : d.sku;
     for (const [vwKey, n] of byVw) {
+      await require('../vwarehouses/separate').checkPut(client, warehouseId, { cellBlockId, companyId: d.company_id, vw: vwKey || null, quality: 'good' });
       await client.query(
         `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
          VALUES ($1, $2, $3, $4, $5, 'good', $6)`, [cellBlockId, warehouseId, d.company_id, toSku, n, vwKey || null]);

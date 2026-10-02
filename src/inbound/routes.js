@@ -178,6 +178,9 @@ router.post('/:id/arrived', requireAuth, requireRole('owner', 'manager', 'worker
           + (differs ? ` Заявлено было: ${inbound.placesText(inv.boxes, inv.pallets)} — мест не столько, сколько обещал продавец.` : ''),
         entityType: 'invoice', entityId: inv.id, invoiceId: inv.id, status: differs ? 'pending' : 'auto', ...actorFields(req.auth),
       });
+      // Машина приехала, а зона склада продавца всё ещё заполнена —
+      // напомнить руководителю (владелец 02.10.2026).
+      await require('../vwarehouses/separate').warnFullZones(c, req.auth.warehouseId, inv.id, 'arrived');
       return { arrivedAt: at };
     });
     res.json(out);

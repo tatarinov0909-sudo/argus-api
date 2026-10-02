@@ -31,7 +31,9 @@ router.get('/cells', requireAuth, requireRole('worker', 'owner', 'manager'), asy
   try {
     const out = await inWarehouse(req, async (c) => {
       await activeCompany(c, req.auth.warehouseId, req.query.companyId);
-      return defects.suggestCells(c, req.auth.warehouseId, req.query.companyId);
+      const vwArg = typeof req.query.vw === 'string' ? req.query.vw : '';
+      const vw = !vwArg ? undefined : vwArg === 'main' ? null : (/^[0-9a-f-]{36}$/i.test(vwArg) ? vwArg : undefined);
+      return defects.suggestCells(c, req.auth.warehouseId, req.query.companyId, 6, { vw });
     });
     res.set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }

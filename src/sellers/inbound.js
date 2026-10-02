@@ -407,6 +407,9 @@ async function run(client, {
     entityType: 'invoice', entityId: inv.id, invoiceId: inv.id,
     actorType: actor.type || 'seller', actorId: actor.id || null,
   });
+  // Везут на склад, у которого зона заполнена, — руководителю сразу
+  // (владелец 02.10.2026; ещё раз — когда машина приедет).
+  await require('../vwarehouses/separate').warnFullZones(client, warehouseId, inv.id, 'created');
   return { applied: true, summary, lines: found, invoice: { id: inv.id, number: inv.number }, created: created.length };
 }
 

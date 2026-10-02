@@ -115,8 +115,19 @@ async function sellerOf(client, warehouseId, companyId) {
 // Проверка файла. С lock=true ячейки из файла блокируются до конца
 // транзакции, и проверка «уже лежит» идёт после блокировки: вторая загрузка
 // того же файла, нажатая одновременно с первой, дождётся её и получит отказ.
-async function plan(client, warehouseId, { companyId, rows }, { lock = false } = {}) {
+async function plan(client, warehouseId, { companyId, rows, defaultVw }, { lock = false } = {}) {
   const seller = await sellerOf(client, warehouseId, companyId);
+  // Склады продавца (владелец 02.10.2026): «по умолчанию склад …» для строк
+  // без столбца «Склад» и столбец «Склад» в файле, если он есть.
+  const vws = (await client.query(
+    'SELECT id, name FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL', [seller.id])).rows;
+  let fallbackVw = null;
+  if (defaultVw) {
+    const hit = vws.find((w) => w.id === defaultVw);
+    if (!hit) throw new HttpError(400, 'Склада по умолчанию у продавца нет — выберите заново');
+    fallbackVw = hit.id;
+  }
+  const vwByName = new Map(vws.map((w) => [String(w.name).trim().toLowerCase(), w.id]));
   if (!Array.isArray(rows) || rows.length === 0) throw new HttpError(400, 'В файле нет строк');
   if (rows.length > MAX_ROWS) {
     throw new HttpError(400, `За раз — не больше ${MAX_ROWS} строк. Разбейте файл на части`);
@@ -169,6 +180,18 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
     }
     line.quality = quality;
 
+    const vwText = String(r.warehouse ?? '').trim();
+    if (vwText && vwText.toLowerCase() !== 'основной') {
+      if (!vwByName.has(vwText.toLowerCase())) {
+        line.error = `склада «${vwText}» у продавца нет — есть: «Основной»${vws.map((w) => `, «${w.name}»`).join('')}`;
+        return;
+      }
+      line.vw = vwByName.get(vwText.toLowerCase());
+    } else {
+      line.vw = vwText ? null : fallbackVw;
+    }
+    if (vws.length) line.vwName = line.vw ? vws.find((w) => w.id === line.vw).name : 'Основной';
+
     if (r.cellIsDate === true) {
       line.error = 'Excel превратил адрес ячейки в дату. Поставьте колонке «Ячейка» формат «Текстовый» и впишите адрес заново';
       return;
@@ -210,7 +233,7 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
   const seen = new Map();
   for (const l of lines) {
     if (l.error) continue;
-    const key = `${l.cellId}|${l.sku}|${l.quality}`;
+    const key = `${l.cellId}|${l.sku}|${l.quality}|${l.vw || ''}`;
     if (seen.has(key)) {
       l.error = `повтор строки ${seen.get(key)}: этот товар в этой ячейке уже есть в файле`;
     } else {
@@ -228,13 +251,13 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
   }
 
   if (cellIds.length) {
-    const keyOf = (cell, sku, quality) => `${cell}|${sku}|${quality}`;
+    const keyOf = (cell, sku, quality, vw) => `${cell}|${sku}|${quality}|${vw || ''}`;
     // Что уже загружали сюда раньше (не считая отменённых загрузок). По этому
     // повторная загрузка узнаёт свои строки, даже если товар с тех пор
     // забрали отбором и в ячейке пусто.
     const history = await client.query(
       `SELECT op.to_cell_block_id AS cell, op.sku, COALESCE(op.details->>'quality', 'good') AS quality,
-              SUM(op.qty) AS qty, MAX(op.created_at) AS at,
+              COALESCE(op.details->>'vw', '') AS vw, SUM(op.qty) AS qty, MAX(op.created_at) AS at,
               array_agg(op.details->>'cellStockId') FILTER (WHERE op.details ? 'cellStockId') AS stock_ids
          FROM stock_operations op
         WHERE op.warehouse_id = $1 AND op.company_id = $2 AND op.kind = 'initial_load'
@@ -242,10 +265,10 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
           AND NOT EXISTS (SELECT 1 FROM stock_operations u
                            WHERE u.warehouse_id = $1 AND u.kind = 'initial_load_undo'
                              AND u.details->>'batch' = op.details->>'batch')
-        GROUP BY 1, 2, 3`,
+        GROUP BY 1, 2, 3, 4`,
       [warehouseId, seller.id, cellIds],
     );
-    const before = new Map(history.rows.map((h) => [keyOf(h.cell, h.sku, h.quality),
+    const before = new Map(history.rows.map((h) => [keyOf(h.cell, h.sku, h.quality, h.vw),
       { qty: Number(h.qty), at: h.at }]));
     // «Уже лежит» — то, что положили приёмка, возврат или перемещение, в любом
     // состоянии: брак, посчитанный поверх принятого годного, — это те же
@@ -273,7 +296,7 @@ async function plan(client, warehouseId, { companyId, rows }, { lock = false } =
     const day = (at) => new Date(at).toLocaleDateString('ru-RU', { timeZone: zone });
     for (const l of lines) {
       if (l.error || !l.cellId) continue;
-      const key = keyOf(l.cellId, l.sku, l.quality);
+      const key = keyOf(l.cellId, l.sku, l.quality, l.vw);
       const prior = before.get(key);
       if (prior && prior.qty === l.qty) {
         l.already = day(prior.at);
@@ -351,9 +374,9 @@ async function apply(client, warehouseId, body, { ownerId, basis = 'count' }) {
     // source=NULL: это наблюдение склада — посчитано на полке, а не выведено
     // из учёта. Происхождение видно в stock_operations.
     const inserted = await client.query(
-      `INSERT INTO cell_stock (warehouse_id, company_id, cell_block_id, sku, qty, quality, source)
-       VALUES ($1, $2, $3, $4, $5, $6, NULL) RETURNING id`,
-      [warehouseId, checked.seller.id, l.cellId, l.sku, l.qty, l.quality],
+      `INSERT INTO cell_stock (warehouse_id, company_id, cell_block_id, sku, qty, quality, source, virtual_warehouse_id)
+       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7) RETURNING id`,
+      [warehouseId, checked.seller.id, l.cellId, l.sku, l.qty, l.quality, l.vw || null],
     );
     l.cellStockId = inserted.rows[0].id;
   }
@@ -365,7 +388,8 @@ async function apply(client, warehouseId, body, { ownerId, basis = 'count' }) {
       `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, to_cell_block_id, details)
        VALUES ($1, $2, 'initial_load', $3, $4, $5, $6::jsonb)`,
       [warehouseId, checked.seller.id, l.sku, l.qty, l.cellId,
-        JSON.stringify({ batch, line: l.line, quality: l.quality, ownerId, cellStockId: l.cellStockId, basis })],
+        JSON.stringify({ batch, line: l.line, quality: l.quality, ownerId, cellStockId: l.cellStockId, basis,
+          ...(l.vw ? { vw: l.vw } : {}) })],
     );
   }
   for (const id of cellIds) await refreshCellFill(client, id);
@@ -375,7 +399,7 @@ async function apply(client, warehouseId, body, { ownerId, basis = 'count' }) {
   for (const l of ok.filter((x) => x.quality !== 'good')) {
     await defects.createMove(client, {
       warehouseId, companyId: checked.seller.id, sku: l.sku, qty: l.qty, bucket: l.quality,
-      source: 'initial_load', cellBlockId: l.cellId, batch, silent: true,
+      source: 'initial_load', cellBlockId: l.cellId, batch, silent: true, vw: l.vw || null,
     });
   }
 
@@ -486,7 +510,7 @@ async function undo(client, warehouseId, batch, { ownerId }) {
 
   const ids = ops.rows.map((o) => o.details.cellStockId);
   const rows = await client.query(
-    `SELECT id, cell_block_id, company_id, sku, quality::text AS quality, qty FROM cell_stock
+    `SELECT id, cell_block_id, company_id, sku, quality::text AS quality, qty, virtual_warehouse_id AS vw FROM cell_stock
       WHERE warehouse_id = $1 AND id::text = ANY($2::text[]) ORDER BY id FOR UPDATE`,
     [warehouseId, ids],
   );
@@ -494,7 +518,8 @@ async function undo(client, warehouseId, batch, { ownerId }) {
   const touched = ops.rows.filter((o) => {
     const r = byId.get(o.details.cellStockId);
     return !r || r.cell_block_id !== o.to_cell_block_id || r.company_id !== o.company_id
-      || r.sku !== o.sku || r.quality !== (o.details.quality || 'good') || Number(r.qty) !== Number(o.qty);
+      || r.sku !== o.sku || r.quality !== (o.details.quality || 'good') || Number(r.qty) !== Number(o.qty)
+      || (r.vw || null) !== (o.details.vw || null);
   });
   if (touched.length) {
     throw new HttpError(409, `Товар этой загрузки уже трогали — отбирали, перемещали или пересчитывали `

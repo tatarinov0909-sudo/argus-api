@@ -13,6 +13,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { requireQty } = require('../middleware/qty');
 const journal = require('../journal/repository');
 const { nextNumber, productName } = require('../defects/service');
+const separate = require('./separate');
 
 const MAIN_NAME = 'Основной';
 const MARKETPLACES = { wb: 'WB', ozon: 'Озон', yandex: 'Яндекс Маркет', other: 'иное' };
@@ -31,7 +32,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const view = (r) => ({
   id: r.id, name: r.name, marketplace: r.marketplace, marketplaceName: MARKETPLACES[r.marketplace],
-  keepSeparate: r.keep_separate, archivedAt: r.archived_at || null, createdAt: r.created_at,
+  keepSeparate: r.keep_separate, defectSeparate: r.defect_separate, archivedAt: r.archived_at || null, createdAt: r.created_at,
 });
 
 async function list(client, companyId, { withArchived = false } = {}) {
@@ -99,7 +100,7 @@ async function notifySeller(client, { warehouseId, companyId, kind, text, entity
 const ACTOR_NAME = { owner: 'Руководитель склада', seller: 'Продавец' };
 const actorType = (role) => (role === 'seller' ? 'seller' : role);
 
-async function create(client, { warehouseId, companyId, name, marketplace, keepSeparate = false, actor }) {
+async function create(client, { warehouseId, companyId, name, marketplace, keepSeparate = false, defectSeparate = false, zone, actor }) {
   const company = await companyRow(client, warehouseId, companyId);
   const clean = cleanName(name);
   const mp = cleanMarketplace(marketplace);
@@ -108,9 +109,11 @@ async function create(client, { warehouseId, companyId, name, marketplace, keepS
     [companyId, clean])).rows[0];
   if (dup) throw new HttpError(409, `Склад «${clean}» у продавца уже есть`);
   const row = (await client.query(
-    `INSERT INTO virtual_warehouses (warehouse_id, company_id, name, marketplace, keep_separate, created_by, created_by_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-    [warehouseId, companyId, clean, mp, keepSeparate === true, actor.id || null, actor.name || null])).rows[0];
+    `INSERT INTO virtual_warehouses (warehouse_id, company_id, name, marketplace, keep_separate, defect_separate, created_by, created_by_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [warehouseId, companyId, clean, mp, keepSeparate === true, keepSeparate === true && defectSeparate === true,
+      actor.id || null, actor.name || null])).rows[0];
+  if (zone && (zone.rows?.length || zone.cells?.length)) await separate.setZone(client, warehouseId, { vwId: row.id, ...zone });
   const text = `Заведён склад «${clean}» продавца «${company.name}» (площадка — ${MARKETPLACES[mp]}`
     + `${keepSeparate === true ? ', хранить отдельно' : ''}).`;
   await journal.createEntry(client, {
@@ -122,7 +125,9 @@ async function create(client, { warehouseId, companyId, name, marketplace, keepS
   return view(row);
 }
 
-async function update(client, { warehouseId, companyId, id, name, marketplace, keepSeparate, actor }) {
+async function update(client, {
+  warehouseId, companyId, id, name, marketplace, keepSeparate, defectSeparate, zone, separateExisting, actor,
+}) {
   const company = await companyRow(client, warehouseId, companyId);
   const cur = (await client.query(
     'SELECT * FROM virtual_warehouses WHERE id = $1 AND company_id = $2 AND archived_at IS NULL FOR UPDATE',
@@ -133,6 +138,21 @@ async function update(client, { warehouseId, companyId, id, name, marketplace, k
     marketplace: marketplace === undefined ? cur.marketplace : cleanMarketplace(marketplace),
     keepSeparate: keepSeparate === undefined ? cur.keep_separate : keepSeparate === true,
   };
+  next.defectSeparate = next.keepSeparate && (defectSeparate === undefined ? cur.defect_separate : defectSeparate === true);
+  // Включили «хранить отдельно», а товар уже лежит вместе с товаром других
+  // складов (владелец 02.10.2026): склад решает — задания грузчику на
+  // разделение или только новый товар.
+  const turnedOn = (next.keepSeparate && !cur.keep_separate) || (next.defectSeparate && !cur.defect_separate);
+  let mixed = [];
+  if (turnedOn) {
+    mixed = await separate.mixedCells(client, warehouseId, companyId, id, { defect: next.defectSeparate });
+    if (!next.defectSeparate) mixed = mixed.filter((m) => m.quality === 'good');
+    else if (cur.keep_separate) mixed = mixed.filter((m) => m.quality !== 'good');
+    if (mixed.length && !['tasks', 'new'].includes(separateExisting)) {
+      throw new HttpError(409, `Товар склада «${cur.name}» уже лежит вместе с товаром других складов в ${mixed.length} `
+        + `${mixed.length === 1 ? 'ячейке' : 'ячейках'} — выберите: задания грузчику на разделение или разделять только новый товар`);
+    }
+  }
   if (next.name.toLowerCase() !== cur.name.toLowerCase()) {
     const dup = (await client.query(
       `SELECT 1 FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL AND id <> $2
@@ -147,9 +167,22 @@ async function update(client, { warehouseId, companyId, id, name, marketplace, k
     if (busy) throw new HttpError(409, `С этого склада собирается поставка ${busy.number} — площадку WB поменять нельзя, пока она не уедет`);
   }
   const row = (await client.query(
-    `UPDATE virtual_warehouses SET name = $2, marketplace = $3, keep_separate = $4 WHERE id = $1 RETURNING *`,
-    [id, next.name, next.marketplace, next.keepSeparate])).rows[0];
+    `UPDATE virtual_warehouses SET name = $2, marketplace = $3, keep_separate = $4, defect_separate = $5 WHERE id = $1 RETURNING *`,
+    [id, next.name, next.marketplace, next.keepSeparate, next.defectSeparate])).rows[0];
   const changes = [];
+  let tasks = 0;
+  if (mixed.length && separateExisting === 'tasks') {
+    tasks = await separate.createSeparateTasks(client, warehouseId, { companyId, vwId: id, list: mixed });
+    changes.push(`задания грузчику на разделение — ${tasks}`);
+  } else if (mixed.length) {
+    changes.push(`уже лежащее вместе (${mixed.length} яч.) не разделяем — отдельно только новый товар`);
+  }
+  if (row.defect_separate !== cur.defect_separate) changes.push(row.defect_separate ? 'брак тоже отдельно' : 'брак — в общих ячейках брака');
+  let zoneOut = null;
+  if (zone !== undefined) {
+    zoneOut = await separate.setZone(client, warehouseId, { vwId: id, rows: zone?.rows || [], cells: zone?.cells || [] });
+    changes.push(zoneOut.cells ? `зона: ${zoneOut.text}` : 'зона снята');
+  }
   if (row.name !== cur.name) changes.push(`название «${cur.name}» → «${row.name}»`);
   if (row.marketplace !== cur.marketplace) changes.push(`площадка ${MARKETPLACES[cur.marketplace]} → ${MARKETPLACES[row.marketplace]}`);
   if (row.keep_separate !== cur.keep_separate) changes.push(row.keep_separate ? 'хранить отдельно' : 'хранить вместе с остальными');
@@ -160,7 +193,7 @@ async function update(client, { warehouseId, companyId, id, name, marketplace, k
       entityType: 'virtual_warehouse', entityId: id, actorType: actorType(actor.role), actorId: actor.id || null,
     });
   }
-  return view(row);
+  return { ...view(row), tasks, ...(zoneOut ? { zone: zoneOut } : {}) };
 }
 
 // Убрать можно только пустой склад: ни товара (и брака) в ячейках, ни
@@ -185,6 +218,10 @@ async function archive(client, { warehouseId, companyId, id, actor }) {
     `SELECT number FROM vw_transfers WHERE (from_vw = $1 OR to_vw = $1) AND status IN ('requested', 'waiting_seller', 'to_move') LIMIT 1`,
     [id])).rows[0];
   if (open) throw new HttpError(409, `По этому складу не закончен перенос ${open.number}`);
+  const task = (await client.query(
+    `SELECT 1 FROM vw_move_tasks WHERE (from_vw = $1 OR to_vw = $1) AND status = 'open' LIMIT 1`, [id])).rows[0];
+  if (task) throw new HttpError(409, 'По этому складу не закончено задание грузчику «переложить»');
+  await client.query('UPDATE cell_blocks SET reserved_vw_id = NULL WHERE reserved_vw_id = $1', [id]);
   await client.query('UPDATE virtual_warehouses SET archived_at = now() WHERE id = $1', [id]);
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик', status: 'auto',
@@ -264,6 +301,16 @@ async function execute(client, warehouseId, t, actor) {
     throw new HttpError(409, `На складе «${nameOf(await list(client, t.company_id, { withArchived: true }), t.from_vw)}» можно перенести только ${free} шт.`
       + ' (остальное в ячейках занято поставками этого склада или его нет)');
   }
+  // Склад «хранить отдельно» (владелец 02.10.2026): товар надо переложить
+  // руками — задания грузчику; каждая переложенная штука сразу переходит.
+  if (await separate.needsMove(client, t.company_id, t.from_vw, t.to_vw, t.quality || 'good')) {
+    await separate.createTransferTasks(client, warehouseId, t);
+    return (await client.query(
+      `UPDATE vw_transfers SET status = 'to_move',
+              decided_role = COALESCE(decided_role, $2), decided_by = COALESCE(decided_by, $3), decided_name = COALESCE(decided_name, $4),
+              decided_at = COALESCE(decided_at, now())
+        WHERE id = $1 RETURNING *`, [t.id, actor.role, actor.id || null, actor.name || null])).rows[0];
+  }
   const cells = await moveRows(client, warehouseId, t);
   return (await client.query(
     `UPDATE vw_transfers SET status = 'done', done_at = now(), moved_cells = $2::jsonb,
@@ -305,13 +352,14 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
   const what = describe(t, rows);
   if (status === 'done') {
     t = await execute(client, warehouseId, t, actor);
+    const byHand = t.status === 'to_move' ? ' Склад хранится отдельно — грузчик перекладывает товар, переложенное сразу на новом складе.' : '';
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
-      actionText: `Перенос ${number} у продавца «${company.name}»: ${what}.${t.note ? ` Комментарий: ${t.note}` : ''}`,
+      actionText: `Перенос ${number} у продавца «${company.name}»: ${what}.${t.note ? ` Комментарий: ${t.note}` : ''}${byHand}`,
       entityType: 'vw_transfer', entityId: t.id, actorType: actorType(actor.role), actorId: actor.id || null,
     });
     await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', entityId: t.id,
-      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${dot(t.note)}` : ''}${DECIDED_SELF}` });
+      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${dot(t.note)}` : ''}${byHand}${DECIDED_SELF}` });
   } else if (status === 'waiting_seller') {
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
@@ -381,7 +429,8 @@ async function decide(client, { warehouseId, transferId, approve, reason, actor 
               decided_at = now(), reject_reason = $5 WHERE id = $1 RETURNING *`,
       [t.id, actor.role, actor.id || null, who, cleanNote(reason)])).rows[0];
   }
-  const verdict = approve ? 'выполнен' : `отказано${done.reject_reason ? ` (${done.reject_reason})` : ''}`;
+  const verdict = !approve ? `отказано${done.reject_reason ? ` (${done.reject_reason})` : ''}`
+    : done.status === 'to_move' ? 'принят — склад хранится отдельно, грузчик перекладывает товар' : 'выполнен';
   const text = `Перенос ${t.number} продавца «${company.name}» ${what} — ${verdict}. Решил: ${who}.`;
   // Заявка продавца висела «очень важно» в журнале — закрываем ответом.
   const pending = (await client.query(
@@ -520,11 +569,13 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
   const companies = [...new Set(rows.map((r) => r.company_id))];
   if (companies.length > 1) throw new HttpError(400, 'Строки разных продавцов');
   const company = await companyRow(client, warehouseId, companies[0]);
-  // Склад у строки привоза выбрал сам продавец: поменять без него — то же,
-  // что перенести его товар между складами (право «решать без продавца»).
-  if (!rightsOf(company).decide && rows.some((r) => r.source_document_type === 'seller_inbound')) {
+  // Поменять склад у строки без продавца — то же, что перенести его товар
+  // между складами (право «решать без продавца», владелец 02.10.2026).
+  if (!rightsOf(company).decide) {
     throw new HttpError(409, `Продавец «${company.name}» запретил складу решать без него, на каком складе его товар. `
-      + 'Склад у строк своего привоза он меняет сам — изменив привоз.');
+      + (rows.some((r) => r.source_document_type === 'seller_inbound')
+        ? 'Склад у строк своего привоза он меняет сам — изменив привоз.'
+        : 'Строка останется на своём складе; перенести товар можно с согласия продавца.'));
   }
   for (const r of rows) {
     if (r.started) throw new HttpError(409, `По «${r.name}» в ${r.number} уже работали — склад строки поменять нельзя`);
@@ -629,12 +680,19 @@ async function retag(client, warehouseId, { companyId, sku, name, fromVw, toVw, 
     }
   }
   const number = await nextNumber(client, warehouseId, 'ПЕР', 'vw_transfers');
+  const byHand = await separate.needsMove(client, companyId, fromVw, toVw, quality);
   const t = (await client.query(
     `INSERT INTO vw_transfers (warehouse_id, company_id, number, sku, name, qty, from_vw, to_vw, note, status, quality,
                                requested_role, requested_by, requested_name, decided_role, decided_by, decided_name, decided_at, done_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'done', $10, $11, $12, $13, $11, $12, $13, now(), now()) RETURNING *`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $14, $10, $11, $12, $13, $11, $12, $13, now(),
+             CASE WHEN $14 = 'done' THEN now() END) RETURNING *`,
     [warehouseId, companyId, number, sku, name, qty, fromVw, toVw, note, quality, actor.role, actor.id || null,
-      actor.name || ACTOR_NAME[actor.role] || null])).rows[0];
+      actor.name || ACTOR_NAME[actor.role] || null, byHand ? 'to_move' : 'done'])).rows[0];
+  // Склад «хранить отдельно» — переложить руками (задания грузчику).
+  if (byHand) {
+    await separate.createTransferTasks(client, warehouseId, t);
+    return number;
+  }
   const cells = await moveRows(client, warehouseId, t);
   await client.query('UPDATE vw_transfers SET moved_cells = $2::jsonb WHERE id = $1', [t.id, JSON.stringify(cells)]);
   return number;

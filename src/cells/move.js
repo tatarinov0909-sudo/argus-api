@@ -46,6 +46,11 @@ async function moveStock(client, warehouseId, {
   });
 
   for (const part of taken) {
+    // Склад «хранить отдельно» и зоны складов продавца (02.10.2026);
+    // подключаем при вызове: модуль складов сам пользуется этим файлом.
+    await require('../vwarehouses/separate').checkPut(client, warehouseId, {
+      cellBlockId: targetCell, companyId: part.companyId, vw: part.vw, quality: targetQuality,
+    });
     await client.query(
       `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -130,7 +135,7 @@ async function takeFromCell(client, warehouseId, {
         [row.id, rest],
       );
     }
-    const key = `${row.company_id || ''} ${row.virtual_warehouse_id || ''}`;
+    const key = `${row.company_id || ''}\u0000${row.virtual_warehouse_id || ''}`;
     const part = takenBy.get(key) || { companyId: row.company_id || null, vw: row.virtual_warehouse_id || null, qty: 0 };
     part.qty += take;
     takenBy.set(key, part);

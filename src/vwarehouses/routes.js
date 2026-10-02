@@ -4,6 +4,8 @@ const { withTenantContext } = require('../db/pool');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const { HttpError } = require('../middleware/errorHandler');
 const vw = require('./service');
+const separate = require('./separate');
+const kladovshchik = require('../agents/kladovshchik');
 
 // Виртуальные склады продавца (владелец 02.10.2026). Склады заводит склад
 // (руководитель, менеджер); продавец их видит, просит перенос и включает или
@@ -26,15 +28,21 @@ const inSeller = (req, fn) => withTenantContext(tenantContextFromAuth(req.auth),
 const inWarehouse = (req, fn) => withTenantContext({ warehouseId: req.auth.warehouseId }, fn);
 
 // Склады продавца, его права и склады для поставки на WB.
-router.get('/', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+// Грузчику — тоже: склад продавца выбирают при заведении возврата.
+router.get('/', requireAuth, requireRole('seller', 'owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const companyId = companyOf(req);
     const out = await inSeller(req, async (c) => {
       const company = (await c.query('SELECT id, ff_rights FROM companies WHERE id = $1 AND archived_at IS NULL', [companyId])).rows[0];
       if (!company) throw new HttpError(404, 'Продавец не найден');
+      // Зона склада — складу (продавцу она ни к чему).
+      const list = await vw.list(c, companyId);
+      if (req.auth.role !== 'seller') {
+        for (const w of list) w.zone = await separate.zoneInfo(c, req.auth.warehouseId, w.id);
+      }
       return {
         main: { id: null, name: vw.MAIN_NAME },
-        warehouses: await vw.list(c, companyId),
+        warehouses: list,
         rights: vw.rightsOf(company),
         wbChoices: await vw.wbChoices(c, companyId),
       };
@@ -48,7 +56,7 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
     const b = req.body || {};
     const out = await inWarehouse(req, async (c) => vw.create(c, {
       warehouseId: req.auth.warehouseId, companyId: companyOf(req), name: b.name, marketplace: b.marketplace,
-      keepSeparate: b.keepSeparate, actor: await actorOf(c, req.auth),
+      keepSeparate: b.keepSeparate, defectSeparate: b.defectSeparate, zone: b.zone, actor: await actorOf(c, req.auth),
     }));
     res.status(201).json(out);
   } catch (err) { next(err); }
@@ -59,7 +67,57 @@ router.patch('/:id([0-9a-fA-F-]{36})', requireAuth, requireRole('owner', 'manage
     const b = req.body || {};
     const out = await inWarehouse(req, async (c) => vw.update(c, {
       warehouseId: req.auth.warehouseId, companyId: companyOf(req), id: req.params.id,
-      name: b.name, marketplace: b.marketplace, keepSeparate: b.keepSeparate, actor: await actorOf(c, req.auth),
+      name: b.name, marketplace: b.marketplace, keepSeparate: b.keepSeparate, defectSeparate: b.defectSeparate,
+      zone: b.zone, separateExisting: b.separateExisting, actor: await actorOf(c, req.auth),
+    }));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Сколько товара склада уже лежит вместе с товаром других складов продавца —
+// чтобы при включении «хранить отдельно» спросить, что с ним делать.
+router.get('/:id([0-9a-fA-F-]{36})/mixed', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = companyOf(req);
+    const out = await inWarehouse(req, (c) => separate.mixedCells(c, req.auth.warehouseId, companyId, req.params.id,
+      { defect: req.query.defect === '1' }));
+    const good = out.filter((m) => m.quality === 'good' || req.query.defect === '1');
+    res.json({ cells: new Set(good.map((m) => m.cell_block_id)).size, units: good.reduce((n, m) => n + m.qty, 0) });
+  } catch (err) { next(err); }
+});
+
+// Задания «переложить» (склад «хранить отдельно»): грузчику — список с
+// подсказкой ячеек, шаг «переложил»; руководитель может снять задание.
+router.get('/move-tasks', requireAuth, requireRole('worker', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const out = await inWarehouse(req, async (c) => {
+      const tasks = await separate.listTasks(c, req.auth.warehouseId, { open: true });
+      for (const t of tasks.slice(0, 50)) {
+        t.suggest = t.quality === 'good'
+          ? await kladovshchik.suggestCells(c, req.auth.warehouseId, t.sku, t.companyId, 3, { vw: t.toVw })
+          : [];
+        t.suggest = t.suggest.filter((o) => o.blockId !== t.fromCellBlockId);
+      }
+      return tasks;
+    });
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+
+router.post('/move-tasks/:id/step', requireAuth, requireRole('worker', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const out = await inWarehouse(req, (c) => separate.step(c, req.auth.warehouseId, {
+      taskId: req.params.id, toCellBlockId: b.toCellBlockId, qty: b.qty, staffKeyId: req.auth.staffKeyId || null,
+    }));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+router.post('/move-tasks/:id/cancel', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const out = await inWarehouse(req, async (c) => separate.cancelTask(c, req.auth.warehouseId, {
+      taskId: req.params.id, note: (req.body || {}).note, actor: await actorOf(c, req.auth),
     }));
     res.json(out);
   } catch (err) { next(err); }

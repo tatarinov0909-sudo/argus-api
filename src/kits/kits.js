@@ -155,6 +155,7 @@ async function assembleKit(client, warehouseId, {
     for (const id of from) cellsTouched.add(id);
   }
 
+  await require('../vwarehouses/separate').checkPut(client, warehouseId, { cellBlockId: toCellBlockId, companyId, vw: vw || null, quality: 'good' });
   await client.query(
     `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
      VALUES ($1, $2, $3, $4, $5, 'good', $6)`,

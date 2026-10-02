@@ -74,10 +74,13 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
         [id, warehouseId],
       );
       if (!original.rows[0]) return null;
-      if ((original.rows[0].entity_type === ITEM_NOTE) !== (resolution === 'ack')) {
-        throw new HttpError(400, original.rows[0].entity_type === ITEM_NOTE
-          ? 'Записку грузчика о товаре отмечают «Принял к сведению»'
-          : '«Принял к сведению» — только для записок грузчика о товаре');
+      // «Принял к сведению» — записки грузчика и предупреждение «зона склада
+      // продавца заполнена» (02.10.2026): соглашаться там не с чем.
+      const ackOnly = ACK_TYPES.has(original.rows[0].entity_type);
+      if (ackOnly !== (resolution === 'ack')) {
+        throw new HttpError(400, ackOnly
+          ? 'Такую запись отмечают «Принял к сведению»'
+          : '«Принял к сведению» — только для записок грузчика о товаре и предупреждений о зоне склада');
       }
       // Второй ответ на одну запись — два противоречащих решения в следе.
       // Так бывает с открытого давно кабинета: заказ уже убрали из поставки,
@@ -130,6 +133,7 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 // сколько заказов; запись ведёт на строку первого по номеру заказа, и через
 // него — на поставку.
 const ITEM_NOTE = 'item_note';
+const ACK_TYPES = new Set([ITEM_NOTE, 'vw_zone']);
 router.post('/item-note', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;

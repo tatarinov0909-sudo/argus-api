@@ -242,8 +242,17 @@ async function findProducts(client, warehouseId, query, { withId = false } = {})
 // потом — просто свободную. Про габариты (влезет/не влезет) правила пока
 // нет — у товаров почти всегда пустые размеры (см. argus_1c_sync_status),
 // добавится само, когда данные появятся.
-async function suggestCells(client, warehouseId, sku, companyId = null, limit = 3) {
+async function suggestCells(client, warehouseId, sku, companyId = null, limit = 3, opts = {}) {
   const options = [];
+  // Склад продавца (02.10.2026): известен — подсказка не смешивает товар со
+  // складом «хранить отдельно» и ведёт в зону склада, пока в ней есть пустая
+  // ячейка; зона заполнена — рядом. Закреплённые за складами ячейки другим
+  // не предлагаем.
+  const separate = require('../vwarehouses/separate');
+  const vwKnown = opts.vw !== undefined;
+  const vw = opts.vw || null;
+  const lay = companyId ? await separate.layout(client, companyId) : null;
+  const zone = vwKnown && vw && lay ? lay.zone.get(vw) : null;
 
   // 1. Тот же артикул. Не размазывать один товар по складу — работник идёт за
   //    ним в одно место, а не собирает по всему залу. Когда продавец известен —
@@ -261,8 +270,24 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
     [warehouseId, sku, limit, companyId || null],
   );
   for (const b of sameSku.rows) {
+    if (lay && lay.any && (vwKnown || lay.zone.size)
+        && await separate.conflict(client, { cellBlockId: b.id, companyId, vw, quality: 'good' }, lay)) continue;
     options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'same_sku' });
   }
+
+  // 1½. Зона склада: пустые ячейки зоны. Пока они есть — только туда.
+  if (zone && zone.size && options.length < limit) {
+    const inZone = (await client.query(
+      `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+         FROM cell_blocks cb JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+        WHERE cb.id = ANY($1::uuid[]) AND cb.id <> ALL($3::uuid[])
+          AND NOT EXISTS (SELECT 1 FROM cell_stock cs WHERE cs.cell_block_id = cb.id AND cs.qty > 0)
+        ORDER BY wr.row_num, cb.rack_start, cb.tier_start LIMIT $2`,
+      [[...zone], limit - options.length, options.map((o) => o.blockId)])).rows;
+    for (const b of inZone) options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'vw_zone' });
+    if (inZone.length) return options;
+  }
+  const zoneFull = !!(zone && zone.size);
 
   // 2. Свободная ячейка ТАМ, ГДЕ УЖЕ ЛЕЖИТ ТОВАР ЭТОГО ПРОДАВЦА.
   //
@@ -285,14 +310,14 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        JOIN company_rows crw ON crw.row_id = wr.id
-       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone AND cb.reserved_vw_id IS NULL
          AND cb.id <> ALL($4::uuid[])
        ORDER BY crw.cells DESC, wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $3`,
       [warehouseId, companyId, limit - options.length, options.map((o) => o.blockId)],
     );
     for (const b of nearCompany.rows) {
-      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'near_company' });
+      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: zoneFull ? 'zone_full' : 'near_company' });
     }
   }
 
@@ -305,14 +330,14 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
       `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone AND cb.reserved_vw_id IS NULL
          AND cb.id <> ALL($3::uuid[])
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $2`,
       [warehouseId, limit - options.length, options.map((o) => o.blockId)],
     );
     for (const b of empty.rows) {
-      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: 'empty' });
+      options.push({ blockId: b.id, label: formatBlockLabel(b.row_num, b), reason: zoneFull ? 'zone_full' : 'empty' });
     }
   }
 
@@ -703,6 +728,7 @@ async function workNow(client, warehouseId) {
     return `ждём ${day(a.planned_date)}`;
   };
 
+  const vw = await vwReminders(client, warehouseId);
   const tasks = (await client.query(
     `SELECT action, count(*)::int AS n, SUM(qty)::int AS units FROM defect_decisions
       WHERE warehouse_id = $1 AND status = 'pending' GROUP BY action ORDER BY action`, [warehouseId])).rows;
@@ -742,7 +768,44 @@ async function workNow(client, warehouseId) {
       })),
       tasks: tasks.map((t) => ({ action: TASK[t.action] || t.action, count: t.n, units: t.units })),
     },
+    ...(vw ? { sellerWarehouses: vw } : {}),
   };
+}
+
+// Склады продавцов — что ждёт (владелец 02.10.2026): заявки продавцов на
+// перенос, переносы и решения, которые ждут продавца, заполненные зоны с
+// привозом, задания «переложить». null — руководитель выключил напоминания
+// или ждать нечего.
+async function vwReminders(client, warehouseId) {
+  const on = (await client.query('SELECT vw_reminders FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
+  if (!on || on.vw_reminders === false) return null;
+  const separate = require('../vwarehouses/separate');
+  const requests = (await client.query(
+    `SELECT t.number, c.name AS seller, t.name, t.qty, t.requested_at FROM vw_transfers t JOIN companies c ON c.id = t.company_id
+      WHERE t.warehouse_id = $1 AND t.status = 'requested' ORDER BY t.requested_at LIMIT 10`, [warehouseId])).rows;
+  const n = (await client.query(
+    `SELECT (SELECT count(*)::int FROM vw_transfers WHERE warehouse_id = $1 AND status = 'waiting_seller') AS consent,
+            (SELECT count(*)::int FROM vw_decisions WHERE warehouse_id = $1 AND status = 'pending') AS decisions,
+            (SELECT count(*)::int FROM vw_move_tasks WHERE warehouse_id = $1 AND status = 'open') AS move_tasks`,
+    [warehouseId])).rows[0];
+  const zones = await separate.fullZones(client, warehouseId);
+  const incoming = zones.length ? (await client.query(
+    `SELECT ii.virtual_warehouse_id AS vw, SUM(ii.declared_qty)::int AS qty, MIN(left(i.source_document_date::text, 10)) AS day
+       FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
+      WHERE i.warehouse_id = $1 AND i.direction = 'in' AND i.status = 'open' AND ii.virtual_warehouse_id = ANY($2::uuid[])
+      GROUP BY 1`, [warehouseId, zones.map((z) => z.id)])).rows : [];
+  const out = {
+    sellerRequests: requests.map((r) => ({ number: r.number, seller: r.seller, product: r.name, qty: Number(r.qty), since: r.requested_at })),
+    waitingSellerConsent: n.consent,
+    waitingSellerDecision: n.decisions,
+    moveTasks: n.move_tasks,
+    fullZones: zones.map((z) => {
+      const inc = incoming.find((x) => x.vw === z.id);
+      return { seller: z.seller, warehouse: z.name, cells: z.cells, ...(inc ? { incoming: inc.qty, incomingDay: inc.day } : {}) };
+    }),
+  };
+  const empty = !out.sellerRequests.length && !out.waitingSellerConsent && !out.waitingSellerDecision && !out.moveTasks && !out.fullZones.length;
+  return empty ? null : out;
 }
 
 // «Сколько у Слим Тим», «у кого не хватает товара под заказы» — остатки
@@ -765,8 +828,25 @@ async function sellerStock(client, warehouseId, seller) {
   }
   const s = found[0];
   const rows = (await loadStock(client, s.companyId, { source: all.source })).filter((r) => r.listed);
+  // Склады продавца (02.10.2026): итог по каждому и товары, что лежат не на
+  // «Основном».
+  const split = rows.filter((r) => r.byWarehouse);
+  const warehouses = split.length ? split[0].byWarehouse.map((w, k) => ({
+    warehouse: w.name,
+    onHand: split.reduce((n, r) => n + Number(r.byWarehouse[k].onHand || 0), 0),
+    inAssembly: split.reduce((n, r) => n + Number(r.byWarehouse[k].inAssembly || 0), 0),
+    available: split.reduce((n, r) => n + Number(r.byWarehouse[k].available || 0), 0),
+    defect: split.reduce((n, r) => n + Number(r.byWarehouse[k].defect || 0), 0),
+  })) : null;
   return {
     ...brief(s),
+    ...(warehouses ? {
+      warehouses,
+      productsByWarehouse: split.filter((r) => r.byWarehouse.some((w) => w.id && w.onHand)).slice(0, 30).map((r) => ({
+        sku: r.sku, name: r.name,
+        split: Object.fromEntries(r.byWarehouse.filter((w) => w.onHand).map((w) => [w.name, w.onHand])),
+      })),
+    } : {}),
     shortages: rows.filter((r) => r.shortage).slice(0, 20).map((r) => ({
       sku: r.sku, name: r.name, total: r.total, ordered: r.orderedNotInSupply, inAssembly: r.inAssembly,
     })),
@@ -814,6 +894,6 @@ function runTool(client, warehouseId, name, args = {}) {
 
 module.exports = {
   parseCellAddress, cellContents,
-  findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary, workQueue,
+  findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary, workQueue, vwReminders,
   listDiscrepancies, suppliesInfo, workNow, sellerStock, runTool, recordSuggestion, recordSuggestionOutcome,
 };
