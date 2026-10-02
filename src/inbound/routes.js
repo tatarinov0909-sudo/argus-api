@@ -49,7 +49,7 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
     const out = await run(req, async (c) => {
       const inv = await findInbound(c, req.auth, req.params.id);
       const items = (await c.query(
-        `SELECT ii.sku, ii.name, ii.declared_qty,
+        `SELECT ii.id, ii.sku, ii.name, ii.declared_qty, ii.virtual_warehouse_id,
                 (SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id) AS accepted,
                 -- Не разложено по ячейкам: принятое минус все укладки (их
                 -- может быть несколько — приёмка в несколько ячеек).
@@ -88,7 +88,9 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
         unplaced: items.reduce((s, i) => s + Number(i.unplaced || 0), 0),
         editable: inv.source_document_type === 'seller_inbound' && inv.status === 'open' && !inv.arrived_at && !done.length,
         discrepancy: completed ? done.reduce((s, i) => s + Number(i.accepted), 0) - items.reduce((s, i) => s + Number(i.declared_qty), 0) : null,
-        lines: items.map((i) => ({ sku: i.sku, name: i.name, declared: Number(i.declared_qty), accepted: num(i.accepted) })),
+        // id и склад продавца строки (виртуальные склады, 02.10.2026).
+        lines: items.map((i) => ({ id: i.id, sku: i.sku, name: i.name, declared: Number(i.declared_qty),
+          accepted: num(i.accepted), vw: i.virtual_warehouse_id })),
         verdict: inv.seller_verdict ? { value: inv.seller_verdict, at: inv.seller_verdict_at, note: inv.seller_verdict_note } : null,
         documents: docs.map((d) => ({ id: d.id, kind: d.kind, number: d.number, date: d.doc_date,
           supplier: d.supplier, fileName: d.file_name, fileType: d.file_type, fileSize: d.file_size, addedBy: d.added_by, createdAt: d.created_at })),

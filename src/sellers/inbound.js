@@ -292,6 +292,7 @@ const canBeNew = (l) => !l.error && !!l.name && l.name.length <= 300 && !!newSku
 
 async function run(client, {
   warehouseId, companyId, grid, apply = false, createNew = false, replaceId = null, details = {}, actor = {},
+  warehouseByRow = null,
 }) {
   const lines = parseInboundSheet(grid);
   const find = await loadCatalog(client, companyId);
@@ -305,6 +306,9 @@ async function run(client, {
   const fresh = new Map(); // артикул и склад → новая карточка
   for (const raw of lines) {
     const line = { ...raw };
+    // Склад, выбранный у строки в предпросмотре, — поверх столбца файла.
+    const picked = warehouseByRow && typeof warehouseByRow === 'object' ? warehouseByRow[String(raw.row)] : undefined;
+    if (typeof picked === 'string' && picked.trim()) line.warehouse = picked.trim().slice(0, 100);
     let vw = null;
     if (vws.length && line.warehouse && low(line.warehouse) !== 'основной') {
       vw = vwByName.get(low(line.warehouse)) || null;
@@ -336,7 +340,8 @@ async function run(client, {
     lines: found.length,
     matched: found.filter((l) => l.sku).length,
     notMatched: found.filter((l) => !l.sku && !l.isNew).length,
-    products: bySku.size,
+    // Товаров — разных, а не строк: товар на двух складах — один товар.
+    products: new Set([...bySku.values()].map((p) => p.sku)).size,
     units: [...bySku.values()].reduce((s, i) => s + i.qty, 0),
     newProducts: new Set([...fresh.values()].map((p) => p.sku.toUpperCase())).size,
     newUnits: [...fresh.values()].reduce((s, i) => s + i.qty, 0),

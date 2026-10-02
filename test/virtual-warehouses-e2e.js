@@ -69,10 +69,18 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const grid = [['Артикул', 'Количество', 'Склад'], ['R-1', 100, 'Озон'], ['R-1', 50, ''], ['R-1', 30, 'ооо ббб'], ['R-1', 5, 'Луна']];
     const preview = await api('POST', '/api/sellers/inbound', seller, { grid });
     assert.match(preview.lines.find((l) => l.warehouse === 'Луна').error, /склада «Луна» у вас нет/);
+    // Склад, выбранный у строки в предпросмотре, — поверх столбца файла.
+    assert.equal(preview.summary.products, 1);   // один товар на трёх складах — один товар
+    const luna = preview.lines.find((l) => l.warehouse === 'Луна');
+    const picked = await api('POST', '/api/sellers/inbound', seller, { grid, warehouseByRow: { [luna.row]: 'Опт' } });
+    const lunaNow = picked.lines.find((l) => l.row === luna.row);
+    assert.equal(lunaNow.error, undefined); assert.equal(lunaNow.vwName, 'Опт');
     const applied = await api('POST', '/api/sellers/inbound', seller, { grid: grid.slice(0, 4), apply: true });
     const inv = await api('GET', `/api/invoices/${applied.invoice.id}`, owner);
     const byVw = Object.fromEntries(inv.items.map((i) => [i.virtual_warehouse_id || 'main', Number(i.declared_qty)]));
     assert.deepEqual(byVw, { [ozon.id]: 100, main: 50, [ooo.id]: 30 });
+    const card = await api('GET', `/api/inbound/${inv.id}`, owner);
+    assert.deepEqual(card.lines.map((l) => l.vw || 'main').sort(), [ozon.id, 'main', ooo.id].sort());
     check('привоз продавца: строки ложатся на свои склады; чужой склад — ошибкой в строке');
 
     await api('POST', `/api/receiving/session/${inv.id}/start`, worker, {}, 201);
@@ -112,6 +120,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(other.status, 409); assert.match(other.body.error, /числится за другим складом продавца/);
     const list = await api('GET', `/api/shipping/pick-list?supplyId=${supply.id}`, worker);
     assert.equal(list.lines[0].shortfall, 10);
+    assert.equal(list.lines[0].vwName, 'ООО БББ');
     check('сборка берёт только товар склада поставки; товар «Озона» в той же ячейке — отказ с объяснением');
 
     // ---- Перенос складом: сразу, продавцу уведомление ----

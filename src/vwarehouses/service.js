@@ -423,9 +423,9 @@ async function setRights(client, { warehouseId, companyId, rights }) {
 
 async function notifications(client, companyId, { limit = 50 } = {}) {
   return (await client.query(
-    `SELECT id, kind, text, created_at, seen_at FROM seller_notifications WHERE company_id = $1
+    `SELECT id, kind, text, entity_id, created_at, seen_at FROM seller_notifications WHERE company_id = $1
       ORDER BY created_at DESC LIMIT $2`, [companyId, limit])).rows.map((n) => ({
-    id: n.id, kind: n.kind, text: n.text, at: n.created_at, unseen: !n.seen_at,
+    id: n.id, kind: n.kind, text: n.text, entityId: n.entity_id, at: n.created_at, unseen: !n.seen_at,
   }));
 }
 
@@ -531,7 +531,9 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
     warehouseId, agent: 'Кладовщик', status: 'auto', actionText: text,
     entityType: 'virtual_warehouse', entityId: vw ? vw.id : null, actorType: actorType(actor.role), actorId: actor.id || null,
   });
-  await notifySeller(client, { warehouseId, companyId: company.id, kind: 'vw_items', text: `${actor.name || 'Склад'}: ${text}` });
+  const what = rows.slice(0, 5).map((r) => `«${r.name || r.sku}»`).join(', ') + (rows.length > 5 ? ' и другие' : '');
+  await notifySeller(client, { warehouseId, companyId: company.id, kind: 'vw_items',
+    text: `${actor.name || 'Склад'} отнёс к складу «${vw ? vw.name : MAIN_NAME}» ${what} в документе ${docs.join(', ')}.` });
   return { updated: rows.length, vw: vw ? vw.id : null };
 }
 

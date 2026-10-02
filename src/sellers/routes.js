@@ -153,6 +153,8 @@ router.post('/inbound', requireAuth, requireRole('seller', 'owner', 'manager'), 
       return inbound.run(c, {
         warehouseId, companyId, grid: body.grid, apply: body.apply === true,
         createNew: body.createNew === true, details: body,
+        warehouseByRow: body.warehouseByRow && typeof body.warehouseByRow === 'object' && !Array.isArray(body.warehouseByRow)
+          ? body.warehouseByRow : null,
         // Замена списка товаров в уже оформленном привозе (до приезда машины).
         replaceId: typeof body.invoiceId === 'string' && /^[0-9a-f-]{36}$/i.test(body.invoiceId) ? body.invoiceId : null,
         actor: req.auth.role === 'seller' ? { type: 'seller', id: req.auth.sellerKeyId || null }

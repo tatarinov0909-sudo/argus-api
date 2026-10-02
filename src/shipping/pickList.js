@@ -190,6 +190,11 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     }
   }
 
+  // Название склада продавца у строки — грузчик видит, почему один товар
+  // стоит в листе двумя строками (виртуальные склады, 02.10.2026).
+  const vwIds = [...new Set([...lines.values()].map((l) => l.vw).filter(Boolean))];
+  const vwNames = new Map(vwIds.length ? (await client.query(
+    'SELECT id, name FROM virtual_warehouses WHERE id = ANY($1::uuid[])', [vwIds])).rows.map((r) => [r.id, r.name]) : []);
   const result = [];
   const visited = new Set();
   for (const [key, line] of lines) {
@@ -217,6 +222,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       name: line.name,
       companyId: line.companyId,
       vw: line.vw,
+      vwName: line.vw ? vwNames.get(line.vw) || null : null,
       article: line.article,
       barcode: line.barcode,
       photo: line.photo || null,

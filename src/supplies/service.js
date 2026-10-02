@@ -288,8 +288,11 @@ async function create(client, warehouseId, {
 // раз, а не столько раз, сколько заказов.
 async function contents(client, warehouseId, supplyId, { showShortages = false, showNotes = false } = {}) {
   const head = await client.query(
-    `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name FROM supplies s
+    `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name,
+            COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
+              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Основной' END) AS vw_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
+       LEFT JOIN virtual_warehouses vw ON vw.id = s.virtual_warehouse_id
       WHERE s.warehouse_id = $1 AND s.id = $2`,
     [warehouseId, supplyId],
   );
@@ -495,6 +498,10 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
       shipDate: head.rows[0].ship_day,
       companyId: head.rows[0].company_id,
       companyName: head.rows[0].company_name,
+      // Склад продавца, с которого собирают (виртуальные склады, 02.10.2026):
+      // null — «Основной»; у продавца без складов не показывается.
+      virtualWarehouseId: head.rows[0].virtual_warehouse_id,
+      virtualWarehouseName: head.rows[0].vw_name,
       createdAt: head.rows[0].created_at,
       readyAt: head.rows[0].ready_at,
       shippedAt: head.rows[0].shipped_at,
@@ -662,6 +669,8 @@ async function list(client, warehouseId, { status = null, showShortages = false,
             s.marketplace, s.mp_supply_id,
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
+            s.virtual_warehouse_id, COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
+              WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Основной' END) AS vw_name,
             -- Кто составил: первая запись журнала о поставке. «Когда пришла»
             -- на склад — created_at.
             cb.actor_type AS created_by_role, cb.actor_name AS created_by,
@@ -675,6 +684,7 @@ async function list(client, warehouseId, { status = null, showShortages = false,
                  AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) END AS missing
        FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
+       LEFT JOIN virtual_warehouses vw ON vw.id = s.virtual_warehouse_id
        LEFT JOIN LATERAL (
          SELECT je.actor_type,
                 CASE WHEN je.actor_type = 'owner' THEN 'владелец' ELSE sk.name END AS actor_name
@@ -685,7 +695,7 @@ async function list(client, warehouseId, { status = null, showShortages = false,
        LEFT JOIN invoices i ON i.supply_id = s.id
       WHERE s.warehouse_id = $1 AND ($2::text IS NULL OR s.status = $2::supply_status)
         AND (NOT $5::boolean OR s.status <> 'shipped' OR COALESCE(s.shipped_at, s.created_at) > now() - interval '14 days')
-      GROUP BY s.id, c.name, cb.actor_type, cb.actor_name
+      GROUP BY s.id, c.name, vw.name, cb.actor_type, cb.actor_name
       ORDER BY s.created_at DESC
       LIMIT $4`,
     [warehouseId, status, showShortages === true, limit, recentOnly === true],
