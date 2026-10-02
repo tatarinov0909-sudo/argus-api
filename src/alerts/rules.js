@@ -82,27 +82,55 @@ async function unsortedReturns(client, warehouseId) {
   }];
 }
 
-// Заказ собран и стоит. Занимает место у ворот, а клиент ждёт.
+// Собрано и стоит. Занимает место у ворот, а покупатель ждёт.
+//
+// С поставками (разбор 02.10.2026) собранный заказ WB ждёт, пока соберут всю
+// поставку, — это нормально, и тревога про «собранные заказы» шумела каждый
+// день. Тревожно другое: поставка собрана целиком (с момента сборки прошло
+// больше порога), а не уехала. Отгрузки из 1С поставок не знают — по ним
+// как раньше, по самому документу.
 async function readyNotShipped(client, warehouseId) {
+  const found = [];
+  const s = await client.query(
+    `SELECT s.number, c.name AS company, s.ready_at
+       FROM supplies s JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
+      WHERE s.warehouse_id = $1 AND s.status = 'ready'
+        AND COALESCE(s.ready_at, s.created_at) < now() - ($2 || ' hours')::interval
+      ORDER BY COALESCE(s.ready_at, s.created_at)`,
+    [warehouseId, THRESHOLDS.readyNotShippedHours],
+  );
+  if (s.rows.length) {
+    const n = s.rows.length;
+    const first = s.rows[0];
+    found.push({
+      key: 'supply_ready_not_shipped',
+      text: n === 1
+        ? `Поставка ${first.number} (${first.company}) собрана, но не уехала. Стоит и занимает место.`
+        : `${n} ${plural(n, 'собранная поставка', 'собранные поставки', 'собранных поставок')} не уехали. `
+          + `Самая давняя — ${first.number} (${first.company}).`,
+    });
+  }
   const r = await client.query(
     `SELECT i.number, c.name AS company, i.created_at
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.status = 'ready'
-       AND i.mp_closed_at IS NULL
+       AND i.source = '1c' AND i.supply_id IS NULL AND i.mp_closed_at IS NULL
        AND i.created_at < now() - ($2 || ' hours')::interval
      ORDER BY i.created_at`,
     [warehouseId, THRESHOLDS.readyNotShippedHours],
   );
-  if (r.rows.length === 0) return [];
-  const n = r.rows.length;
-  const first = r.rows[0];
-  return [{
-    key: 'ready_not_shipped',
-    text: n === 1
-      ? `Заказ ${first.number} (${first.company}) собран, но так и не отгружен. Стоит и занимает место.`
-      : `${n} ${plural(n, 'собранный заказ', 'собранных заказа', 'собранных заказов')} не отгружены. `
-        + `Самый давний — ${first.number} (${first.company}).`,
-  }];
+  if (r.rows.length) {
+    const n = r.rows.length;
+    const first = r.rows[0];
+    found.push({
+      key: 'ready_not_shipped',
+      text: n === 1
+        ? `Отгрузка ${first.number} из 1С (${first.company}) собрана, но так и не уехала. Стоит и занимает место.`
+        : `${n} ${plural(n, 'собранная отгрузка', 'собранные отгрузки', 'собранных отгрузок')} из 1С не уехали. `
+          + `Самая давняя — ${first.number} (${first.company}).`,
+    });
+  }
+  return found;
 }
 
 // Обмен с 1С молчит. Это тише всех остальных поломок и опаснее их: агент

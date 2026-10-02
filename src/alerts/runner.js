@@ -1,5 +1,7 @@
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const { collect } = require('./rules');
+const { workQueue } = require('../agents/kladovshchik');
+const { plural } = require('../journal/plural');
 const { zoneOf, todayIn, hourIn } = require('../warehouses/time');
 
 // Проход сторожа по одному складу.
@@ -86,21 +88,22 @@ async function maybeDigest(client, warehouseId) {
     [warehouseId],
   );
 
-  const work = await client.query(
-    `SELECT
-       (SELECT COUNT(*)::int FROM invoices
-        WHERE warehouse_id = $1 AND direction = 'out' AND status IN ('open', 'in_progress') AND mp_closed_at IS NULL) AS to_pick,
-       (SELECT COUNT(*)::int FROM invoices
-        WHERE warehouse_id = $1 AND direction = 'in' AND status IN ('open', 'in_progress')) AS to_receive,
-       (SELECT COUNT(*)::int FROM invoices
-        WHERE warehouse_id = $1 AND direction = 'return' AND status IN ('open', 'in_progress')) AS to_sort`,
-    [warehouseId],
-  );
-  const w = work.rows[0];
+  // Работа дня — как её видит грузчик (разбор 02.10.2026): «1202 на сборку»
+  // считало все заказы WB, а «46 на приёмку» — заказы поставщику из 1С.
+  const w = await workQueue(client, warehouseId);
   const parts = [];
-  if (w.to_pick) parts.push(`${w.to_pick} на сборку`);
-  if (w.to_receive) parts.push(`${w.to_receive} на приёмку`);
-  if (w.to_sort) parts.push(`${w.to_sort} на разбор возврата`);
+  if (w.suppliesToPick) {
+    parts.push(`${w.suppliesToPick} ${plural(w.suppliesToPick, 'поставка', 'поставки', 'поставок')} на сборку `
+      + `(${w.ordersToPick} ${plural(w.ordersToPick, 'заказ', 'заказа', 'заказов')})`);
+  }
+  if (w.onecToPick) parts.push(`${w.onecToPick} ${plural(w.onecToPick, 'отгрузка', 'отгрузки', 'отгрузок')} из 1С`);
+  if (w.suppliesReady) parts.push(`${w.suppliesReady} ${plural(w.suppliesReady, 'собранная поставка ждёт', 'собранные поставки ждут', 'собранных поставок ждут')} отгрузки`);
+  if (w.toReceive) {
+    parts.push(`${w.toReceive} ${plural(w.toReceive, 'привоз', 'привоза', 'привозов')} на приёмку`
+      + (w.arrived ? ` (${w.arrived} уже ${plural(w.arrived, 'приехал', 'приехали', 'приехали')})` : ''));
+  }
+  if (w.returnsToSort) parts.push(`${w.returnsToSort} ${plural(w.returnsToSort, 'возврат', 'возврата', 'возвратов')} на разбор`);
+  if (w.defectTasks) parts.push(`${w.defectTasks} ${plural(w.defectTasks, 'задание', 'задания', 'заданий')} склада брака`);
 
   // Ни работы, ни открытых тревог — писать не о чем. И день при этом НЕ
   // помечаем сделанным: проверки идут каждые десять минут круглосуточно, и

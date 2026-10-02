@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, allowWarehouseView } = require('../middleware/auth');
 const { agentLimiter } = require('../middleware/rateLimit');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
@@ -16,7 +16,9 @@ const router = express.Router();
 // Owner/staff only — a seller has no warehouseId in their token (RLS scopes
 // them by companyId instead, see tenantContext.js), and this tool is about
 // physical cell locations, which a seller has no reason to query anyway.
-router.get('/kladovshchik/find', requireAuth, requireRole('owner', 'worker'), async (req, res, next) => {
+// Менеджер — с правом «склад», как сама карта склада: раньше карту ему
+// открывали, а поиск на ней отвечал отказом (разбор 02.10.2026).
+router.get('/kladovshchik/find', requireAuth, allowWarehouseView, async (req, res, next) => {
   try {
     const q = req.query.q?.trim();
     if (!q) throw new HttpError(400, 'Укажите ?q= — что искать');

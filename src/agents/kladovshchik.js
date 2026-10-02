@@ -10,6 +10,7 @@
 // товар и спрашивают, когда он потерялся.
 const { kitInfo } = require('../kits/kits');
 const { formatBlockLabel } = require('../cells/label');
+const { loadStock } = require('../sellers/stock');
 
 // «Что лежит в 1.5.4?» (владелец 27.09.2026): Оркестратор искал адрес как
 // артикул, находил ноль и отвечал, что по ячейке искать не умеет. Отдельным
@@ -103,6 +104,25 @@ async function findProducts(client, warehouseId, query, { withId = false } = {})
     [warehouseId, `%${query}%`],
   );
 
+  // «Всего», «Заказано», «В сборке», «В пути», «Доступно» — те же числа и та
+  // же формула, что в кабинете продавца (sellers/stock.js). Раньше Кладовщик
+  // считал «можно отгрузить» по ячейкам и не вычитал заказы: у 21 товара из 46
+  // на стенде ответ в чате расходился с кабинетом (разбор 02.10.2026). Карте
+  // склада (withId) хватает ячеек — её не замедляем.
+  const cabinet = new Map();
+  const sellers = new Map();
+  if (!withId && products.rows.length) {
+    const companyIds = [...new Set(products.rows.map((p) => p.company_id).filter(Boolean))];
+    const source = (await client.query('SELECT stock_source FROM warehouses WHERE id = $1', [warehouseId]))
+      .rows[0]?.stock_source === 'argus' ? 'argus' : '1c';
+    for (const row of (await client.query('SELECT id, name FROM companies WHERE id = ANY($1::uuid[])', [companyIds])).rows) {
+      sellers.set(row.id, row.name);
+    }
+    for (const companyId of companyIds) {
+      for (const r of await loadStock(client, companyId, { source })) cabinet.set(`${companyId}\u0000${r.sku}`, r);
+    }
+  }
+
   const results = [];
   for (const p of products.rows) {
     // Только этого продавца: один артикул у двух продавцов — разный товар,
@@ -156,12 +176,20 @@ async function findProducts(client, warehouseId, query, { withId = false } = {})
       [warehouseId, p.sku, p.company_id || null],
     );
 
+    const s = cabinet.get(`${p.company_id}\u0000${p.sku}`);
     results.push({
       sku: p.sku,
       // Продавец обязателен в ответе: один и тот же код у двух продавцов —
       // разный товар, и «60 штук» без имени продавца вводили бы в заблуждение.
-      companyId: p.company_id || null,
+      ...(withId ? { companyId: p.company_id || null } : { seller: sellers.get(p.company_id) || null }),
       name: p.name,
+      ...(s ? {
+        stock: {
+          total: s.total, ordered: s.orderedNotInSupply, inAssembly: s.inAssembly,
+          inTransit: s.inTransit, available: s.sellerAvailable,
+          defect: s.defective + s.packagingDefect, shortage: s.shortage,
+        },
+      } : {}),
       category: p.category,
       weightG: p.weight_g,
       totalQty,
@@ -331,6 +359,11 @@ const STATUS_LABEL = {
 };
 
 function invoiceStatusLabel(row) {
+  // Заказ WB, который менеджер ещё не положил в поставку, — не «не начатая
+  // отгрузка»: склад его и не должен начинать.
+  if (row.status === 'open' && row.direction === 'out' && row.source !== '1c' && !row.supply_id && !row.mp_closed_at) {
+    return 'заказан на WB, в поставку ещё не взят';
+  }
   if (row.status === 'shipped') return row.mp_close_reason === 'canceled'
     ? 'отгружен со склада; позднее отменён на WB' : STATUS_LABEL.shipped;
   if (row.mp_stock_returned_at) return 'отменён на WB; товар возвращён в ячейки';
@@ -344,6 +377,7 @@ function invoiceStatusLabel(row) {
 async function listInvoices(client, warehouseId, { direction, status, limit = 20 } = {}) {
   const result = await client.query(
     `SELECT i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name,
+            i.source, i.supply_id, (SELECT s.number FROM supplies s WHERE s.id = i.supply_id) AS supply_number,
             COUNT(ii.id)::int AS item_count
      FROM invoices i
      JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
@@ -352,6 +386,8 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
        AND ($2::invoice_direction IS NULL OR i.direction = $2::invoice_direction)
        AND ($3::invoice_status IS NULL OR i.status = $3::invoice_status)
        AND ($3::invoice_status IS NULL OR $3::invoice_status = 'shipped' OR i.mp_closed_at IS NULL)
+       -- «Заказ поставщику» из 1С — заказ, а не привоз (как в списке грузчика).
+       AND i.source_document_type IS DISTINCT FROM 'supplier_order'
      GROUP BY i.id, i.number, i.direction, i.status, i.created_at, c.name
      ORDER BY (i.status IN ('completed', 'shipped') OR i.mp_closed_at IS NOT NULL) ASC, i.created_at DESC
      LIMIT $4`,
@@ -362,6 +398,7 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
     kind: DIRECTION_LABEL[r.direction] || r.direction,
     status: invoiceStatusLabel(r),
     company: r.company_name,
+    ...(r.supply_number ? { supply: r.supply_number } : {}),
     itemCount: r.item_count,
     createdAt: r.created_at,
   }));
@@ -372,7 +409,8 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
 // принятое количество, у отгрузки собранное, у возврата — разбор по состоянию.
 async function invoiceDetails(client, warehouseId, number) {
   const inv = await client.query(
-    `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name
+    `SELECT i.id, i.number, i.direction, i.status, i.created_at, i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, c.name AS company_name,
+            i.source, i.supply_id
      FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
      WHERE i.warehouse_id = $1 AND upper(i.number) = upper($2)
      ORDER BY i.created_at DESC LIMIT 1`,
@@ -418,6 +456,44 @@ async function invoiceDetails(client, warehouseId, number) {
   };
 }
 
+// Что склад ждёт сделать — как это видит грузчик в своих списках (одно
+// правило для утренней сводки, чата и экрана грузчика, разбор 02.10.2026):
+// сборка — заказы, которые менеджер положил в поставку, и отгрузки из 1С,
+// а не все заказы WB; приёмка — привозы, без «заказов поставщику» из 1С
+// (это заказ, а не привоз); возвраты — неразобранные; задания склада брака.
+async function workQueue(client, warehouseId) {
+  const r = await client.query(
+    `SELECT
+       (SELECT COUNT(DISTINCT i.supply_id)::int FROM invoices i JOIN supplies s ON s.id = i.supply_id
+         WHERE i.warehouse_id = $1 AND s.status = 'collecting' AND i.direction = 'out'
+           AND i.status IN ('open', 'in_progress') AND i.mp_closed_at IS NULL) AS supplies_to_pick,
+       (SELECT COUNT(*)::int FROM invoices i JOIN supplies s ON s.id = i.supply_id
+         WHERE i.warehouse_id = $1 AND s.status = 'collecting' AND i.direction = 'out'
+           AND i.status IN ('open', 'in_progress') AND i.mp_closed_at IS NULL) AS orders_to_pick,
+       (SELECT COUNT(*)::int FROM invoices i
+         WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.source = '1c' AND i.supply_id IS NULL
+           AND i.status IN ('open', 'in_progress') AND i.mp_closed_at IS NULL) AS onec_to_pick,
+       (SELECT COUNT(*)::int FROM supplies s WHERE s.warehouse_id = $1 AND s.status = 'ready') AS supplies_ready,
+       (SELECT COUNT(*)::int FROM invoices i
+         WHERE i.warehouse_id = $1 AND i.direction = 'in' AND i.status IN ('open', 'in_progress')
+           AND i.source_document_type IS DISTINCT FROM 'supplier_order') AS to_receive,
+       (SELECT COUNT(*)::int FROM invoices i
+         WHERE i.warehouse_id = $1 AND i.direction = 'in' AND i.status IN ('open', 'in_progress')
+           AND i.source_document_type IS DISTINCT FROM 'supplier_order' AND i.arrived_at IS NOT NULL) AS arrived,
+       (SELECT COUNT(*)::int FROM invoices i
+         WHERE i.warehouse_id = $1 AND i.direction = 'return' AND i.status IN ('open', 'in_progress')) AS to_sort,
+       (SELECT COUNT(*)::int FROM defect_decisions d
+         WHERE d.warehouse_id = $1 AND d.status = 'pending') AS defect_tasks`,
+    [warehouseId],
+  );
+  const w = r.rows[0];
+  return {
+    suppliesToPick: w.supplies_to_pick, ordersToPick: w.orders_to_pick, onecToPick: w.onec_to_pick,
+    suppliesReady: w.supplies_ready, toReceive: w.to_receive, arrived: w.arrived,
+    returnsToSort: w.to_sort, defectTasks: w.defect_tasks,
+  };
+}
+
 // «Насколько склад полон», «сколько свободных ячеек», «сколько всего брака».
 // Один запрос на каждую цифру — считает база, не агент.
 async function warehouseSummary(client, warehouseId) {
@@ -448,11 +524,9 @@ async function warehouseSummary(client, warehouseId) {
      GROUP BY quality_bucket`,
     [warehouseId],
   );
-  const openDocs = await client.query(
-    `SELECT COUNT(*)::int AS n FROM invoices
-     WHERE warehouse_id = $1 AND status NOT IN ('completed', 'shipped') AND mp_closed_at IS NULL`,
-    [warehouseId],
-  );
+  // «Незакрытых документов 1358» ничего не говорило: туда попадали все
+  // заказы WB и заказы поставщику из 1С. Теперь — работа, как у грузчика.
+  const work = await workQueue(client, warehouseId);
 
   const bucketLabel = { good: 'хороший', defective: 'брак', packaging_defect: 'брак упаковки' };
   const c = cells.rows[0];
@@ -468,21 +542,25 @@ async function warehouseSummary(client, warehouseId) {
     onShelvesByState: byQuality.rows.map((r) => ({
       state: bucketLabel[r.quality] || r.quality, qty: Number(r.qty),
     })),
-    openDocuments: openDocs.rows[0].n,
+    work,
     returned: returns.rows.map((r) => ({
       state: bucketLabel[r.quality_bucket] || r.quality_bucket, qty: Number(r.qty),
     })),
   };
 }
 
-// «Что ждёт моего решения» — расхождения, которые приёмка и отгрузка отправили
-// владельцу. Журнал только на чтение: подтверждать и откатывать можно в
-// кабинете, где видно всю карточку, а не одной фразой в чате.
+// «Что ждёт моего решения» — расхождения, записки грузчиков, «нет товара».
+// Журнал только на чтение: подтверждать и откатывать можно в кабинете, где
+// видно всю карточку, а не одной фразой в чате. Журнал ничего не стирает:
+// ответ — новая запись со ссылкой на исходную, а исходная навсегда
+// «pending». Поэтому ждущая — та, на которую никто не ответил (как в
+// напоминании alerts/rules.js); раньше чат показывал и решённое.
 async function listDiscrepancies(client, warehouseId, { limit = 15 } = {}) {
   const result = await client.query(
     `SELECT je.action_text, je.created_at, je.agent
      FROM journal_entries je
      WHERE je.warehouse_id = $1 AND je.status = 'pending'
+       AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)
      ORDER BY je.created_at DESC
      LIMIT $2`,
     [warehouseId, Math.min(limit, 50)],
@@ -549,6 +627,6 @@ function runTool(client, warehouseId, name, args = {}) {
 
 module.exports = {
   parseCellAddress, cellContents,
-  findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary,
+  findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary, workQueue,
   listDiscrepancies, pickList, runTool, recordSuggestion, recordSuggestionOutcome,
 };
