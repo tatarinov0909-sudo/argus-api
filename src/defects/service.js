@@ -75,7 +75,7 @@ async function cellLabel(client, warehouseId, cellBlockId) {
 // silent — без записи в журнал (загрузка остатков пишет свою одну).
 async function createMove(client, {
   warehouseId, companyId, sku, qty, bucket, note = null, source, invoiceId = null, supplyId = null,
-  cellBlockId = null, batch = null, staffKeyId = null, silent = false,
+  cellBlockId = null, batch = null, staffKeyId = null, silent = false, vw = null,
 }) {
   requireBucket(bucket);
   if (!SOURCES[source]) throw new HttpError(400, 'Неизвестно, откуда брак');
@@ -85,11 +85,11 @@ async function createMove(client, {
   const number = await nextNumber(client, warehouseId, 'БР', 'defect_moves');
   const row = (await client.query(
     `INSERT INTO defect_moves (warehouse_id, company_id, number, sku, name, qty, bucket, note, source,
-                               invoice_id, supply_id, cell_block_id, batch, created_by, created_by_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                               invoice_id, supply_id, cell_block_id, batch, created_by, created_by_name, virtual_warehouse_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      RETURNING id, number, created_at`,
     [warehouseId, companyId, number, sku, name, amount, bucket, cleanNote(note), source,
-      invoiceId, supplyId, cellBlockId, batch, staffKeyId, who],
+      invoiceId, supplyId, cellBlockId, batch, staffKeyId, who, vw || null],
   )).rows[0];
   if (!silent) {
     const where = cellBlockId ? ` в ячейку ${await cellLabel(client, warehouseId, cellBlockId)}` : '';
@@ -110,6 +110,9 @@ async function createMove(client, {
 async function markFromShelf(client, {
   warehouseId, companyId, sku, fromCellBlockId, toCellBlockId, qty, bucket, note, source, supplyId = null,
   invoiceId = null, staffKeyId,
+  // Виртуальный склад годного, которое отмечаем браком: undefined — любой
+  // (снятые строки несут свой склад), null — «Основной».
+  vw,
 }) {
   requireBucket(bucket);
   const amount = requireQty(qty, 'Количество брака', { min: 1 });
@@ -117,12 +120,14 @@ async function markFromShelf(client, {
   const target = toCellBlockId || fromCellBlockId;
   await cellLabel(client, warehouseId, target);
   // Только годное этого продавца: takeFromCell ограничен продавцом.
-  await takeFromCell(client, warehouseId, {
-    cellBlockId: fromCellBlockId, sku, companyId, quality: 'good', qty: amount, verb: 'отметить браком',
+  const parts = await takeFromCell(client, warehouseId, {
+    cellBlockId: fromCellBlockId, sku, companyId, quality: 'good', qty: amount, verb: 'отметить браком', vw,
   });
-  await client.query(
-    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-     VALUES ($1, $2, $3, $4, $5, $6)`, [target, warehouseId, companyId, sku, amount, bucket]);
+  for (const part of parts) {
+    await client.query(
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`, [target, warehouseId, companyId, sku, part.qty, bucket, part.vw]);
+  }
   await client.query(
     `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, from_cell_block_id, to_cell_block_id, details, worker_key_id)
      VALUES ($1, $2, 'defect_in', $3, $4, $5, $6, $7::jsonb, $8)`,
@@ -130,10 +135,15 @@ async function markFromShelf(client, {
       JSON.stringify({ fromQuality: 'good', toQuality: bucket, source }), staffKeyId || null]);
   await refreshCellFill(client, fromCellBlockId);
   if (target !== fromCellBlockId) await refreshCellFill(client, target);
-  return createMove(client, {
-    warehouseId, companyId, sku, qty: amount, bucket, note, source, supplyId, invoiceId,
-    cellBlockId: target, staffKeyId,
-  });
+  // Один документ на склад: брак разных складов — разные решения продавца.
+  const moves = [];
+  for (const part of parts) {
+    moves.push(await createMove(client, {
+      warehouseId, companyId, sku, qty: part.qty, bucket, note, source, supplyId, invoiceId,
+      cellBlockId: target, staffKeyId, vw: part.vw,
+    }));
+  }
+  return moves.length === 1 ? moves[0] : { ...moves[0], qty: amount, moves };
 }
 
 // Куда класть брак: сначала ячейки, где уже лежит брак этого продавца, потом
@@ -300,21 +310,25 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
   }
   let left = qty;
   const took = [];
+  const byVw = new Map();
   for (const c of cells) {
     if (left <= 0) break;
     const n = Math.min(left, c.qty);
-    await takeFromCell(client, warehouseId, {
+    const parts = await takeFromCell(client, warehouseId, {
       cellBlockId: c.cellBlockId, sku: d.sku, companyId: d.company_id, quality: d.bucket, qty: n, verb: 'взять',
     });
+    for (const part of parts) byVw.set(part.vw || '', (byVw.get(part.vw || '') || 0) + part.qty);
     took.push({ cellBlockId: c.cellBlockId, label: c.label, qty: n });
     left -= n;
   }
   let toSku = null;
   if (backToSale) {
     toSku = d.action === 'markdown' ? await markdownProduct(client, warehouseId, d.company_id, d) : d.sku;
-    await client.query(
-      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-       VALUES ($1, $2, $3, $4, $5, 'good')`, [cellBlockId, warehouseId, d.company_id, toSku, qty]);
+    for (const [vwKey, n] of byVw) {
+      await client.query(
+        `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+         VALUES ($1, $2, $3, $4, $5, 'good', $6)`, [cellBlockId, warehouseId, d.company_id, toSku, n, vwKey || null]);
+    }
   }
   for (const t of took) {
     await client.query(
@@ -378,4 +392,5 @@ async function waitingBySeller(client, warehouseId, { olderThanDays = 0 } = {}) 
 module.exports = {
   BUCKETS, ACTIONS, SOURCES, requireBucket, cleanNote, createMove, markFromShelf, suggestCells,
   balances, decide, tasks, execute, cellLabel, defectCells, waitingBySeller,
+  nextNumber, productName, staffName,
 };

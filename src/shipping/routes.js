@@ -30,7 +30,7 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
       // because a line can reference a SKU that has no directory card yet
       // (hand-entered invoice, or 1C nomenclature not synced through).
       const itemResult = await client.query(
-        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id,
+        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.virtual_warehouse_id,
                 p.category, p.length_mm, p.width_mm, p.height_mm, p.weight_g
          FROM invoice_items ii
          LEFT JOIN products p
@@ -51,11 +51,13 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
          JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
          WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3 AND cs.qty > 0
            AND cs.quality = 'good'
+           -- Только товар склада этой строки (виртуальный склад, 02.10.2026).
+           AND cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid
          GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.rack_end,
                   cb.tier_start, cb.tier_end
          HAVING SUM(cs.qty) > 0
          ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-        [warehouseId, item.company_id, item.sku],
+        [warehouseId, item.company_id, item.sku, item.virtual_warehouse_id],
       );
 
       const alreadyPicked = await client.query(
@@ -244,7 +246,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   if (requireWork) await requireAssembly(client, warehouseId, staffKeyId, supplyId);
   const itemResult = await client.query(
     `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
-            ii.external_id,
+            ii.external_id, ii.virtual_warehouse_id,
             i.direction, i.status, i.mp_closed_at, i.number AS invoice_number,
             i.external_id AS invoice_external_id, i.source, i.supply_id,
             c.external_id AS company_external_id
@@ -300,19 +302,36 @@ async function recordPick(client, warehouseId, staffKeyId, {
     `SELECT id, qty FROM cell_stock
      WHERE cell_block_id = $1 AND warehouse_id = $2 AND company_id = $3 AND sku = $4
        AND qty > 0 AND quality = 'good'
+       -- Только товар склада строки: поставка со склада «WB» не берёт
+       -- товар склада «Озон», даже из той же ячейки (02.10.2026).
+       AND virtual_warehouse_id IS NOT DISTINCT FROM $5::uuid
      ORDER BY updated_at
      FOR UPDATE`,
-    [cellBlockId, warehouseId, item.company_id, item.sku],
+    [cellBlockId, warehouseId, item.company_id, item.sku, item.virtual_warehouse_id],
   );
   const availableInCell = stockResult.rows
     .reduce((sum, r) => sum + Number(r.qty), 0);
+  // Товар другого склада продавца в той же ячейке — не для этой строки.
+  const vwName = async () => (item.virtual_warehouse_id
+    ? ((await client.query('SELECT name FROM virtual_warehouses WHERE id = $1', [item.virtual_warehouse_id])).rows[0] || {}).name || 'склад'
+    : 'Основной');
   if (availableInCell <= 0) {
-    throw new HttpError(409, 'В этой ячейке нет такого товара');
+    const other = Number((await client.query(
+      `SELECT COALESCE(SUM(qty), 0) AS n FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2 AND sku = $3
+          AND quality = 'good' AND qty > 0`, [cellBlockId, item.company_id, item.sku])).rows[0].n);
+    throw new HttpError(409, other > 0
+      ? `Этот товар в ячейке числится за другим складом продавца — для склада «${await vwName()}» его брать нельзя`
+      : 'В этой ячейке нет такого товара');
   }
   if (qty > availableInCell) {
+    // Склад называем, только если у продавца склады заведены: у остальных
+    // фулфилментов всё как раньше.
+    const hasVw = (await client.query(
+      'SELECT 1 FROM virtual_warehouses WHERE company_id = $1 LIMIT 1', [item.company_id])).rows[0];
     throw new HttpError(
       409,
-      `В ячейке только ${availableInCell}, нельзя забрать ${qty}`,
+      hasVw ? `В ячейке только ${availableInCell} шт. склада «${await vwName()}», нельзя забрать ${qty}`
+        : `В ячейке только ${availableInCell}, нельзя забрать ${qty}`,
     );
   }
 
@@ -725,9 +744,11 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
              JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
             WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3
               AND cs.qty > 0 AND cs.quality = 'good'
+              -- Только склад поставки (виртуальный склад, 02.10.2026).
+              AND cs.virtual_warehouse_id IS NOT DISTINCT FROM (SELECT virtual_warehouse_id FROM supplies WHERE id = $4)
             GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.tier_start
             ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-          [warehouseId, s.company_id, it.sku],
+          [warehouseId, s.company_id, it.sku, s.id],
         )).rows;
         let taken = 0;
         for (const c of cells) {

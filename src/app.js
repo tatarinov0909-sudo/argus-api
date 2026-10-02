@@ -91,6 +91,7 @@ function createApp() {
   app.use('/api/acts', require('./acts/routes'));
   app.use('/api/inbound', require('./inbound/routes'));
   app.use('/api/defects', require('./defects/routes'));
+  app.use('/api/vwarehouses', require('./vwarehouses/routes'));
 
   app.use(errorHandler);
 

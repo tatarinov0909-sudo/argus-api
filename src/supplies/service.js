@@ -1,3 +1,4 @@
+const vwarehouses = require('../vwarehouses/service');
 const { HttpError } = require('../middleware/errorHandler');
 const { plural } = require('../journal/plural');
 const { formatBlockLabel } = require('../cells/label');
@@ -147,6 +148,9 @@ function cleanShippingPoint(value) {
 async function create(client, warehouseId, {
   invoiceIds, marketplace = null, destination: rawDestination = null,
   shipDate: rawShipDate = null, shippingPointId: rawPoint = null, actor,
+  // Виртуальный склад, с которого собирается поставка (02.10.2026): null —
+  // «Основной»; undefined — выбрать сам, если подходящий склад один.
+  virtualWarehouseId,
 }) {
   if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
     throw new HttpError(400, 'Не указано ни одного заказа');
@@ -214,6 +218,20 @@ async function create(client, warehouseId, {
       + `Например «${unpickable[0].number}». Такие заказы остаются в очереди.`);
   }
 
+  // Склад поставки. На WB — только «Основной» и склады WB (вопросы 10–11);
+  // подходящий один — ставим сам, несколько — выбирает менеджер.
+  const toWb = marketplace === 'wb' || orders.rows.some((o) => o.source === 'wb');
+  let vw = null;
+  if (virtualWarehouseId === undefined) {
+    const choices = toWb ? await vwarehouses.wbChoices(client, companies[0])
+      : [{ id: null, name: vwarehouses.MAIN_NAME }].concat(await vwarehouses.list(client, companies[0]));
+    if (choices.length > 1) {
+      throw new HttpError(400, `Выберите, с какого склада собирать поставку: ${choices.map((c) => `«${c.name}»`).join(', ')}`);
+    }
+  } else {
+    vw = await vwarehouses.requireVw(client, companies[0], virtualWarehouseId, { forWb: toWb });
+  }
+
   await client.query('SAVEPOINT supply_number');
   const supply = await insertWithNumber(client, warehouseId, {
     companyId: companies[0], marketplace, destination, shipDate, shippingPointId,
@@ -224,6 +242,8 @@ async function create(client, warehouseId, {
     `UPDATE invoices SET supply_id = $1 WHERE warehouse_id = $2 AND id = ANY($3::uuid[])`,
     [supply.id, warehouseId, invoiceIds],
   );
+  await client.query('UPDATE supplies SET virtual_warehouse_id = $2 WHERE id = $1', [supply.id, vw ? vw.id : null]);
+  await vwarehouses.assignOrders(client, warehouseId, invoiceIds, vw ? vw.id : null);
   // Заказ мог быть собран ДО того, как его включили в поставку (накладную из
   // 1С собирают и без поставки). Тогда новых отборов не будет, пересчитать
   // статус поставки станет некому, и она навсегда зависала в «собирается»:
@@ -236,7 +256,8 @@ async function create(client, warehouseId, {
     // «Собрана» в Аргусе значит «грузчики всё собрали», поэтому здесь
     // «составлена»: пока это только решение менеджера, что уезжает.
     actionText: `Составлена поставка «${number}» — ${orders.rows.length} `
-      + `${plural(orders.rows.length, 'заказ', 'заказа', 'заказов')}, продавец «${orders.rows[0].company_name}».`,
+      + `${plural(orders.rows.length, 'заказ', 'заказа', 'заказов')}, продавец «${orders.rows[0].company_name}»`
+      + `${vw ? `, со склада «${vw.name}»` : ''}.`,
     entityType: 'supply',
     entityId: supply.id,
     actorType: actor?.type || 'owner',
@@ -246,6 +267,8 @@ async function create(client, warehouseId, {
   return {
     ...supply,
     companyId: companies[0],
+    virtualWarehouseId: vw ? vw.id : null,
+    virtualWarehouseName: vw ? vw.name : vwarehouses.MAIN_NAME,
     orders: orders.rows.length,
     companyName: orders.rows[0].company_name,
     // Что именно подтверждать на площадке: её номер заказа и наш документ.
@@ -370,10 +393,11 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
       WHERE cs.warehouse_id = $1 AND cs.company_id = $3 AND cs.sku = ANY($2::text[])
         AND cs.qty > 0 AND cs.quality = 'good'
+        AND cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid
       GROUP BY cs.sku, cb.id, wr.row_num, cb.label,
                cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
       ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-    [warehouseId, skus, head.rows[0].company_id],
+    [warehouseId, skus, head.rows[0].company_id, head.rows[0].virtual_warehouse_id],
   );
   for (const row of places.rows) {
     const item = bySku.get(row.sku);
@@ -584,19 +608,20 @@ const LEFT_TO_PICK_SQL = `CASE WHEN EXISTS (SELECT 1 FROM shipping_records sr
 async function stockCover(client, warehouseId, companyId = null) {
   const stock = new Map();
   const cells = await client.query(
-    `SELECT company_id, sku, SUM(qty)::numeric AS qty FROM cell_stock
+    `SELECT company_id, sku, virtual_warehouse_id AS vw, SUM(qty)::numeric AS qty FROM cell_stock
       WHERE warehouse_id = $1 AND quality = 'good' AND qty > 0
         AND ($2::uuid IS NULL OR company_id = $2::uuid)
-      GROUP BY company_id, sku`,
+      GROUP BY company_id, sku, virtual_warehouse_id`,
     [warehouseId, companyId],
   );
-  for (const r of cells.rows) stock.set(`${r.company_id}|${r.sku}`, Number(r.qty));
+  // Ключ — продавец, товар и виртуальный склад (02.10.2026).
+  for (const r of cells.rows) stock.set(`${r.company_id}|${r.sku}|${r.vw || ''}`, Number(r.qty));
   // Сколько лежит годного и сколько из этого уже ждут собираемые поставки —
   // до раскладки по заказам: это числа для экрана, а не для очереди.
   const onHand = new Map(stock);
   const reserved = new Map();
   const demand = await client.query(
-    `SELECT s.id AS supply_id, i.id AS invoice_id, i.company_id, ii.sku,
+    `SELECT s.id AS supply_id, i.id AS invoice_id, i.company_id, ii.sku, ii.virtual_warehouse_id AS vw,
             ${LEFT_TO_PICK_SQL} AS need
        FROM supplies s
        JOIN invoices i ON i.supply_id = s.id
@@ -615,11 +640,11 @@ async function stockCover(client, warehouseId, companyId = null) {
     return true;
   };
   for (const r of demand.rows) {
-    const key = `${r.company_id}|${r.sku}`;
+    const key = `${r.company_id}|${r.sku}|${r.vw || ''}`;
     reserved.set(key, (reserved.get(key) || 0) + Math.max(0, Number(r.need)));
     if (!take(key, Number(r.need))) shortInvoices.add(r.invoice_id);
   }
-  return { shortInvoices, take, onHand, reserved };
+  return { shortInvoices, take, onHand, reserved, onHandLeft: (key) => stock.get(key) || 0 };
 }
 
 // recentOnly — грузчику: уехавшие больше двух недель назад не нужны, как и
@@ -735,7 +760,7 @@ async function pendingOrders(client, warehouseId, companyId) {
     `SELECT i.id, i.number, i.created_at, i.source AS marketplace, i.status,
             i.mp_created_at, i.mp_offices, i.mp_sale_price_kopecks,
             ii.sku, ii.name, ii.declared_qty, ii.mp_article, ii.mp_barcode,
-            ii.mp_nm_id, ii.mp_rid, i.mp_warehouse_id, w.name AS mp_warehouse_name,
+            ii.mp_nm_id, ii.mp_rid, i.mp_warehouse_id, w.name AS mp_warehouse_name, ii.virtual_warehouse_id AS vw,
             CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
             ${WB_CONFIRMED_SQL} AS wb_confirmed
@@ -755,11 +780,29 @@ async function pendingOrders(client, warehouseId, companyId) {
   // Товара хватит? Сперва — поставкам, что уже собираются, потом очереди,
   // старшим заказам первыми: так же склад и будет их собирать.
   const cover = await stockCover(client, warehouseId, companyId);
+  // Виртуальные склады (02.10.2026): заказ WB вне поставки склада ещё не
+  // знает — считаем по складам, с которых его можно собрать на WB
+  // («Основной» и склады WB); отгрузка из 1С — по своему складу.
+  const wbVw = (await vwarehouses.wbChoices(client, companyId)).map((c) => c.id || '');
+  const vwsOf = (x) => (x.marketplace === '1c' ? [x.vw || ''] : wbVw);
+  const keys = (x) => vwsOf(x).map((v) => `${companyId}|${x.sku}|${v}`);
+  const sumOf = (map, x) => keys(x).reduce((n, k) => n + (map.get(k) || 0), 0);
+  const takeAny = (x, need) => {
+    let left = need;
+    for (const k of keys(x)) {
+      if (left <= 0) break;
+      const have = cover.onHandLeft(k);
+      const n = Math.min(have, left);
+      if (n > 0) cover.take(k, n);
+      left -= n;
+    }
+    return left <= 0;
+  };
   const stockShort = new Set();
   const byAge = [...r.rows].sort((a, b) => new Date(a.mp_created_at || a.created_at)
     - new Date(b.mp_created_at || b.created_at));
   for (const x of byAge) {
-    if (x.sku && !cover.take(`${companyId}|${x.sku}`, Number(x.left_to_pick || 0))) stockShort.add(x.id);
+    if (x.sku && !takeAny(x, Number(x.left_to_pick || 0))) stockShort.add(x.id);
   }
   // Цвет строки — по товару целиком (владелец 27.09.2026): красный — годного
   // в ячейках нет совсем, жёлтый — есть, но меньше, чем нужно этим заказам
@@ -771,9 +814,8 @@ async function pendingOrders(client, warehouseId, companyId) {
   }
   const stockOf = (x) => {
     if (!x.sku || !x.pickable) return { stockQty: null, stockNeed: null, stockReserved: null, stockLevel: null };
-    const key = `${companyId}|${x.sku}`;
-    const qty = cover.onHand.get(key) || 0;
-    const reservedQty = cover.reserved.get(key) || 0;
+    const qty = sumOf(cover.onHand, x);
+    const reservedQty = sumOf(cover.reserved, x);
     const need = pendingNeed.get(x.sku) || 0;
     const level = need + reservedQty <= 0 ? 'ok' : qty <= 0 ? 'none' : qty < need + reservedQty ? 'short' : 'ok';
     return { stockQty: qty, stockNeed: need, stockReserved: reservedQty, stockLevel: level };
@@ -859,9 +901,10 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   }
 
   const freed = await client.query(
-    'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND supply_id = $2',
+    'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND supply_id = $2 RETURNING id',
     [warehouseId, supplyId],
   );
+  await vwarehouses.releaseOrders(client, warehouseId, freed.rows.map((r) => r.id));
   await client.query('DELETE FROM supplies WHERE warehouse_id = $1 AND id = $2',
     [warehouseId, supplyId]);
 
@@ -953,6 +996,7 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
 
   await client.query('UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND id = $2',
     [warehouseId, invoiceId]);
+  await vwarehouses.releaseOrders(client, warehouseId, [invoiceId]);
   await refreshSupplyStatus(client, warehouseId, supplyId);
   const status = await client.query('SELECT status FROM supplies WHERE warehouse_id = $1 AND id = $2',
     [warehouseId, supplyId]);

@@ -19,7 +19,9 @@ const CATEGORIES = [
 ];
 
 const WORK_TYPES = new Set(['receiving_session', 'supply_assembly', 'paper_pick', 'item_note']);
-const CELL_TYPES = new Set(['cell_block', 'company', 'stock_operation', 'receiving_placement', 'inventory']);
+const CELL_TYPES = new Set(['cell_block', 'company', 'stock_operation', 'receiving_placement', 'inventory',
+  // Виртуальные склады продавца и переносы между ними (02.10.2026).
+  'virtual_warehouse', 'vw_transfer']);
 const STAFF_TYPES = new Set(['worker_pause', 'staff_key']);
 const DOC_TYPES = new Set(['act', 'document']);
 

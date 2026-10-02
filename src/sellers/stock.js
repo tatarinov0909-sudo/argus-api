@@ -153,6 +153,11 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
         [companyId],
       );
   const rows = result.rows;
+  // Раскладка по виртуальным складам продавца (02.10.2026) — только если
+  // склады заведены: у остальных продавцов ответ прежний.
+  const vws = (await client.query(
+    'SELECT id, name FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL ORDER BY created_at', [companyId])).rows;
+  const split = vws.length ? await loadSplit(client, companyId) : null;
     return rows.map((r) => {
       // Warehouse stock includes picked goods still waiting for departure.
       // 1C is a separate reconciliation source, never a fallback balance.
@@ -236,8 +241,62 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
       available: stockKnown ? Math.max(0, onHand - ordered) : null,
       short: stockKnown ? Math.max(0, ordered - onHand) : null,
+      ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source }) } : {}),
       };
     });
+}
+
+// Сколько товара на каждом виртуальном складе: годное в ячейках и собранное,
+// но не уехавшее (по складу строки), что уже в поставках с этого склада и
+// брак, пришедший с него.
+async function loadSplit(client, companyId) {
+  const r = await client.query(
+    `SELECT sku, vw, SUM(good) AS good, SUM(bad) AS bad, SUM(staged) AS staged, SUM(assembly) AS assembly FROM (
+       SELECT sku, virtual_warehouse_id AS vw,
+              COALESCE(SUM(qty) FILTER (WHERE quality = 'good'), 0) AS good,
+              COALESCE(SUM(qty) FILTER (WHERE quality <> 'good'), 0) AS bad, 0 AS staged, 0 AS assembly
+         FROM cell_stock WHERE company_id = $1 AND qty > 0 GROUP BY sku, virtual_warehouse_id
+       UNION ALL
+       SELECT ii.sku, ii.virtual_warehouse_id, 0, 0, SUM(sr.picked_qty), 0
+         FROM shipping_records sr JOIN invoice_items ii ON ii.id = sr.invoice_item_id JOIN invoices i ON i.id = ii.invoice_id
+        WHERE sr.company_id = $1 AND i.direction = 'out' AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
+        GROUP BY ii.sku, ii.virtual_warehouse_id
+       UNION ALL
+       SELECT ii.sku, ii.virtual_warehouse_id, 0, 0, 0, SUM(ii.declared_qty)
+         FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+        WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out' AND ${DEMAND_SQL} AND ${IN_ASSEMBLY_SQL}
+        GROUP BY ii.sku, ii.virtual_warehouse_id
+     ) x GROUP BY sku, vw`, [companyId]);
+  const map = new Map();
+  for (const x of r.rows) {
+    if (!map.has(x.sku)) map.set(x.sku, new Map());
+    map.get(x.sku).set(x.vw || '', {
+      good: Number(x.good), bad: Number(x.bad), staged: Number(x.staged), assembly: Number(x.assembly),
+    });
+  }
+  return map;
+}
+
+// «Основной» — всё, что не на заведённых складах: при учёте в 1С это «Всего»
+// из 1С минус остальные склады (1С о складах Аргуса не знает), при учёте в
+// Аргусе — его ячейки. «Заказано» (заказы вне поставки) склада не имеет —
+// оно только в общем итоге.
+function splitOf(split, sku, vws, { total, source }) {
+  const bySku = split.get(sku) || new Map();
+  const at = (id) => bySku.get(id || '') || { good: 0, bad: 0, staged: 0, assembly: 0 };
+  const others = vws.map((w) => {
+    const a = at(w.id);
+    const onHand = a.good + a.staged;
+    return { id: w.id, name: w.name, onHand, inAssembly: a.assembly, available: Math.max(0, onHand - a.assembly), defect: a.bad };
+  });
+  const main = at(null);
+  const mainOnHand = source === 'argus'
+    ? main.good + main.staged
+    : (total === null ? null : Math.max(0, total - others.reduce((n, w) => n + w.onHand, 0)));
+  return [{
+    id: null, name: 'Основной', onHand: mainOnHand, inAssembly: main.assembly,
+    available: mainOnHand === null ? null : Math.max(0, mainOnHand - main.assembly), defect: main.bad,
+  }].concat(others);
 }
 
 // Итог по продавцу — одно правило для кабинета продавца, сводки владельца

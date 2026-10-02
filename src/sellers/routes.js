@@ -38,6 +38,8 @@ function sellerStockView(row) {
     orderedOrders: row.queuedOrders,
     assemblyOrders: row.assemblyOrders,
     updatedAt: row.totalUpdatedAt,
+    // Раскладка по складам продавца — если они заведены (02.10.2026).
+    ...(row.byWarehouse ? { warehouses: row.byWarehouse } : {}),
   };
 }
 

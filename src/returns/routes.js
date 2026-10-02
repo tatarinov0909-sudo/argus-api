@@ -94,9 +94,11 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         // Состояние едет в остаток вместе с количеством: брак на полке обязан
         // отличаться от годного, иначе отгрузка предложит его клиенту.
         await client.query(
-          `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [cellBlockId, warehouseId, item.company_id, item.sku, qty, qualityBucket],
+          // Возврат ложится на склад строки возврата (виртуальный склад,
+          // 02.10.2026; брак помнит его же); не выбран — «Основной».
+          `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+           VALUES ($1, $2, $3, $4, $5, $6, (SELECT virtual_warehouse_id FROM invoice_items WHERE id = $7))`,
+          [cellBlockId, warehouseId, item.company_id, item.sku, qty, qualityBucket, item.id],
         );
         await refreshCellFill(client, cellBlockId);
       }
@@ -137,6 +139,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
         move = await defects.createMove(client, {
           warehouseId, companyId: item.company_id, sku: item.sku, qty, bucket: qualityBucket, note,
           source: 'return', invoiceId: item.invoice_id, cellBlockId, staffKeyId,
+          vw: (await client.query('SELECT virtual_warehouse_id FROM invoice_items WHERE id = $1', [item.id])).rows[0]?.virtual_warehouse_id || null,
         });
       } else await journal.createEntry(client, {
         warehouseId,

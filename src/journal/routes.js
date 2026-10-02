@@ -1,3 +1,4 @@
+const vwarehouses = require('../vwarehouses/service');
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
@@ -89,6 +90,20 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
       }
       if (original.rows[0].agent === 'Обмен с WB') {
         throw new HttpError(409, 'Решение по заказу WB принимается в разделе «Сверка заказов WB»');
+      }
+      // Заявка продавца на перенос между складами: «Подтвердить» выполняет
+      // перенос, «Отклонить» — отказ; продавцу приходит уведомление.
+      if (original.rows[0].entity_type === 'vw_transfer') {
+        const t = (await client.query('SELECT entity_id FROM journal_entries WHERE id = $1', [id])).rows[0];
+        const s = role === 'manager' ? (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0] : null;
+        await vwarehouses.decide(client, {
+          warehouseId, transferId: t.entity_id, approve: resolution === 'confirm', reason: note,
+          actor: role === 'manager'
+            ? { role: 'manager', id: staffKeyId, name: s ? `Менеджер ${s.name}` : 'Менеджер склада' }
+            : { role: 'owner', id: ownerId, name: 'Руководитель склада' },
+        });
+        return (await client.query(
+          'SELECT * FROM journal_entries WHERE related_entry_id = $1 ORDER BY created_at DESC LIMIT 1', [id])).rows[0];
       }
       return repository.resolveEntry(client, {
         warehouseId, originalEntryId: id, resolution, resolvedByOwnerId: ownerId, note,

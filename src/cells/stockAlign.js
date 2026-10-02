@@ -115,12 +115,16 @@ async function findProduct(client, warehouseId, companyId, rec) {
 
 async function cellsOf(client, companyId, sku) {
   return (await client.query(
-    `SELECT cs.id, cs.cell_block_id, cs.qty, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+    `SELECT cs.id, cs.cell_block_id, cs.qty, cs.virtual_warehouse_id AS vw,
+            wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
       WHERE cs.company_id = $1 AND cs.sku = $2 AND cs.quality = 'good' AND cs.qty > 0
-      ORDER BY cs.qty DESC, cs.id FOR UPDATE OF cs`,
+      -- Сверка с 1С меняет «Основной» (1С о складах Аргуса не знает): его
+      -- строки — первыми, списание с других складов — только если его не
+      -- хватило (виртуальные склады, 02.10.2026).
+      ORDER BY (cs.virtual_warehouse_id IS NULL) DESC, cs.qty DESC, cs.id FOR UPDATE OF cs`,
     [companyId, sku],
   )).rows;
 }
@@ -255,7 +259,15 @@ async function run(client, warehouseId, {
       if (cells.length) {
         line.note = `+${line.change} в ${label(cells[0])}`;
         if (apply) {
-          await client.query('UPDATE cell_stock SET qty = qty + $2, updated_at = now() WHERE id = $1', [cells[0].id, line.change]);
+          // Прибавка — на «Основной»: в его строку, а нет её — новой строкой
+          // в ту же ячейку.
+          if (!cells[0].vw) {
+            await client.query('UPDATE cell_stock SET qty = qty + $2, updated_at = now() WHERE id = $1', [cells[0].id, line.change]);
+          } else {
+            await client.query(
+              `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty) VALUES ($1, $2, $3, $4, $5)`,
+              [cells[0].cell_block_id, warehouseId, companyId, product.sku, line.change]);
+          }
           touched.add(cells[0].cell_block_id);
         }
       } else if (!placeNew) {

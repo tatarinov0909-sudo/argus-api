@@ -122,9 +122,11 @@ async function resolve(client, warehouseId, id, { action, version, confirmed, ow
       // These are the recorded picks, returned only after physical confirmation
       // by the owner. source=NULL is a warehouse observation, never an inference
       // from accounting stock or a marketplace cancellation.
-      await client.query(`INSERT INTO cell_stock (warehouse_id,company_id,cell_block_id,sku,qty,quality,source)
-        VALUES ($1,$2,$3,$4,$5,'good',NULL)`,
-      [warehouseId, inv.company_id, row.existing_cell_id, row.sku, row.picked_qty]);
+      // Возвращается на склад, с которого брали (виртуальный склад строки, 02.10.2026).
+      await client.query(`INSERT INTO cell_stock (warehouse_id,company_id,cell_block_id,sku,qty,quality,source,virtual_warehouse_id)
+        VALUES ($1,$2,$3,$4,$5,'good',NULL,(SELECT ii.virtual_warehouse_id FROM shipping_records sr
+          JOIN invoice_items ii ON ii.id = sr.invoice_item_id WHERE sr.id = $6))`,
+      [warehouseId, inv.company_id, row.existing_cell_id, row.sku, row.picked_qty, row.id]);
       await client.query(`INSERT INTO stock_operations
         (warehouse_id,company_id,kind,sku,qty,to_cell_block_id,details)
         VALUES ($1,$2,'canceled_pick_return',$3,$4,$5,$6::jsonb)`,
@@ -140,6 +142,7 @@ async function resolve(client, warehouseId, id, { action, version, confirmed, ow
 
   if (inv.supply_id) {
     await client.query(`UPDATE invoices SET supply_id=NULL WHERE warehouse_id=$1 AND id=$2`, [warehouseId, id]);
+    await require('../vwarehouses/service').releaseOrders(client, warehouseId, [id]);
     await refreshSupplyStatus(client, warehouseId, inv.supply_id);
   }
   await journal.createEntry(client, { warehouseId, agent: 'Сверка заказов WB',

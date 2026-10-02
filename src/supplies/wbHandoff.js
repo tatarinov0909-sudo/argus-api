@@ -32,6 +32,7 @@ async function detachRejected(client, warehouseId, supply, rejected) {
       'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND id = $2',
       [warehouseId, row.invoiceId],
     );
+    await require('../vwarehouses/service').releaseOrders(client, warehouseId, [row.invoiceId]);
     await journal.createEntry(client, {
       warehouseId,
       agent: 'Обмен с WB',

@@ -1,4 +1,5 @@
 const defects = require('../defects/service');
+const vwarehouses = require('../vwarehouses/service');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const outbox = require('../sync/outbox');
@@ -489,6 +490,20 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
   // удалялся вместе со всем остальным — товар исчезал бесследно, хотя лежал
   // на полке, и архивацию продавца можно отменить, а этот товар — нет.
   const changes = diffOf(task.expected || [], counted);
+  // Что числилось на каждом виртуальном складе продавца (02.10.2026):
+  // пересчёт не стирает отметку склада — недостача списывается с
+  // «Основного», потом с самого большого склада, излишек — на «Основной».
+  const before = (await client.query(
+    `SELECT cs.company_id, cs.sku, cs.quality::text AS quality, cs.virtual_warehouse_id AS vw, SUM(cs.qty) AS qty
+       FROM cell_stock cs
+      WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2 AND cs.qty > 0
+        AND (cs.company_id IS NULL
+             OR EXISTS (SELECT 1 FROM companies c WHERE c.id = cs.company_id AND c.archived_at IS NULL))
+      GROUP BY cs.company_id, cs.sku, cs.quality, cs.virtual_warehouse_id`,
+    [warehouseId, task.cell_block_id])).rows;
+  const partsOf = (line) => before.filter((b) => (b.company_id || null) === (line.companyId || null)
+    && b.sku === line.sku && b.quality === (line.quality || 'good'));
+  const cuts = [];
   await client.query(
     `DELETE FROM cell_stock cs
       WHERE cs.warehouse_id = $1 AND cs.cell_block_id = $2
@@ -497,14 +512,48 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
                          WHERE c.id = cs.company_id AND c.archived_at IS NULL))`,
     [warehouseId, task.cell_block_id],
   );
+  const seen = new Set();
   for (const line of counted) {
-    if (Number(line.qty) <= 0) continue;
-    await client.query(
-      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [task.cell_block_id, warehouseId, line.companyId || null, line.sku,
-        line.qty, line.quality || 'good'],
-    );
+    seen.add(`${line.companyId || ''}|${line.sku}|${line.quality || 'good'}`);
+    const plan = vwarehouses.allocateCount(partsOf(line), Number(line.qty));
+    if (plan.cut.length || plan.surplus) cuts.push({ line, ...plan });
+    for (const part of plan.result) {
+      await client.query(
+        `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [task.cell_block_id, warehouseId, line.companyId || null, line.sku,
+          part.qty, line.quality || 'good', part.vw],
+      );
+    }
+  }
+  // Числилось, а не насчитали вовсе — списано целиком со всех складов.
+  for (const b of before) {
+    const key = `${b.company_id || ''}|${b.sku}|${b.quality}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const line = { companyId: b.company_id, sku: b.sku, quality: b.quality, qty: 0 };
+    cuts.push({ line, ...vwarehouses.allocateCount(partsOf(line), 0) });
+  }
+  // Продавцу со складами — уведомление: с какого склада списали недостачу
+  // (вопрос 13: решает склад, продавец узнаёт).
+  const label = await client.query(
+    `SELECT wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end FROM cell_blocks cb
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id WHERE cb.id = $1`, [task.cell_block_id]);
+  const where = label.rows[0] ? formatBlockLabel(label.rows[0].row_num, label.rows[0]) : 'ячейки';
+  for (const c of cuts) {
+    if (!c.line.companyId) continue;
+    const vws = await vwarehouses.list(client, c.line.companyId, { withArchived: true });
+    if (!vws.length) continue;
+    const name = (await client.query('SELECT name FROM products WHERE company_id = $1 AND sku = $2 LIMIT 1',
+      [c.line.companyId, c.line.sku])).rows[0]?.name || c.line.sku;
+    const bad = (c.line.quality || 'good') !== 'good' ? ' (брак)' : '';
+    const text = c.cut.length
+      ? `Пересчёт ячейки ${where}: «${name}»${bad} — не хватило ${c.cut.reduce((n, x) => n + x.qty, 0)} шт., списано: `
+        + c.cut.map((x) => `«${vwarehouses.nameOf(vws, x.vw)}» — ${x.qty} шт.`).join(', ') + '.'
+      : `Пересчёт ячейки ${where}: «${name}»${bad} — найдено лишних ${c.surplus} шт., они на «${vwarehouses.MAIN_NAME}».`;
+    await vwarehouses.notifySeller(client, {
+      warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus', text,
+    });
   }
   await refreshCellFill(client, task.cell_block_id);
 

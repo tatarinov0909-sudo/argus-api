@@ -55,7 +55,7 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
                 COALESCE((
                   SELECT json_agg(json_build_object(
                     'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
-                    'quality', cs.quality, 'source', cs.source
+                    'quality', cs.quality, 'source', cs.source, 'vw', cs.virtual_warehouse_id
                   ) ORDER BY cs.updated_at)
                     FROM cell_stock cs WHERE cs.cell_block_id = cb.id
                 ), '[]') AS stock,
@@ -580,19 +580,25 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
       throw new HttpError(409, 'Брак меняют только по решению продавца — задание придёт в «Склад брака»');
     }
 
+    // Виртуальный склад строк (02.10.2026): не передан — любые строки, каждая
+    // переезжает со своим складом; null — «Основной».
+    const vw = Object.prototype.hasOwnProperty.call(req.body, 'vw') ? (req.body.vw || null) : undefined;
     const moved = await withTenantContext({ warehouseId }, async (client) => {
       const result = await moveStock(client, warehouseId, {
         sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality, toQuality,
-        workerKeyId: req.auth.staffKeyId || null,
+        workerKeyId: req.auth.staffKeyId || null, vw,
       });
 
-      // Годное стало браком — это перемещение на склад брака продавца.
+      // Годное стало браком — это перемещение на склад брака продавца:
+      // документ на каждый склад, с которого брак.
       if (result.fromQuality === 'good' && result.toQuality !== 'good') {
         if (!companyId) throw new HttpError(400, 'Укажите продавца товара, который отмечаете браком');
-        await defects.createMove(client, {
-          warehouseId, companyId, sku: result.sku, qty: result.qty, bucket: result.toQuality,
-          source: 'move', cellBlockId: result.toCellBlockId, staffKeyId,
-        });
+        for (const part of result.parts) {
+          await defects.createMove(client, {
+            warehouseId, companyId, sku: result.sku, qty: part.qty, bucket: result.toQuality,
+            source: 'move', cellBlockId: result.toCellBlockId, staffKeyId, vw: part.vw,
+          });
+        }
       }
       const changedState = result.toQuality !== result.fromQuality;
       const changedCell = result.toCellBlockId !== result.fromCellBlockId;

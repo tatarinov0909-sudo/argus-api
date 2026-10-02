@@ -18,7 +18,9 @@ const { requireQty } = require('../middleware/qty');
 
 // «Из чего собирается» — с остатком по каждому компоненту, годным и всего.
 // companyId обязателен: один и тот же код у разных продавцов — разный товар.
-async function components(client, warehouseId, companyId, kitSku) {
+// vw — виртуальный склад (02.10.2026): undefined — весь товар продавца,
+// null — «Основной», иначе — этот склад.
+async function components(client, warehouseId, companyId, kitSku, vw) {
   const rows = await client.query(
     `SELECT k.component_sku, k.qty,
             COALESCE(p.name, (SELECT ii.name FROM invoice_items ii
@@ -29,14 +31,15 @@ async function components(client, warehouseId, companyId, kitSku) {
                       WHERE cs.warehouse_id = k.warehouse_id
                         AND cs.company_id = k.company_id
                         AND cs.sku = k.component_sku
-                        AND cs.quality = 'good'), 0) AS available
+                        AND cs.quality = 'good'
+                        AND (NOT $4::boolean OR cs.virtual_warehouse_id IS NOT DISTINCT FROM $5::uuid)), 0) AS available
      FROM product_kits k
      LEFT JOIN products p
        ON p.warehouse_id = k.warehouse_id AND p.company_id = k.company_id
       AND p.sku = k.component_sku
      WHERE k.warehouse_id = $1 AND k.company_id = $2 AND k.kit_sku = $3
      ORDER BY k.component_sku`,
-    [warehouseId, companyId, kitSku],
+    [warehouseId, companyId, kitSku, vw !== undefined, vw || null],
   );
   return rows.rows.map((r) => ({
     sku: r.component_sku,
@@ -50,8 +53,8 @@ async function components(client, warehouseId, companyId, kitSku) {
 
 // null — это не набор. Отличать от «набор, но собрать нельзя»: в первом случае
 // нехватка на отгрузке окончательна, во втором её ещё можно закрыть сборкой.
-async function kitInfo(client, warehouseId, companyId, kitSku) {
-  const parts = await components(client, warehouseId, companyId, kitSku);
+async function kitInfo(client, warehouseId, companyId, kitSku, vw) {
+  const parts = await components(client, warehouseId, companyId, kitSku, vw);
   if (parts.length === 0) return null;
   const buildable = Math.min(...parts.map((p) => p.enoughFor));
   return {
@@ -79,14 +82,15 @@ async function kitSkusAmong(client, warehouseId, skus) {
 // Списать по ячейкам, начиная с самой давней. Компонент, в отличие от отбора
 // на отгрузке, ищется по всему складу, а не в одной ячейке: работник и так
 // идёт за ним туда, где он есть.
-async function consume(client, warehouseId, companyId, sku, qty) {
+async function consume(client, warehouseId, companyId, sku, qty, vw = null) {
   const stock = await client.query(
     `SELECT id, qty, cell_block_id FROM cell_stock
      WHERE warehouse_id = $1 AND company_id = $2 AND sku = $3
        AND qty > 0 AND quality = 'good'
+       AND virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid
      ORDER BY updated_at
      FOR UPDATE`,
-    [warehouseId, companyId, sku],
+    [warehouseId, companyId, sku, vw],
   );
   const available = stock.rows.reduce((sum, r) => sum + Number(r.qty), 0);
   if (available < qty) {
@@ -119,6 +123,9 @@ async function consume(client, warehouseId, companyId, sku, qty) {
 // значит развалить пригодный к продаже товар и не собрать ничего.
 async function assembleKit(client, warehouseId, {
   companyId, kitSku, qty, toCellBlockId, workerKeyId = null,
+  // Склад набора (02.10.2026): компоненты — с него, набор — на него;
+  // null — «Основной».
+  vw = null,
 }) {
   if (!companyId || !kitSku || !toCellBlockId) {
     throw new HttpError(400, 'Нужны продавец, набор и ячейка');
@@ -133,7 +140,7 @@ async function assembleKit(client, warehouseId, {
   );
   if (!cell.rows[0]) throw new HttpError(404, 'Ячейка не найдена');
 
-  const parts = await components(client, warehouseId, companyId, kitSku);
+  const parts = await components(client, warehouseId, companyId, kitSku, vw);
   if (parts.length === 0) throw new HttpError(404, 'Состав набора неизвестен');
 
   const short = parts.filter((p) => p.available < p.perKit * amount);
@@ -144,14 +151,14 @@ async function assembleKit(client, warehouseId, {
 
   const cellsTouched = new Set([toCellBlockId]);
   for (const p of parts) {
-    const from = await consume(client, warehouseId, companyId, p.sku, p.perKit * amount);
+    const from = await consume(client, warehouseId, companyId, p.sku, p.perKit * amount, vw);
     for (const id of from) cellsTouched.add(id);
   }
 
   await client.query(
-    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-     VALUES ($1, $2, $3, $4, $5, 'good')`,
-    [toCellBlockId, warehouseId, companyId, kitSku, amount],
+    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+     VALUES ($1, $2, $3, $4, $5, 'good', $6)`,
+    [toCellBlockId, warehouseId, companyId, kitSku, amount, vw],
   );
 
   // Пересчитываем заполненность и у ячейки назначения, и у каждой, откуда

@@ -348,6 +348,7 @@ async function receiveItem(client, {
     defectMove = await defects.createMove(client, {
       warehouseId, companyId: item.company_id, sku: item.sku, qty: defect.qty, bucket: defect.bucket,
       note: defect.note, source: 'receiving', invoiceId: item.invoice_id, cellBlockId: defect.cellBlockId, staffKeyId,
+      vw: await itemVw(client, invoiceItemId),
     });
     placed.push({ id: step.id, cellBlockId: step.cell_block_id, qty: Number(step.qty), step: step.step, defect: true });
   }
@@ -459,16 +460,24 @@ async function unplacedItems(client, invoiceId) {
   return r.rows.map((x) => ({ id: x.id, name: x.name, sku: x.sku, left: Number(x.left) }));
 }
 
+// Виртуальный склад строки документа: null — «Основной».
+async function itemVw(client, invoiceItemId) {
+  const r = (await client.query('SELECT virtual_warehouse_id FROM invoice_items WHERE id = $1', [invoiceItemId])).rows[0];
+  return r ? r.virtual_warehouse_id || null : null;
+}
+
 // Шаг «положил N шт. в ячейку»: строка остатка в ячейке и строка укладки со
 // следующим номером шага. pairId — у второй половины «Переложить»: шаг
 // «забрал», к которому она относится.
 async function putStep(client, {
   warehouseId, staffKeyId, recordId, item, cellBlockId, qty, pairId = null, quality = 'good',
 }) {
+  // Товар ложится на склад строки привоза (виртуальный склад продавца,
+  // 02.10.2026); не выбран — «Основной».
   await client.query(
-    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [cellBlockId, warehouseId, item.company_id, item.sku, qty, quality],
+    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+     VALUES ($1, $2, $3, $4, $5, $6, (SELECT virtual_warehouse_id FROM invoice_items WHERE id = $7))`,
+    [cellBlockId, warehouseId, item.company_id, item.sku, qty, quality, item.id],
   );
   const row = (await client.query(
     `INSERT INTO receiving_placements
@@ -492,7 +501,9 @@ async function takeStep(client, { warehouseId, staffKeyId, recordId, item, cellB
   // С полки снимается самое свежее этого товара — то, что положила эта
   // приёмка, а не весенний остаток: иначе весенний товар «молодел» бы, а его
   // время укладки и порядок «сначала старое» врали.
-  await takeFromCell(client, warehouseId, { cellBlockId, sku: item.sku, companyId: item.company_id, qty, verb: 'забрать', newest: true });
+  // Только товар склада этой строки привоза: не чужой склад того же продавца.
+  const vw = await itemVw(client, item.id);
+  await takeFromCell(client, warehouseId, { cellBlockId, sku: item.sku, companyId: item.company_id, qty, verb: 'забрать', newest: true, vw });
   const row = (await client.query(
     `INSERT INTO receiving_placements
        (receiving_record_id, invoice_item_id, warehouse_id, company_id, cell_block_id, sku, qty, step, placed_by, kind)
@@ -688,6 +699,7 @@ router.post('/items/:invoiceItemId/defect', requireAuth, requireRole('worker'), 
       const move = await defects.createMove(client, {
         warehouseId, companyId: item.company_id, sku: item.sku, qty: plan.qty, bucket: plan.bucket, note: plan.note,
         source: 'receiving', invoiceId: invoice.id, cellBlockId: plan.cellBlockId, staffKeyId,
+        vw: await itemVw(client, item.id),
       });
       const done = await placingDone(client, {
         warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId: plan.cellBlockId, legacy, skipJournal: true,

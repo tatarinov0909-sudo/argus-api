@@ -18,6 +18,9 @@ const { refreshCellFill } = require('./fill');
 async function moveStock(client, warehouseId, {
   sku, companyId, fromCellBlockId, toCellBlockId, qty,
   fromQuality = 'good', toQuality, workerKeyId = null,
+  // Виртуальный склад строк, которые двигаем (02.10.2026): undefined — любые,
+  // null — «Основной». Каждая строка уезжает со своим складом.
+  vw,
 }) {
   if (!sku || !fromCellBlockId) {
     throw new HttpError(400, 'Нужны товар, ячейка-источник и количество');
@@ -38,15 +41,15 @@ async function moveStock(client, warehouseId, {
     if (!dest.rows[0]) throw new HttpError(404, 'Ячейка назначения не найдена');
   }
 
-  const takenByCompany = await takeFromCell(client, warehouseId, {
-    cellBlockId: fromCellBlockId, sku, companyId, quality: fromQuality, qty: amount, verb: 'переместить',
+  const taken = await takeFromCell(client, warehouseId, {
+    cellBlockId: fromCellBlockId, sku, companyId, quality: fromQuality, qty: amount, verb: 'переместить', vw,
   });
 
-  for (const [key, moved] of takenByCompany) {
+  for (const part of taken) {
     await client.query(
-      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [targetCell, warehouseId, key || null, sku, moved, targetQuality],
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [targetCell, warehouseId, part.companyId, sku, part.qty, targetQuality, part.vw],
     );
   }
 
@@ -58,45 +61,49 @@ async function moveStock(client, warehouseId, {
   // ли состояние товара — для продавца это разные события.
   // След операции — тоже по каждому продавцу отдельно: в истории продавца
   // должно стоять ровно его количество, а не общая сумма по ячейке.
-  for (const [key, moved] of takenByCompany) {
+  for (const part of taken) {
     await client.query(
       `INSERT INTO stock_operations
          (warehouse_id, company_id, kind, sku, qty,
           from_cell_block_id, to_cell_block_id, details, worker_key_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [warehouseId, key || null, targetQuality === fromQuality ? 'move' : 'repack',
-        sku, moved, fromCellBlockId, targetCell,
+      [warehouseId, part.companyId, targetQuality === fromQuality ? 'move' : 'repack',
+        sku, part.qty, fromCellBlockId, targetCell,
         JSON.stringify({ fromQuality, toQuality: targetQuality }), workerKeyId],
     );
   }
 
   return {
     sku, qty: amount, fromQuality, toQuality: targetQuality,
-    fromCellBlockId, toCellBlockId: targetCell,
+    fromCellBlockId, toCellBlockId: targetCell, parts: taken,
   };
 }
 
 // Снять товар с полки: строки остатка ячейки, начиная с самой давней, — тем
 // же правилом, что и отбор на отгрузке, чтобы товар не «молодел» при
-// перестановке. Возвращает, сколько снято у какого продавца. Нехватка — отказ
-// до того, как что-то сдвинулось. Общая для перестановки и для раскладки
-// приёмки («Переложить», «Убрать из ячейки», receiving/routes.js).
+// перестановке. Возвращает, сколько снято у какого продавца с какого
+// виртуального склада: [{ companyId, vw, qty }]. Нехватка — отказ до того,
+// как что-то сдвинулось. Общая для перестановки, брака и раскладки приёмки
+// («Переложить», «Убрать из ячейки», receiving/routes.js).
 async function takeFromCell(client, warehouseId, {
   cellBlockId, sku, companyId = null, quality = 'good', qty, verb = 'забрать',
   // newest — снимать с самых свежих строк (раскладка приёмки забирает то, что
   // сама положила); по умолчанию — с самой давней.
   newest = false,
+  // Виртуальный склад (02.10.2026): undefined — любой, null — «Основной».
+  vw,
 }) {
   // Блокируем строки источника: два работника, переставляющие один и тот же
   // товар одновременно, не должны оба пройти проверку остатка.
   const source = await client.query(
-    `SELECT id, qty, company_id FROM cell_stock
+    `SELECT id, qty, company_id, virtual_warehouse_id FROM cell_stock
      WHERE cell_block_id = $1 AND warehouse_id = $2 AND sku = $3 AND quality = $4
        AND ($5::uuid IS NULL OR company_id = $5::uuid)
+       AND (NOT $6::boolean OR virtual_warehouse_id IS NOT DISTINCT FROM $7::uuid)
        AND qty > 0
      ORDER BY ${newest ? 'placed_at DESC, updated_at DESC' : 'updated_at'}
      FOR UPDATE`,
-    [cellBlockId, warehouseId, sku, quality, companyId || null],
+    [cellBlockId, warehouseId, sku, quality, companyId || null, vw !== undefined, vw || null],
   );
   const available = source.rows.reduce((sum, r) => sum + Number(r.qty), 0);
   if (available <= 0) throw new HttpError(409, 'В этой ячейке нет такого товара в таком состоянии');
@@ -110,7 +117,7 @@ async function takeFromCell(client, warehouseId, {
   // физически становился товаром продавца Б, и оба видели это как факт —
   // и в остатке, и в истории операций.
   let left = qty;
-  const takenByCompany = new Map();
+  const takenBy = new Map();
   for (const row of source.rows) {
     if (left <= 0) break;
     const take = Math.min(left, Number(row.qty));
@@ -123,11 +130,13 @@ async function takeFromCell(client, warehouseId, {
         [row.id, rest],
       );
     }
-    const key = row.company_id || '';
-    takenByCompany.set(key, (takenByCompany.get(key) || 0) + take);
+    const key = `${row.company_id || ''} ${row.virtual_warehouse_id || ''}`;
+    const part = takenBy.get(key) || { companyId: row.company_id || null, vw: row.virtual_warehouse_id || null, qty: 0 };
+    part.qty += take;
+    takenBy.set(key, part);
     left -= take;
   }
-  return takenByCompany;
+  return [...takenBy.values()];
 }
 
 module.exports = { moveStock, takeFromCell };

@@ -72,7 +72,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   // Что осталось добрать по каждой строке: заявлено минус уже отобранное.
   // Закрытые строки (is_final) в лист не попадают — по ним ходить незачем.
   const items = await client.query(
-    `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty,
+    `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty, ii.virtual_warehouse_id AS vw,
             ii.mp_article, COALESCE(NULLIF(BTRIM(ii.mp_barcode), ''), p.barcode) AS barcode,
             m.photo_url,
             COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
@@ -106,10 +106,12 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     const left = it.closed ? 0 : Math.max(0, declared - Number(it.picked));
     const need = whole ? declared : left;
     if (!whole && need <= 0) continue;
-    const key = `${it.company_id}|${it.sku}`;
+    // И один виртуальный склад (02.10.2026): товар склада «Озон» не идёт
+    // в строку поставки с «Основного».
+    const key = `${it.company_id}|${it.sku}|${it.vw || ''}`;
     if (!lines.has(key)) {
       lines.set(key, {
-        sku: it.sku, name: it.name, companyId: it.company_id, needQty: 0, leftQty: 0, pickedQty: 0, perOrder: [],
+        sku: it.sku, name: it.name, companyId: it.company_id, vw: it.vw || null, needQty: 0, leftQty: 0, pickedQty: 0, perOrder: [],
         // Артикул площадки и штрихкод: по ним сборщик и ищет товар на полке,
         // а не по внутреннему коду.
         article: it.mp_article || null,
@@ -140,13 +142,13 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
 
   // Где это лежит — только годное: брак и ждущий перепаковки клиенту не едут.
   const stock = await client.query(
-    `SELECT cs.company_id, cs.sku, cs.cell_block_id, SUM(cs.qty) AS available,
+    `SELECT cs.company_id, cs.sku, cs.virtual_warehouse_id AS vw, cs.cell_block_id, SUM(cs.qty) AS available,
             wr.row_num, cb.label, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      FROM cell_stock cs
      JOIN cell_blocks cb ON cb.id = cs.cell_block_id
      JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE cs.warehouse_id = $1 AND cs.qty > 0 AND cs.quality = 'good'
-     GROUP BY cs.company_id, cs.sku, cs.cell_block_id, wr.row_num, cb.label,
+     GROUP BY cs.company_id, cs.sku, cs.virtual_warehouse_id, cs.cell_block_id, wr.row_num, cb.label,
               cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
      ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
     [warehouseId],
@@ -154,7 +156,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
 
   const stockByKey = new Map();
   for (const r of stock.rows) {
-    const key = `${r.company_id}|${r.sku}`;
+    const key = `${r.company_id}|${r.sku}|${r.vw || ''}`;
     if (!stockByKey.has(key)) stockByKey.set(key, []);
     stockByKey.get(key).push(r);
   }
@@ -164,20 +166,20 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   const takenByKey = new Map();
   if (whole) {
     const taken = await client.query(
-      `SELECT ii.company_id, ii.sku, sr.cell_block_id, SUM(sr.picked_qty) AS qty,
+      `SELECT ii.company_id, ii.sku, ii.virtual_warehouse_id AS vw, sr.cell_block_id, SUM(sr.picked_qty) AS qty,
               wr.row_num, cb.label, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
          FROM shipping_records sr
          JOIN invoice_items ii ON ii.id = sr.invoice_item_id
          LEFT JOIN cell_blocks cb ON cb.id = sr.cell_block_id
          LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
         WHERE ii.invoice_id = ANY($1::uuid[]) AND sr.picked_qty > 0
-        GROUP BY ii.company_id, ii.sku, sr.cell_block_id, wr.row_num, cb.label,
+        GROUP BY ii.company_id, ii.sku, ii.virtual_warehouse_id, sr.cell_block_id, wr.row_num, cb.label,
                  cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
         ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
       [ids],
     );
     for (const r of taken.rows) {
-      const key = `${r.company_id}|${r.sku}`;
+      const key = `${r.company_id}|${r.sku}|${r.vw || ''}`;
       if (!takenByKey.has(key)) takenByKey.set(key, []);
       takenByKey.get(key).push({
         cellBlockId: r.cell_block_id,
@@ -214,6 +216,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       sku: line.sku,
       name: line.name,
       companyId: line.companyId,
+      vw: line.vw,
       article: line.article,
       barcode: line.barcode,
       photo: line.photo || null,
@@ -243,9 +246,9 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   const takenComponents = new Map();
   for (const line of result) {
     if (line.shortfall <= 0 || !kitSkus.has(line.sku)) continue;
-    const info = await kitInfo(client, warehouseId, line.companyId, line.sku);
+    const info = await kitInfo(client, warehouseId, line.companyId, line.sku, line.vw);
     if (!info) continue;
-    const key = (sku) => `${line.companyId}|${sku}`;
+    const key = (sku) => `${line.companyId}|${sku}|${line.vw || ''}`;
     // Сколько наборов реально соберём с учётом уже занятых компонентов.
     let buildable = info.buildable;
     for (const part of info.components || []) {

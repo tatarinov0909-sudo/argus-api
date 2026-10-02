@@ -29,8 +29,11 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
     const {
       invoiceIds, marketplace, destination, shipDate, shippingPointId,
     } = req.body || {};
+    // Склад поставки (02.10.2026): ключа нет — выбрать сам, null — «Основной».
+    const virtualWarehouseId = Object.prototype.hasOwnProperty.call(req.body || {}, 'virtualWarehouseId')
+      ? (req.body.virtualWarehouseId || null) : undefined;
     const supply = await withTenantContext({ warehouseId }, (client) => service.create(client, warehouseId, {
-      invoiceIds, marketplace, destination, shipDate, shippingPointId, actor: actorOf(req.auth),
+      invoiceIds, marketplace, destination, shipDate, shippingPointId, actor: actorOf(req.auth), virtualWarehouseId,
     }));
 
     // Передача на площадку — отдельным шагом и вне транзакции: чужая сеть не

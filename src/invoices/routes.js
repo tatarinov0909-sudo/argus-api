@@ -1,3 +1,4 @@
+const vwarehouses = require('../vwarehouses/service');
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
@@ -126,7 +127,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       // across several quality buckets, not just several cells.
       if (inv.direction === 'return') {
         const itemsResult = await client.query(
-          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.virtual_warehouse_id,
                   COALESCE(SUM(rr.qty), 0) AS returned_qty,
                   COALESCE(
                     json_agg(
@@ -155,7 +156,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       // several cells (see the shipping migration for why).
       if (inv.direction === 'out') {
         const itemsResult = await client.query(
-          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+          `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.virtual_warehouse_id,
                   COALESCE(SUM(sr.picked_qty), 0) AS picked_qty,
                   COALESCE(BOOL_OR(sr.is_final), false) AS closed,
                   -- Грузчик уже отметил «нет товара», а руководитель ещё не
@@ -195,7 +196,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       // Штрихкод и артикул WB — крупно на экране приёмки: по ним товар
       // узнают на коробке (владелец 27.09.2026).
       const itemsResult = await client.query(
-        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty,
+        `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.virtual_warehouse_id,
                 codes.barcode, codes.wb_article,
                 rr.id AS receiving_id, rr.accepted_qty, rr.finished_at, rr.pause_reasons,
                 cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end, wr.row_num,
@@ -288,10 +289,12 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
 
       const createdItems = [];
       for (const it of items) {
+        // Виртуальный склад строки (02.10.2026): не указан — «Основной».
+        const vw = await vwarehouses.requireVw(client, companyId, it.virtualWarehouseId);
         const itemResult = await client.query(
-          `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, sku, declared_qty`,
-          [inv.id, warehouseId, companyId, it.name, it.sku, it.declaredQty],
+          `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty, virtual_warehouse_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, sku, declared_qty, virtual_warehouse_id`,
+          [inv.id, warehouseId, companyId, it.name, it.sku, it.declaredQty, vw ? vw.id : null],
         );
         createdItems.push(itemResult.rows[0]);
       }

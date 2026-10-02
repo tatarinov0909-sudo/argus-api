@@ -47,13 +47,26 @@ router.post('/moves', requireAuth, requireRole('worker'), async (req, res, next)
     const out = await inWarehouse(req, async (c) => {
       await activeCompany(c, req.auth.warehouseId, b.companyId);
       if (typeof b.sku !== 'string' || !b.sku) throw new HttpError(400, 'Укажите товар');
+      // С какого виртуального склада годное (02.10.2026): сборка поставки —
+      // склад поставки, сборка заказа — склад строки; иначе — переданный
+      // склад или любой (каждая строка остаётся со своим складом).
+      let vw = Object.prototype.hasOwnProperty.call(b, 'vw') ? (b.vw || null) : undefined;
+      if (UUID.test(String(b.supplyId || ''))) {
+        const s = (await c.query('SELECT virtual_warehouse_id FROM supplies WHERE id = $1 AND warehouse_id = $2',
+          [b.supplyId, req.auth.warehouseId])).rows[0];
+        if (s) vw = s.virtual_warehouse_id || null;
+      } else if (UUID.test(String(b.invoiceItemId || ''))) {
+        const it = (await c.query('SELECT virtual_warehouse_id FROM invoice_items WHERE id = $1 AND warehouse_id = $2',
+          [b.invoiceItemId, req.auth.warehouseId])).rows[0];
+        if (it) vw = it.virtual_warehouse_id || null;
+      }
       return defects.markFromShelf(c, {
         warehouseId: req.auth.warehouseId, companyId: b.companyId, sku: b.sku,
         fromCellBlockId: b.fromCellBlockId, toCellBlockId: b.toCellBlockId || null, qty: b.qty,
         bucket: b.bucket, note: b.note, source,
         supplyId: UUID.test(String(b.supplyId || '')) ? b.supplyId : null,
         invoiceId: UUID.test(String(b.invoiceId || '')) ? b.invoiceId : null,
-        staffKeyId: req.auth.staffKeyId,
+        staffKeyId: req.auth.staffKeyId, vw,
       });
     });
     res.status(201).json(out);

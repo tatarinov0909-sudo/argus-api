@@ -46,6 +46,9 @@ const COLUMNS = {
   barcode: /(баркод|штрих-?код|^шк$|barcode|ean)/,
   article: /(артикул|^арт\.?|sku|^код|vendor ?code)/,
   name: /(наименование|название|^товар|номенклатура|^name)/,
+  // Виртуальный склад продавца (02.10.2026): столбец ровно «Склад». Пусто —
+  // «Основной». Берётся, только если у продавца склады заведены.
+  warehouse: /^(склад|виртуальный склад)$/,
 };
 
 function limitLines(lines) {
@@ -91,6 +94,7 @@ function parseInboundSheet(grid) {
         barcode: cols.barcode === undefined ? null : (text(r[cols.barcode]).replace(/\.0+$/, '') || null),
         article: cols.article === undefined ? null : (text(r[cols.article]).replace(/\.0+$/, '') || null),
         name: cols.name === undefined ? null : (text(r[cols.name]) || null),
+        warehouse: cols.warehouse === undefined ? null : (text(r[cols.warehouse]) || null),
       };
       if (!line.barcode && !line.article && !line.name) continue;
       if ([line.barcode, line.article, line.name].some((v) => /^(итог|всего)/i.test(v || ''))) continue;
@@ -291,24 +295,42 @@ async function run(client, {
 }) {
   const lines = parseInboundSheet(grid);
   const find = await loadCatalog(client, companyId);
+  // Склады продавца: строка привоза ложится на свой склад (владелец
+  // 02.10.2026). Нет складов — столбец «Склад» не читаем вовсе.
+  const vws = (await client.query(
+    'SELECT id, name FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL', [companyId])).rows;
+  const vwByName = new Map(vws.map((w) => [low(w.name), w]));
   const found = [];
   const bySku = new Map();
-  const fresh = new Map(); // артикул в верхнем регистре → новая карточка
-  for (const line of lines) {
+  const fresh = new Map(); // артикул и склад → новая карточка
+  for (const raw of lines) {
+    const line = { ...raw };
+    let vw = null;
+    if (vws.length && line.warehouse && low(line.warehouse) !== 'основной') {
+      vw = vwByName.get(low(line.warehouse)) || null;
+      if (!vw && !line.error) {
+        line.error = `склада «${line.warehouse}» у вас нет — есть: «Основной», ${vws.map((w) => `«${w.name}»`).join(', ')}`;
+      }
+    }
     const { product, by } = line.error ? { product: null, by: null } : find(line);
-    const item = { ...line, qty: line.qty || 0, sku: product ? product.sku : null, productName: product ? product.name : null, by };
+    const item = {
+      ...line, qty: line.qty || 0, sku: product ? product.sku : null, productName: product ? product.name : null, by,
+      ...(vws.length ? { vwName: vw ? vw.name : 'Основной' } : {}),
+    };
+    const vwKey = vw ? vw.id : '';
     if (!product && canBeNew(line)) {
       item.isNew = true;
-      const key = newSku(line).toUpperCase();
-      const agg = fresh.get(key) || { sku: newSku(line), name: line.name, barcode: line.barcode, qty: 0 };
+      const key = `${newSku(line).toUpperCase()}\u0000${vwKey}`;
+      const agg = fresh.get(key) || { sku: newSku(line), name: line.name, barcode: line.barcode, qty: 0, vw: vw ? vw.id : null };
       agg.qty += item.qty;
       fresh.set(key, agg);
     }
     found.push(item);
     if (!product) continue;
-    const agg = bySku.get(product.sku) || { sku: product.sku, name: product.name, qty: 0 };
+    const key = `${product.sku}\u0000${vwKey}`;
+    const agg = bySku.get(key) || { sku: product.sku, name: product.name, qty: 0, vw: vw ? vw.id : null };
     agg.qty += item.qty;
-    bySku.set(product.sku, agg);
+    bySku.set(key, agg);
   }
   const summary = {
     lines: found.length,
@@ -316,7 +338,7 @@ async function run(client, {
     notMatched: found.filter((l) => !l.sku && !l.isNew).length,
     products: bySku.size,
     units: [...bySku.values()].reduce((s, i) => s + i.qty, 0),
-    newProducts: fresh.size,
+    newProducts: new Set([...fresh.values()].map((p) => p.sku.toUpperCase())).size,
     newUnits: [...fresh.values()].reduce((s, i) => s + i.qty, 0),
   };
   if (!apply) return { applied: false, summary, lines: found };
@@ -336,14 +358,17 @@ async function run(client, {
         created.push(p);
       }
       const sku = existing ? existing.sku : p.sku;
-      const agg = bySku.get(sku) || { sku, name: existing ? existing.name : p.name, qty: 0 };
+      const key = `${sku}\u0000${p.vw || ''}`;
+      const agg = bySku.get(key) || { sku, name: existing ? existing.name : p.name, qty: 0, vw: p.vw };
       agg.qty += p.qty;
-      bySku.set(sku, agg);
+      bySku.set(key, agg);
     }
   }
   const items = [...bySku.values()];
   if (!items.length) throw new HttpError(400, 'В файле не нашлось ни одного товара из вашего каталога');
-  const tooMuch = items.find((i) => i.qty > MAX_QTY);
+  const perSku = new Map();
+  for (const i of items) perSku.set(i.sku, { name: i.name, qty: (perSku.get(i.sku)?.qty || 0) + i.qty });
+  const tooMuch = [...perSku.values()].find((i) => i.qty > MAX_QTY);
   if (tooMuch) {
     throw new HttpError(400, `«${tooMuch.name}»: ${tooMuch.qty.toLocaleString('ru-RU')} шт. в одном приходе — больше `
       + `${MAX_QTY.toLocaleString('ru-RU')}. Проверьте количество в файле.`);
@@ -359,15 +384,18 @@ async function run(client, {
   }
   await saveDetails(client, inv.id, d);
   await client.query(
-    `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
-     SELECT $1, $2, $3, x.name, x.sku, x.qty
-       FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
+    `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty, virtual_warehouse_id)
+     SELECT $1, $2, $3, x.name, x.sku, x.qty, x.vw
+       FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int, vw uuid)`,
     [inv.id, warehouseId, companyId, JSON.stringify(items)]);
   const units = items.reduce((sum, i) => sum + i.qty, 0);
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик',
     actionText: `Продавец «${company.name}» ${replaceId ? 'заменил список товаров в привозе' : 'оформил привоз'} ${inv.number}: `
-      + `${items.length} товаров, ${units} шт. ${describe(d)}`.trim()
+      + `${perSku.size} товаров, ${units} шт. ${describe(d)}`.trim()
+      + (vws.length && items.some((i) => i.vw)
+        ? ` По складам: ${[...new Set(items.map((i) => i.vw || ''))].map((id) => `«${id ? vws.find((w) => w.id === id).name : 'Основной'}» — ${
+          items.filter((i) => (i.vw || '') === id).reduce((n, i) => n + i.qty, 0)} шт.`).join(', ')}.` : '')
       + (created.length ? ` Новые товары заведены в каталог из его файла (${created.length}): `
         + created.slice(0, 5).map((p) => `«${p.name}» (${p.sku})`).join(', ') + (created.length > 5 ? ' и другие' : '')
         + ' — проверьте карточки при приёмке.' : ''),

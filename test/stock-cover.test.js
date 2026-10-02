@@ -20,7 +20,7 @@ test('полки раздаются поставкам по старшинств
   const cover = await stockCover(client, 'w');
   assert.deepEqual([...cover.shortInvoices], ['i2']);
   // Второй поставке не хватило — полка пуста, очереди ничего не осталось.
-  assert.equal(cover.take('c|A', 1), false);
+  assert.equal(cover.take('c|A|', 1), false);
   // Полностью собранная строка (need 0) нехватки не создаёт.
   assert.equal(cover.shortInvoices.has('i3'), false);
 });
@@ -31,7 +31,19 @@ test('очередь получает то, что осталось после �
     demand: [{ supply_id: 's1', invoice_id: 'i1', company_id: 'c', sku: 'A', need: '3' }],
   });
   const cover = await stockCover(client, 'w');
-  assert.equal(cover.take('c|A', 1), true);
-  assert.equal(cover.take('c|A', 1), true);
-  assert.equal(cover.take('c|A', 1), false);
+  assert.equal(cover.take('c|A|', 1), true);
+  assert.equal(cover.take('c|A|', 1), true);
+  assert.equal(cover.take('c|A|', 1), false);
+});
+
+// Виртуальные склады (02.10.2026): товар склада «Озон» не закрывает поставку
+// с «Основного», даже у того же продавца и товара.
+test('остаток считается по складу: чужой склад продавца не закрывает поставку', async () => {
+  const client = fakeClient({
+    cells: [{ company_id: 'c', sku: 'A', vw: 'ozon', qty: '10' }, { company_id: 'c', sku: 'A', vw: null, qty: '1' }],
+    demand: [{ supply_id: 's1', invoice_id: 'i1', company_id: 'c', sku: 'A', vw: null, need: '3' }],
+  });
+  const cover = await stockCover(client, 'w');
+  assert.deepEqual([...cover.shortInvoices], ['i1']);
+  assert.equal(cover.take('c|A|ozon', 10), true);
 });
