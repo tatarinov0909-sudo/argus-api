@@ -542,17 +542,39 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
   const where = label.rows[0] ? formatBlockLabel(label.rows[0].row_num, label.rows[0]) : 'ячейки';
   for (const c of cuts) {
     if (!c.line.companyId) continue;
-    const vws = await vwarehouses.list(client, c.line.companyId, { withArchived: true });
+    const vws = await vwarehouses.list(client, c.line.companyId);
     if (!vws.length) continue;
     const name = (await client.query('SELECT name FROM products WHERE company_id = $1 AND sku = $2 LIMIT 1',
       [c.line.companyId, c.line.sku])).rows[0]?.name || c.line.sku;
-    const bad = (c.line.quality || 'good') !== 'good' ? ' (брак)' : '';
-    const text = c.cut.length
-      ? `Пересчёт ячейки ${where}: «${name}»${bad} — не хватило ${c.cut.reduce((n, x) => n + x.qty, 0)} шт., списано: `
-        + c.cut.map((x) => `«${vwarehouses.nameOf(vws, x.vw)}» — ${x.qty} шт.`).join(', ') + '.'
-      : `Пересчёт ячейки ${where}: «${name}»${bad} — найдено лишних ${c.surplus} шт., они на «${vwarehouses.MAIN_NAME}».`;
-    await vwarehouses.notifySeller(client, {
-      warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus', text,
+    const quality = c.line.quality || 'good';
+    const bad = quality !== 'good' ? ' (брак)' : '';
+    const had = partsOf(c.line).map((b) => ({ vw: b.vw || null, qty: Number(b.qty) })).filter((b) => b.qty > 0);
+    const now = (vw) => (c.result.find((x) => (x.vw || null) === vw) || { qty: 0 }).qty;
+    const was = (vw) => (had.find((x) => x.vw === vw) || { qty: 0 }).qty;
+    const shortQty = c.cut.reduce((n, x) => n + x.qty, 0);
+    // Спорно, когда списать или записать можно на разные склады
+    // (владелец 02.10.2026): недостача — из складов, где товар числился;
+    // излишек — на любой склад продавца.
+    const candidates = c.cut.length
+      ? had.map((x) => x.vw)
+      : [null, ...vws.map((w) => w.id)];
+    const title = c.cut.length
+      ? `Пересчёт ячейки ${where}: «${name}»${bad} — не хватило ${shortQty} шт.`
+      : `Пересчёт ячейки ${where}: «${name}»${bad} — найдено лишних ${c.surplus} шт.`;
+    if (candidates.length < 2) {
+      await vwarehouses.notifySeller(client, {
+        warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus',
+        text: `${title}, ${c.cut.length ? 'списано с' : 'записаны на'} «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
+      });
+      continue;
+    }
+    await vwarehouses.splitSituation(client, {
+      warehouseId, companyId: c.line.companyId, kind: 'inventory', sku: c.line.sku, name, quality, title,
+      parts: candidates.map((vw) => ({
+        vw, before: was(vw), value: now(vw),
+        min: c.cut.length ? 0 : was(vw),
+        max: c.cut.length ? was(vw) : was(vw) + c.surplus,
+      })),
     });
   }
   await refreshCellFill(client, task.cell_block_id);

@@ -116,9 +116,15 @@ async function markFromShelf(client, {
 }) {
   requireBucket(bucket);
   const amount = requireQty(qty, 'Количество брака', { min: 1 });
-  await cellLabel(client, warehouseId, fromCellBlockId);
+  const fromLabel = await cellLabel(client, warehouseId, fromCellBlockId);
   const target = toCellBlockId || fromCellBlockId;
   await cellLabel(client, warehouseId, target);
+  // Склад не назван, а в ячейке годное разных складов продавца — с какого
+  // склада брак, решено по правилу; это спорная ситуация (владелец 02.10.2026).
+  const had = vw !== undefined ? [] : (await client.query(
+    `SELECT virtual_warehouse_id AS vw, SUM(qty)::int AS qty FROM cell_stock
+      WHERE cell_block_id = $1 AND company_id = $2 AND sku = $3 AND quality = 'good' AND qty > 0
+      GROUP BY virtual_warehouse_id`, [fromCellBlockId, companyId, sku])).rows;
   // Только годное этого продавца: takeFromCell ограничен продавцом.
   const parts = await takeFromCell(client, warehouseId, {
     cellBlockId: fromCellBlockId, sku, companyId, quality: 'good', qty: amount, verb: 'отметить браком', vw,
@@ -142,6 +148,16 @@ async function markFromShelf(client, {
       warehouseId, companyId, sku, qty: part.qty, bucket, note, source, supplyId, invoiceId,
       cellBlockId: target, staffKeyId, vw: part.vw,
     }));
+  }
+  if (had.length > 1) {
+    const taken = (v) => parts.filter((p) => (p.vw || null) === (v || null)).reduce((n, p) => n + p.qty, 0);
+    const name = await productName(client, companyId, sku);
+    // Позднее подключение: склады продавца сами берут номера документов отсюда.
+    await require('../vwarehouses/service').splitSituation(client, {
+      warehouseId, companyId, kind: 'defect', sku, name, quality: bucket,
+      title: `Брак ${amount} шт. «${name}» в ячейке ${fromLabel}`,
+      parts: had.map((h) => ({ vw: h.vw, before: h.qty, value: taken(h.vw), min: 0, max: Math.min(h.qty, amount) })),
+    });
   }
   return moves.length === 1 ? moves[0] : { ...moves[0], qty: amount, moves };
 }

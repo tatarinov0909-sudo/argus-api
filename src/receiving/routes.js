@@ -11,6 +11,7 @@ const journal = require('../journal/repository');
 const kladovshchik = require('../agents/kladovshchik');
 const outbox = require('../sync/outbox');
 const work = require('./session');
+const vwarehouses = require('../vwarehouses/service');
 
 const router = express.Router();
 
@@ -430,7 +431,13 @@ async function settleInvoice(client, { warehouseId, staffKeyId, invoiceId, numbe
     [invoiceId],
   )).rows[0];
   const status = left.open === 0 && left.unplaced === 0 ? 'completed' : 'in_progress';
+  const was = (await client.query('SELECT status FROM invoices WHERE id = $1', [invoiceId])).rows[0];
   await client.query('UPDATE invoices SET status = $2 WHERE id = $1', [invoiceId, status]);
+  // Приход только что принят: товар одной позиции на разных складах продавца
+  // принят не так, как заявлен, — продавцу уведомление или его решение.
+  if (status === 'completed' && direction === 'in' && was && was.status !== 'completed') {
+    await vwarehouses.receivingSplits(client, { warehouseId, invoiceId });
+  }
   let finished = null;
   if (status === 'completed' && direction === 'in' && closeWork) {
     const [row] = await work.settle(client, warehouseId, [invoiceId], { force: true });

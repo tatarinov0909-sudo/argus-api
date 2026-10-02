@@ -18,10 +18,15 @@ const MAIN_NAME = 'Основной';
 const MARKETPLACES = { wb: 'WB', ozon: 'Озон', yandex: 'Яндекс Маркет', other: 'иное' };
 // «Права склада» (вопрос 14): что склад может делать с товаром продавца без
 // его согласия. Нет ключа в ff_rights — право есть.
+// Одно право (владелец 02.10.2026): решать без продавца спорные ситуации с
+// количеством — переносы между его складами, недостачу и излишки пересчёта,
+// расхождения приёмки по складам, брак с полки, где лежит товар разных
+// складов. Составлять поставки, приёмку и отгрузку склад ведёт всегда сам.
 const RIGHTS = {
-  transfer: 'переносить товар между складами',
-  shortage: 'решать, с какого склада списать недостачу при пересчёте',
+  decide: 'решать без него спорные ситуации с количеством (переносы между складами, недостачи, излишки, расхождения, брак)',
 };
+// Хвост уведомления, когда склад решил сам: продавец должен заметить.
+const DECIDED_SELF = ' Обратите внимание: склад решил это сам. Запретить складу решать такое без вас можно в «Правах склада».';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const view = (r) => ({
@@ -216,11 +221,12 @@ async function transferable(client, companyId, sku, vwId) {
 // переходят на склад-назначение в тех же ячейках. Физически ничего не
 // двигается — склады «вместе» (вопрос 7).
 async function moveRows(client, warehouseId, t, staffKeyId = null) {
+  const quality = t.quality || 'good';
   const rows = (await client.query(
     `SELECT id, cell_block_id, qty FROM cell_stock
-      WHERE company_id = $1 AND sku = $2 AND quality = 'good' AND qty > 0
+      WHERE company_id = $1 AND sku = $2 AND quality::text = $4 AND qty > 0
         AND virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid
-      ORDER BY updated_at FOR UPDATE`, [t.company_id, t.sku, t.from_vw])).rows;
+      ORDER BY updated_at FOR UPDATE`, [t.company_id, t.sku, t.from_vw, quality])).rows;
   let left = Number(t.qty);
   const cells = new Map();
   for (const row of rows) {
@@ -232,7 +238,7 @@ async function moveRows(client, warehouseId, t, staffKeyId = null) {
       await client.query('UPDATE cell_stock SET qty = qty - $2, updated_at = now() WHERE id = $1', [row.id, take]);
       await client.query(
         `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
-         VALUES ($1, $2, $3, $4, $5, 'good', $6)`, [row.cell_block_id, warehouseId, t.company_id, t.sku, take, t.to_vw]);
+         VALUES ($1, $2, $3, $4, $5, $7, $6)`, [row.cell_block_id, warehouseId, t.company_id, t.sku, take, t.to_vw, quality]);
     }
     cells.set(row.cell_block_id, (cells.get(row.cell_block_id) || 0) + take);
     left -= take;
@@ -243,7 +249,7 @@ async function moveRows(client, warehouseId, t, staffKeyId = null) {
       `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, from_cell_block_id, to_cell_block_id, details, worker_key_id)
        VALUES ($1, $2, 'vw_transfer', $3, $4, $5, $5, $6::jsonb, $7)`,
       [warehouseId, t.company_id, t.sku, qty, cellBlockId,
-        JSON.stringify({ transfer: t.number, fromVw: t.from_vw, toVw: t.to_vw }), staffKeyId]);
+        JSON.stringify({ transfer: t.number, fromVw: t.from_vw, toVw: t.to_vw, quality }), staffKeyId]);
   }
   return [...cells].map(([cellBlockId, qty]) => ({ cellBlockId, qty }));
 }
@@ -286,7 +292,7 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
   const name = await productName(client, companyId, cleanSku);
   const fromSeller = actor.role === 'seller';
   const rights = rightsOf(company);
-  const status = fromSeller ? 'requested' : (rights.transfer ? 'done' : 'waiting_seller');
+  const status = fromSeller ? 'requested' : (rights.decide ? 'done' : 'waiting_seller');
   const number = await nextNumber(client, warehouseId, 'ПЕР', 'vw_transfers');
   let t = (await client.query(
     `INSERT INTO vw_transfers (warehouse_id, company_id, number, sku, name, qty, from_vw, to_vw, note, status,
@@ -304,8 +310,8 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
       actionText: `Перенос ${number} у продавца «${company.name}»: ${what}.${t.note ? ` Комментарий: ${t.note}` : ''}`,
       entityType: 'vw_transfer', entityId: t.id, actorType: actorType(actor.role), actorId: actor.id || null,
     });
-    await notifySeller(client, { warehouseId, companyId, kind: 'vw_transfer_done', entityId: t.id,
-      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${t.note}` : ''}` });
+    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', entityId: t.id,
+      text: `${actor.name || ACTOR_NAME[actor.role] || 'Склад'} перенёс ваш товар ${what}.${t.note ? ` Комментарий: ${dot(t.note)}` : ''}${DECIDED_SELF}` });
   } else if (status === 'waiting_seller') {
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
@@ -395,7 +401,7 @@ async function decide(client, { warehouseId, transferId, approve, reason, actor 
     });
   }
   if (actor.role !== 'seller') {
-    await notifySeller(client, { warehouseId, companyId: t.company_id, kind: approve ? 'vw_transfer_done' : 'vw_transfer_rejected',
+    await notifySeller(client, { warehouseId, companyId: t.company_id, kind: approve ? 'vw_request_done' : 'vw_transfer_rejected',
       entityId: t.id, text: `Ваша заявка ${t.number}: ${what} — ${verdict}.` });
   }
   return transferView(done, rows);
@@ -414,7 +420,7 @@ async function setRights(client, { warehouseId, companyId, rights }) {
   if (changed.length) {
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
-      actionText: `Продавец «${company.name}» ${changed.join('; ')}${Object.values(rights).some((v) => !v) ? ' без его согласия' : ''}.`,
+      actionText: `Продавец «${company.name}» ${changed.join('; ')}.`,
       entityType: 'company', entityId: companyId, actorType: 'seller',
     });
   }
@@ -504,7 +510,7 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
   }
   const rows = (await client.query(
     `SELECT ii.id, ii.company_id, ii.sku, ii.name, ii.virtual_warehouse_id, i.number, i.direction, i.status,
-            i.supply_id, i.source,
+            i.supply_id, i.source, i.source_document_type,
             (EXISTS (SELECT 1 FROM receiving_records r WHERE r.invoice_item_id = ii.id)
              OR EXISTS (SELECT 1 FROM shipping_records r WHERE r.invoice_item_id = ii.id)
              OR EXISTS (SELECT 1 FROM return_records r WHERE r.invoice_item_id = ii.id)) AS started
@@ -514,6 +520,12 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
   const companies = [...new Set(rows.map((r) => r.company_id))];
   if (companies.length > 1) throw new HttpError(400, 'Строки разных продавцов');
   const company = await companyRow(client, warehouseId, companies[0]);
+  // Склад у строки привоза выбрал сам продавец: поменять без него — то же,
+  // что перенести его товар между складами (право «решать без продавца»).
+  if (!rightsOf(company).decide && rows.some((r) => r.source_document_type === 'seller_inbound')) {
+    throw new HttpError(409, `Продавец «${company.name}» запретил складу решать без него, на каком складе его товар. `
+      + 'Склад у строк своего привоза он меняет сам — изменив привоз.');
+  }
   for (const r of rows) {
     if (r.started) throw new HttpError(409, `По «${r.name}» в ${r.number} уже работали — склад строки поменять нельзя`);
     if (!['open', 'in_progress'].includes(r.status)) throw new HttpError(409, `Документ ${r.number} уже закрыт`);
@@ -533,11 +545,210 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
   });
   const what = rows.slice(0, 5).map((r) => `«${r.name || r.sku}»`).join(', ') + (rows.length > 5 ? ' и другие' : '');
   await notifySeller(client, { warehouseId, companyId: company.id, kind: 'vw_items',
-    text: `${actor.name || 'Склад'} отнёс к складу «${vw ? vw.name : MAIN_NAME}» ${what} в документе ${docs.join(', ')}.` });
+    text: `${actor.name || 'Склад'} отнёс к складу «${vw ? vw.name : MAIN_NAME}» ${what} в документе ${docs.join(', ')}.${DECIDED_SELF}` });
   return { updated: rows.length, vw: vw ? vw.id : null };
 }
 
+// ---------- Спорные ситуации с количеством (владелец 02.10.2026) ----------
+// Пересчёт нашёл меньше или больше, приняли не столько, сколько заявили на
+// разные склады, брак с полки, где лежит товар разных складов. Учёт сразу
+// записывается по правилу склада — полки должны быть правдой. Право
+// «решать без продавца» есть — продавцу заметное уведомление; продавец его
+// запретил — решение ждёт продавца: он соглашается или делит по-своему, и
+// разница переносится между его складами.
+//
+// parts: [{ vw, before, value, min, max }]. Для пересчёта и приёмки value —
+// сколько стало на складе (по правилу), для брака — сколько брака записано
+// на склад; min/max — пределы, в которых продавец может поменять.
+const DECISION_KINDS = ['inventory', 'receiving', 'defect'];
+
+const dot = (t) => (t.endsWith('.') ? t : `${t}.`);
+
+function howText(kind, parts, rows) {
+  const n = (x) => `«${nameOf(rows, x.vw)}»`;
+  if (kind === 'receiving') {
+    return 'принято: ' + parts.map((x) => `${n(x)} — ${x.value} из ${x.before} шт.`).join(', ');
+  }
+  if (kind === 'defect') {
+    return 'брак записан: ' + parts.filter((x) => x.value > 0).map((x) => `${n(x)} — ${x.value} шт.`).join(', ');
+  }
+  const cut = parts.filter((x) => x.value < x.before).map((x) => `${n(x)} — ${x.before - x.value} шт.`);
+  const add = parts.filter((x) => x.value > x.before).map((x) => `${n(x)} — ${x.value - x.before} шт.`);
+  return [cut.length ? 'списано: ' + cut.join(', ') : '', add.length ? 'записано: ' + add.join(', ') : '']
+    .filter(Boolean).join('; ');
+}
+
+async function splitSituation(client, { warehouseId, companyId, kind, sku, name, quality = 'good', title, parts }) {
+  const company = await companyRow(client, warehouseId, companyId);
+  const rows = await list(client, companyId, { withArchived: true });
+  if (!rows.length) return null;
+  const clean = parts.map((x) => ({
+    vw: x.vw || null, before: Number(x.before), value: Number(x.value), min: Number(x.min), max: Number(x.max),
+  }));
+  const how = howText(kind, clean, rows);
+  if (rightsOf(company).decide) {
+    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${title}. Склад решил так — ${dot(how)}${DECIDED_SELF}` });
+    return null;
+  }
+  const d = (await client.query(
+    `INSERT INTO vw_decisions (warehouse_id, company_id, kind, sku, name, quality, title, parts)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id`,
+    [warehouseId, companyId, kind, sku, name || sku, quality, title.slice(0, 500), JSON.stringify(clean)])).rows[0];
+  await notifySeller(client, { warehouseId, companyId, kind: 'vw_decision', entityId: d.id,
+    text: `${title}. Пока учёт записан по правилу склада — ${dot(how)} Вы запретили складу решать такое без вас: согласитесь или разделите по-своему на странице «Товары».` });
+  await journal.createEntry(client, {
+    warehouseId, agent: 'Кладовщик', status: 'auto',
+    actionText: `${title} (продавец «${company.name}»). Учёт записан по правилу — ${dot(how)} Продавец запретил складу решать такое без него — решение за ним.`,
+    entityType: 'vw_decision', entityId: d.id, actorType: 'system',
+  });
+  return d.id;
+}
+
+function decisionView(d, rows) {
+  return {
+    id: d.id, kind: d.kind, sku: d.sku, name: d.name, quality: d.quality, title: d.title, status: d.status,
+    parts: (d.parts || []).map((x) => ({ ...x, name: nameOf(rows, x.vw) })),
+    chosen: d.chosen, transfers: d.transfers, createdAt: d.created_at, decidedAt: d.decided_at,
+  };
+}
+
+async function listDecisions(client, companyId, { open = false, limit = 100 } = {}) {
+  const rows = await list(client, companyId, { withArchived: true });
+  return (await client.query(
+    `SELECT * FROM vw_decisions WHERE company_id = $1 AND (NOT $2 OR status = 'pending')
+      ORDER BY created_at DESC LIMIT $3`, [companyId, open, limit])).rows.map((d) => decisionView(d, rows));
+}
+
+// Перенос по решению продавца: сразу выполнен, со своим номером.
+async function retag(client, warehouseId, { companyId, sku, name, fromVw, toVw, qty, quality, note, actor }) {
+  if (quality === 'good') {
+    const free = (await transferable(client, companyId, sku, fromVw)).free;
+    if (free < qty) {
+      throw new HttpError(409, `На складе «${nameOf(await list(client, companyId, { withArchived: true }), fromVw)}» свободно только ${free} шт. `
+        + 'этого товара — остальное уже в поставках. Разделите иначе.');
+    }
+  }
+  const number = await nextNumber(client, warehouseId, 'ПЕР', 'vw_transfers');
+  const t = (await client.query(
+    `INSERT INTO vw_transfers (warehouse_id, company_id, number, sku, name, qty, from_vw, to_vw, note, status, quality,
+                               requested_role, requested_by, requested_name, decided_role, decided_by, decided_name, decided_at, done_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'done', $10, $11, $12, $13, $11, $12, $13, now(), now()) RETURNING *`,
+    [warehouseId, companyId, number, sku, name, qty, fromVw, toVw, note, quality, actor.role, actor.id || null,
+      actor.name || ACTOR_NAME[actor.role] || null])).rows[0];
+  const cells = await moveRows(client, warehouseId, t);
+  await client.query('UPDATE vw_transfers SET moved_cells = $2::jsonb WHERE id = $1', [t.id, JSON.stringify(cells)]);
+  return number;
+}
+
+// Пары «откуда → куда»: кто отдаёт и кто получает, жадно.
+function pairs(givers, takers) {
+  const out = [];
+  const g = givers.map((x) => ({ ...x })); const t = takers.map((x) => ({ ...x }));
+  let i = 0; let j = 0;
+  while (i < g.length && j < t.length) {
+    const q = Math.min(g[i].qty, t[j].qty);
+    out.push({ from: g[i].vw, to: t[j].vw, qty: q });
+    g[i].qty -= q; t[j].qty -= q;
+    if (!g[i].qty) i += 1;
+    if (!t[j].qty) j += 1;
+  }
+  return out;
+}
+
+async function resolveDecision(client, { warehouseId, decisionId, chosen, confirm, actor }) {
+  if (!UUID.test(String(decisionId || ''))) throw new HttpError(404, 'Решение не найдено');
+  const d = (await client.query('SELECT * FROM vw_decisions WHERE id = $1 AND warehouse_id = $2 FOR UPDATE',
+    [decisionId, warehouseId])).rows[0];
+  if (!d || d.company_id !== actor.companyId) throw new HttpError(404, 'Решение не найдено');
+  if (d.status !== 'pending') throw new HttpError(409, 'По этому случаю вы уже решили');
+  const rows = await list(client, d.company_id, { withArchived: true });
+  const parts = d.parts.map((x) => ({ ...x, vw: x.vw || null }));
+  const key = (vw) => vw || '';
+  let status = 'confirmed';
+  let picked = parts.map((x) => ({ vw: x.vw, qty: x.value }));
+  const numbers = [];
+  if (!confirm) {
+    if (!Array.isArray(chosen)) throw new HttpError(400, 'Укажите, сколько на каждом складе');
+    const byVw = new Map(chosen.map((c) => [key(c.vw), c.qty]));
+    picked = parts.map((x) => {
+      const q = byVw.has(key(x.vw)) ? Number(byVw.get(key(x.vw))) : x.value;
+      if (!Number.isInteger(q) || q < x.min || q > x.max) {
+        throw new HttpError(400, `«${nameOf(rows, x.vw)}»: можно от ${x.min} до ${x.max} шт.`);
+      }
+      return { vw: x.vw, qty: q };
+    });
+    const total = parts.reduce((n, x) => n + x.value, 0);
+    const sum = picked.reduce((n, x) => n + x.qty, 0);
+    if (sum !== total) throw new HttpError(400, `Всего должно получиться ${total} шт., а сейчас ${sum}`);
+    const diff = parts.map((x, k) => ({ vw: x.vw, d: picked[k].qty - x.value }));
+    const up = diff.filter((x) => x.d > 0).map((x) => ({ vw: x.vw, qty: x.d }));
+    const down = diff.filter((x) => x.d < 0).map((x) => ({ vw: x.vw, qty: -x.d }));
+    if (up.length) {
+      status = 'changed';
+      const note = `Решение продавца: ${d.title}`.slice(0, 300);
+      const one = (from, to, qty, quality) => retag(client, warehouseId, {
+        companyId: d.company_id, sku: d.sku, name: d.name, fromVw: from, toVw: to, qty, quality, note, actor,
+      });
+      if (d.kind === 'defect') {
+        // Больше брака на склад — у него меньше годного: годное уходит туда,
+        // где брака стало меньше, а брак — обратно.
+        for (const m of pairs(up, down)) {
+          numbers.push(await one(m.from, m.to, m.qty, 'good'));
+          numbers.push(await one(m.to, m.from, m.qty, d.quality));
+        }
+      } else {
+        for (const m of pairs(down, up)) numbers.push(await one(m.from, m.to, m.qty, d.quality));
+      }
+    }
+  }
+  await client.query(
+    `UPDATE vw_decisions SET status = $2, chosen = $3::jsonb, transfers = $4::jsonb, decided_at = now(), decided_by = $5
+      WHERE id = $1`, [d.id, status, JSON.stringify(picked), JSON.stringify(numbers), actor.id || null]);
+  const company = await companyRow(client, warehouseId, d.company_id);
+  const how = howText(d.kind, parts.map((x, k) => ({ ...x, value: picked[k].qty })), rows);
+  await journal.createEntry(client, {
+    warehouseId, agent: 'Кладовщик', status: 'auto',
+    actionText: `Продавец «${company.name}» ${status === 'changed' ? 'решил по-своему' : 'согласился'}: ${d.title} — ${dot(how)}`
+      + (numbers.length ? ` Переносы ${numbers.join(', ')}.` : ''),
+    entityType: 'vw_decision', entityId: d.id, actorType: 'seller', actorId: actor.id || null,
+  });
+  const done = (await client.query('SELECT * FROM vw_decisions WHERE id = $1', [d.id])).rows[0];
+  return decisionView(done, rows);
+}
+
+// Приход принят: товар одной позиции заявлен на разные склады продавца, а
+// принят не столько, сколько заявлено, — какой склад получил меньше (или
+// больше), решил склад, разложив принятое по строкам.
+async function receivingSplits(client, { warehouseId, invoiceId }) {
+  const inv = (await client.query('SELECT id, number, company_id FROM invoices WHERE id = $1', [invoiceId])).rows[0];
+  if (!inv || !inv.company_id) return;
+  const lines = (await client.query(
+    `SELECT ii.sku, MAX(ii.name) AS name, ii.virtual_warehouse_id AS vw, SUM(ii.declared_qty)::int AS declared,
+            SUM(COALESCE((SELECT SUM(rr.accepted_qty) FROM receiving_records rr WHERE rr.invoice_item_id = ii.id), 0))::int AS accepted
+       FROM invoice_items ii WHERE ii.invoice_id = $1
+      GROUP BY ii.sku, ii.virtual_warehouse_id ORDER BY ii.sku`, [invoiceId])).rows;
+  const bySku = new Map();
+  for (const l of lines) bySku.set(l.sku, (bySku.get(l.sku) || []).concat(l));
+  for (const [sku, group] of bySku) {
+    if (group.length < 2) continue;
+    const declared = group.reduce((n, l) => n + l.declared, 0);
+    const accepted = group.reduce((n, l) => n + l.accepted, 0);
+    if (declared === accepted) continue;
+    const short = accepted < declared;
+    await splitSituation(client, {
+      warehouseId, companyId: inv.company_id, kind: 'receiving', sku, name: group[0].name,
+      title: `Приход ${inv.number}: «${group[0].name || sku}» — заявлено ${declared} шт., принято ${accepted} шт.`,
+      parts: group.map((l) => ({
+        vw: l.vw, before: l.declared, value: l.accepted,
+        min: short ? 0 : Math.min(l.declared, l.accepted),
+        max: short ? Math.max(l.declared, l.accepted) : accepted,
+      })),
+    });
+  }
+}
+
 module.exports = {
+  DECISION_KINDS, splitSituation, listDecisions, resolveDecision, receivingSplits,
   setItemsVw,
   allocateCount,
   releaseOrders, assignOrders,

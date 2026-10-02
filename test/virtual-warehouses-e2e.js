@@ -60,7 +60,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const seen = await api('GET', '/api/vwarehouses', seller);
     assert.deepEqual(seen.warehouses.map((w) => [w.name, w.marketplaceName]), [['Озон', 'Озон'], ['ООО БББ', 'WB'], ['Опт', 'иное']]);
     assert.deepEqual(seen.wbChoices.map((w) => w.name), ['Основной', 'ООО БББ']);
-    assert.deepEqual(seen.rights, { transfer: true, shortage: true });
+    assert.deepEqual(seen.rights, { decide: true });
     const notes = await api('GET', '/api/vwarehouses/notifications', seller);
     assert.equal(notes.filter((n) => n.kind === 'vw_created').length, 3);
     check('склады заводят руководитель и менеджер; продавец видит свои склады, права и уведомления');
@@ -128,7 +128,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.equal(t1.status, 'done');
     assert.deepEqual(await vwQty(), { 'Основной': 30, 'Озон': 100, 'ООО БББ': 20 });
     await api('POST', '/api/shipping', worker, { invoiceItemId: itemId, pickedQty: 10, cellBlockId: cells[0], isFinal: true }, 201);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_transfer_done' && /«Основной» → «ООО БББ»/.test(n.text)));
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided' && /«Основной» → «ООО БББ»/.test(n.text) && /Обратите внимание/.test(n.text)));
     await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 31, fromVw: null, toVw: ozon.id }, 409);
     // То, что ждёт сборки со склада, не переносится.
     const order2 = await api('POST', '/api/invoices', owner, { companyId: company, number: 'WB-VW2', direction: 'out',
@@ -147,7 +147,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await api('POST', `/api/vwarehouses/transfers/${req1.id}/decide`, seller, { approve: true }, 403);
     await api('POST', `/api/journal/${entry.id}/resolve`, owner, { resolution: 'confirm' }, 201);
     assert.equal((await vwQty())['Опт'], 10);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_transfer_done' && /ПЕР-/.test(n.text)));
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_request_done' && /ПЕР-/.test(n.text)));
     const req2 = await api('POST', '/api/vwarehouses/transfers', seller, { sku: 'R-1', qty: 5, fromVw: ozon.id, toVw: opt.id }, 201);
     const rej = await api('POST', `/api/vwarehouses/transfers/${req2.id}/decide`, manager, { approve: false, reason: 'нет места' });
     assert.equal(rej.status, 'rejected');
@@ -155,15 +155,16 @@ const { pool, withTenantContext } = require('../src/db/pool');
     check('заявка продавца: «очень важно» в журнале; «Подтвердить» выполняет перенос, отказ — с причиной; продавцу уведомление');
 
     // ---- Права склада: продавец отключил переносы ----
-    await api('PATCH', '/api/vwarehouses/rights', owner, { rights: { transfer: false } }, 403);
-    assert.deepEqual((await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { transfer: false } })).rights, { transfer: false, shortage: true });
+    await api('PATCH', '/api/vwarehouses/rights', owner, { rights: { decide: false } }, 403);
+    await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { transfer: false } }, 400);
+    assert.deepEqual((await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } })).rights, { decide: false });
     const asked = await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 5, fromVw: ozon.id, toVw: null }, 201);
     assert.equal(asked.status, 'waiting_seller');
     await api('POST', `/api/vwarehouses/transfers/${asked.id}/decide`, owner, { approve: true }, 403);
     const before = await vwQty();
     await api('POST', `/api/vwarehouses/transfers/${asked.id}/decide`, seller, { approve: true });
     assert.equal((await vwQty())['Озон'], before['Озон'] - 5);
-    await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { transfer: true } });
+    await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: true } });
     check('продавец отключил право — перенос склада ждёт его согласия; согласился — выполнено');
 
     // ---- Строки документа: склад до начала работы ----
@@ -209,13 +210,82 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const largest = now.filter((r) => r.name !== 'Основной').sort((a, b) => b.n - a.n)[0];
     assert.equal(after['Основной'], undefined);
     assert.equal(after[largest.name], largest.n - 3);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'inventory_shortage'
-      && n.text.includes(`«Основной» — ${main} шт.`) && n.text.includes(`«${largest.name}» — 3 шт.`)));
-    check('пересчёт: недостача сначала с «Основного», потом с самого большого склада; продавцу уведомление');
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
+      && n.text.includes(`«Основной» — ${main} шт.`) && n.text.includes(`«${largest.name}» — 3 шт.`) && /Обратите внимание/.test(n.text)));
+    check('пересчёт: недостача сначала с «Основного», потом с самого большого склада; продавцу «обратите внимание»');
+
+    // ---- Галочка «запретить складу решать без меня» (владелец 02.10.2026) ----
+    assert.deepEqual((await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } })).rights, { decide: false });
+    const qtyBy = async (quality) => Object.fromEntries((await db(
+      `SELECT COALESCE(w.name, 'Основной') AS name, SUM(cs.qty)::int AS n FROM cell_stock cs
+         LEFT JOIN virtual_warehouses w ON w.id = cs.virtual_warehouse_id
+        WHERE cs.company_id = $1 AND cs.quality::text = $2 AND cs.qty > 0 GROUP BY 1`, [company, quality])).rows.map((r) => [r.name, r.n]));
+    const decisions = async () => api('GET', '/api/vwarehouses/decisions?open=1', seller);
+    const expectMoved = (q0, q1, parts, chosenOf, sign = 1) => {
+      for (const x of parts) assert.equal(q1[x.name] || 0, (q0[x.name] || 0) + sign * (chosenOf(x) - x.value), x.name);
+    };
+
+    // Приёмка: 10 шт. заявлены на «Озон», 5 — на «Основной», приняли 10 и 3.
+    const inb = await api('POST', '/api/sellers/inbound', seller, { grid: [['Артикул', 'Количество', 'Склад'], ['R-1', 10, 'Озон'], ['R-1', 5, '']], apply: true });
+    const inbDoc = await api('GET', `/api/invoices/${inb.invoice.id}`, owner);
+    const lockedItem = await call('POST', '/api/vwarehouses/items', owner, { itemIds: [inbDoc.items[0].id], vw: opt.id });
+    assert.equal(lockedItem.status, 409); assert.match(lockedItem.body.error, /запретил складу решать без него/);
+    await api('POST', `/api/receiving/session/${inbDoc.id}/start`, worker, {}, 201);
+    for (const it of inbDoc.items) {
+      await api('POST', '/api/receiving', worker, { invoiceItemId: it.id, acceptedQty: it.virtual_warehouse_id ? 10 : 3, cellBlockId: cells[2] }, 201);
+    }
+    const recv = (await decisions()).find((d) => d.kind === 'receiving');
+    assert.match(recv.title, /заявлено 15 шт\., принято 13 шт\./);
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_decision' && n.entityId === recv.id));
+    await api('POST', `/api/vwarehouses/decisions/${recv.id}`, owner, { confirm: true }, 403);
+    await api('POST', `/api/vwarehouses/decisions/${recv.id}`, seller, { chosen: [{ vw: ozon.id, qty: 8 }, { vw: null, qty: 6 }] }, 400);
+    const r0 = await qtyBy('good');
+    const recvDone = await api('POST', `/api/vwarehouses/decisions/${recv.id}`, seller, { chosen: [{ vw: ozon.id, qty: 8 }, { vw: null, qty: 5 }] });
+    assert.equal(recvDone.status, 'changed'); assert.equal(recvDone.transfers.length, 1);
+    expectMoved(r0, await qtyBy('good'), recv.parts, (x) => (x.vw ? 8 : 5));
+    await api('POST', `/api/vwarehouses/decisions/${recv.id}`, seller, { confirm: true }, 409);
+
+    // Пересчёт: не хватило 2 шт. — по правилу списано, продавец решает иначе.
+    const task2 = await run(async (c) => {
+      const r = await c.query('INSERT INTO inventory_runs(warehouse_id) VALUES($1) RETURNING id', [warehouseId]);
+      return (await c.query(`INSERT INTO inventory_tasks(run_id,warehouse_id,cell_block_id,reason) VALUES($1,$2,$3,'тест') RETURNING id`,
+        [r.rows[0].id, warehouseId, cells[0]])).rows[0].id;
+    });
+    const opened2 = await api('POST', `/api/inventory/tasks/${task2}/open`, worker);
+    const inCell = (await db(`SELECT SUM(qty)::int AS n FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2 AND quality = 'good'`, [cells[0], company])).rows[0].n;
+    await api('POST', `/api/inventory/tasks/${task2}/count`, worker, {
+      lines: [{ sku: 'R-1', companyId: company, quality: 'good', qty: inCell - 2 }], snapshotId: opened2.snapshotId }, 200);
+    await api('POST', `/api/inventory/tasks/${task2}/resolve`, owner, { decision: 'apply' });
+    const invDec = (await decisions()).find((d) => d.kind === 'inventory');
+    assert.match(invDec.title, /не хватило 2 шт\./);
+    // «Опт» в конце убирают — его не трогаем, чтобы проверка не зависела от порядка строк.
+    const spare = invDec.parts.find((x) => x.value === x.before && x.before >= 2 && x.name !== 'Опт');
+    const invChosen = (x) => (x === spare ? x.before - 2 : x.before);
+    const i0 = await qtyBy('good');
+    const invDone = await api('POST', `/api/vwarehouses/decisions/${invDec.id}`, seller, { chosen: invDec.parts.map((x) => ({ vw: x.vw, qty: invChosen(x) })) });
+    assert.equal(invDone.status, 'changed');
+    expectMoved(i0, await qtyBy('good'), invDec.parts, invChosen);
+
+    // Брак с полки, где товар разных складов: склад не назвал, чей брак.
+    const beforeBad = await db(`SELECT virtual_warehouse_id AS vw, SUM(qty)::int AS n FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2
+      AND quality = 'good' AND qty > 0 GROUP BY 1`, [cells[0], company]);
+    assert.ok(beforeBad.rows.filter((r) => r.n >= 2).length >= 2);
+    await api('POST', '/api/defects/moves', worker, { companyId: company, sku: 'R-1', fromCellBlockId: cells[0], toCellBlockId: cells[3],
+      qty: 2, bucket: 'defective', source: 'move' }, 201);
+    const defDec = (await decisions()).find((d) => d.kind === 'defect');
+    const target = defDec.parts.find((x) => x.before >= 2 && x.value < 2 && x.name !== 'Опт');
+    const defChosen = (x) => (x === target ? 2 : 0);
+    const g0 = await qtyBy('good'); const b0 = await qtyBy('defective');
+    await api('POST', `/api/vwarehouses/decisions/${defDec.id}`, seller, { chosen: defDec.parts.map((x) => ({ vw: x.vw, qty: defChosen(x) })) });
+    expectMoved(g0, await qtyBy('good'), defDec.parts, defChosen, -1);
+    expectMoved(b0, await qtyBy('defective'), defDec.parts, defChosen);
+    assert.equal((await decisions()).length, 0);
+    await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: true } });
+    check('галочка «запретить решать без меня»: расхождение приёмки, недостача пересчёта и брак ждут продавца; его решение переносит разницу; склад строки привоза не меняет');
 
     // ---- Убрать склад можно только пустой ----
     await api('DELETE', `/api/vwarehouses/${ozon.id}?companyId=${company}`, owner, undefined, 409);
-    const t3 = await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 10, fromVw: opt.id, toVw: null }, 201);
+    const t3 = await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: (await vwQty())['Опт'], fromVw: opt.id, toVw: null }, 201);
     assert.equal(t3.status, 'done');
     await api('DELETE', `/api/vwarehouses/${opt.id}?companyId=${company}`, owner);
     assert.ok(!(await api('GET', '/api/vwarehouses', seller)).warehouses.some((w) => w.id === opt.id));

@@ -109,6 +109,27 @@ router.post('/transfers/:id/decide', requireAuth, requireRole('seller', 'owner',
   } catch (err) { next(err); }
 });
 
+// Спорные ситуации с количеством, которые ждут продавца (он запретил складу
+// решать без него): список — продавцу и складу, решает только продавец.
+router.get('/decisions', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = companyOf(req);
+    const out = await inSeller(req, (c) => vw.listDecisions(c, companyId, { open: req.query.open === '1' }));
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+
+router.post('/decisions/:id', requireAuth, requireRole('seller'), async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const out = await inWarehouse(req, async (c) => vw.resolveDecision(c, {
+      warehouseId: req.auth.warehouseId, decisionId: req.params.id, chosen: b.chosen, confirm: b.confirm === true,
+      actor: await actorOf(c, req.auth),
+    }));
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 // Склад у строк документа до начала работы — руководитель и менеджер.
 router.post('/items', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
