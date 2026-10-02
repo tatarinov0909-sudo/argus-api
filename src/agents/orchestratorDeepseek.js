@@ -27,11 +27,11 @@ const TOOLS = ALL_TOOLS.map((t) => ({
 function taskLabel(name, args) {
   switch (name) {
     case 'find_products': return parseCellAddress(args.query) ? `посмотреть ячейку ${args.query}` : `найти «${args.query}»`;
-    case 'suggest_cell': return `подобрать ячейку для «${args.sku}»`;
+    case 'supplies': return args.number ? `посмотреть поставку ${args.number}` : 'посмотреть поставки';
+    case 'work_now': return 'посмотреть, что на складе сейчас';
     case 'invoice_details': return `посмотреть накладную «${args.number}»`;
     case 'warehouse_summary': return 'проверить состояние склада';
     case 'list_discrepancies': return 'собрать расхождения';
-    case 'pick_list': return 'собрать лист грузчика';
     case 'list_invoices': {
       const kind = { in: 'приёмки', out: 'отгрузки', return: 'возвраты' }[args.direction];
       return kind ? `посмотреть ${kind}` : 'посмотреть накладные';

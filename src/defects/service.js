@@ -348,7 +348,34 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
   return { id: d.id, number: d.number, action: d.action, qty, took, toSku };
 }
 
+// Сколько брака у каждого продавца ещё никто не решил и с какого времени
+// (самый давний документ брака). olderThanDays — только брак, лежащий дольше
+// (напоминание руководителю через неделю).
+async function waitingBySeller(client, warehouseId, { olderThanDays = 0 } = {}) {
+  const r = await client.query(
+    `WITH stock AS (
+       SELECT cs.company_id, cs.sku, cs.quality::text AS bucket, SUM(cs.qty) AS qty
+         FROM cell_stock cs WHERE cs.warehouse_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
+        GROUP BY cs.company_id, cs.sku, cs.quality),
+     pending AS (
+       SELECT company_id, sku, bucket, SUM(qty) AS qty FROM defect_decisions
+        WHERE warehouse_id = $1 AND status = 'pending' GROUP BY company_id, sku, bucket),
+     waiting AS (
+       SELECT s.company_id, GREATEST(s.qty - COALESCE(p.qty, 0), 0) AS qty,
+              (SELECT MIN(m.created_at) FROM defect_moves m
+                WHERE m.company_id = s.company_id AND m.sku = s.sku AND m.bucket = s.bucket) AS since
+         FROM stock s LEFT JOIN pending p ON p.company_id = s.company_id AND p.sku = s.sku AND p.bucket = s.bucket)
+     SELECT w.company_id, c.name, SUM(w.qty)::int AS qty, MIN(w.since) AS since
+       FROM waiting w JOIN companies c ON c.id = w.company_id AND c.archived_at IS NULL
+      WHERE w.qty > 0 AND ($2::int = 0 OR w.since < now() - ($2 || ' days')::interval)
+      GROUP BY w.company_id, c.name
+      ORDER BY MIN(w.since) NULLS LAST`,
+    [warehouseId, olderThanDays],
+  );
+  return r.rows.map((x) => ({ companyId: x.company_id, seller: x.name, qty: x.qty, since: x.since }));
+}
+
 module.exports = {
   BUCKETS, ACTIONS, SOURCES, requireBucket, cleanNote, createMove, markFromShelf, suggestCells,
-  balances, decide, tasks, execute, cellLabel, defectCells,
+  balances, decide, tasks, execute, cellLabel, defectCells, waitingBySeller,
 };

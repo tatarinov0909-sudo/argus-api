@@ -570,24 +570,178 @@ async function listDiscrepancies(client, warehouseId, { limit = 15 } = {}) {
   }));
 }
 
-// «Что собирать» — тот же лист грузчика, что и у работника на экране, только
-// пересказанный словами. Живёт в shipping/pickList.js: одно правило на оба
-// входа, чтобы агент не отвечал по одной логике, а экран показывал другую.
-async function pickList(client, warehouseId) {
-  const { buildPickList } = require('../shipping/pickList');
-  const list = await buildPickList(client, warehouseId, []);
+// ---------------------------------------------------------------------------
+// Поставки и «что на складе сейчас» (разбор Кладовщика 02.10.2026, вариант
+// владельца «а»): четыре новых умения в двух инструментах, чтобы вопрос не
+// подорожал. Считают те же функции, что экраны: список и состав поставки —
+// supplies/service.js, ход сборки и приёмки — work/sessions.js, склад брака —
+// defects/service.js. Свой SQL здесь только там, где готового нет.
+// ---------------------------------------------------------------------------
+
+const ASSEMBLY_MODE = { app: 'в приложении', paper: 'по бумажному листу' };
+
+// Кто ведёт работу по документу и где она сейчас.
+function workView(st, unit) {
+  if (!st) return {};
+  const a = st.assembly;
+  const live = a && (a.status === 'active' || a.status === 'paused');
   return {
-    orders: list.orders,
-    totalUnits: list.totalUnits,
-    cellsToVisit: list.cellsToVisit,
-    lines: list.lines.map((l) => ({
-      sku: l.sku,
-      name: l.name,
-      needQty: l.needQty,
-      shortfall: l.shortfall,
-      cells: l.cells.map((c) => ({ cell: c.label, take: c.take })),
-      forOrders: l.perOrder.map((o) => ({ order: o.invoiceNumber, qty: o.qty })),
+    ...(live ? {
+      who: a.workerName,
+      status: a.status === 'paused' ? 'на паузе' : 'идёт',
+      ...(a.status === 'paused' && a.pauseReason ? { pauseReason: a.pauseReason } : {}),
+      ...(a.mode && ASSEMBLY_MODE[a.mode] && unit === 'шт.' ? { how: ASSEMBLY_MODE[a.mode] } : {}),
+      workedMinutes: Math.round(a.workMs / 60000),
+    } : {}),
+    ...(st.total ? { done: `${st.taken} из ${st.total} ${unit}` } : {}),
+    ...(st.lastComment ? { comment: st.lastComment.text } : {}),
+  };
+}
+
+// «Что с поставкой ПС-…», «что сейчас собирают», «что готово к отгрузке».
+async function suppliesInfo(client, warehouseId, number) {
+  const supplies = require('../supplies/service');
+  const assembly = require('../shipping/assembly');
+  const wanted = String(number || '').trim();
+  if (wanted) {
+    const row = (await client.query(
+      'SELECT id FROM supplies WHERE warehouse_id = $1 AND upper(number) = upper($2) LIMIT 1',
+      [warehouseId, wanted])).rows[0];
+    if (!row) return null;
+    const c = await supplies.contents(client, warehouseId, row.id, { showShortages: true });
+    const st = (await assembly.statesFor(client, warehouseId, [row.id])).get(row.id);
+    const s = c.supply;
+    return {
+      number: s.number,
+      seller: s.companyName,
+      status: s.statusName,
+      destination: s.destination || null,
+      shipDate: s.shipDate || null,
+      orders: c.totals.orders,
+      units: c.totals.units,
+      assembly: workView(st, 'шт.'),
+      // Что ещё взять со склада — по обходу, из каких ячеек и сколько.
+      toTake: c.picking.map((p) => ({
+        sku: p.sku,
+        name: p.name,
+        left: p.qty,
+        cells: p.cells.filter((x) => x.take > 0).map((x) => ({ cell: x.label, take: x.take })),
+        ...(p.available < p.qty ? { notInCells: p.qty - p.available } : {}),
+      })),
+      // «Нет товара» от грузчика, руководитель ещё не решил.
+      notFound: c.shortages.map((x) => x.text),
+    };
+  }
+  const rows = await supplies.list(client, warehouseId, { showShortages: true, recentOnly: true });
+  const order = { collecting: 0, ready: 1, shipped: 2 };
+  rows.sort((a, b) => order[a.status] - order[b.status] || new Date(b.created_at) - new Date(a.created_at));
+  const shown = rows.filter((r) => r.status !== 'shipped').concat(rows.filter((r) => r.status === 'shipped').slice(0, 5)).slice(0, 25);
+  const states = await assembly.statesFor(client, warehouseId, shown.filter((r) => r.status === 'collecting').map((r) => r.id));
+  return {
+    collecting: rows.filter((r) => r.status === 'collecting').length,
+    ready: rows.filter((r) => r.status === 'ready').length,
+    shippedLast2Weeks: rows.filter((r) => r.status === 'shipped').length,
+    supplies: shown.map((r) => ({
+      number: r.number,
+      seller: r.company_name,
+      status: r.statusName,
+      destination: r.destination || null,
+      shipDate: r.ship_date || null,
+      orders: r.orders,
+      ordersPicked: r.picked,
+      ...(r.missing ? { notFoundMarks: r.missing } : {}),
+      ...(r.stockShort ? { ordersWithoutStock: r.stockShort } : {}),
+      ...(r.status === 'collecting' ? { assembly: workView(states.get(r.id), 'шт.') } : {}),
+      ...(r.status === 'ready' && r.ready_at ? { readyAt: r.ready_at } : {}),
+      ...(r.status === 'shipped' && r.shipped_at ? { shippedAt: r.shipped_at } : {}),
     })),
+  };
+}
+
+// «Кто что делает», «что привезут сегодня», «сколько брака ждёт решения».
+async function workNow(client, warehouseId) {
+  const assembly = require('../shipping/assembly');
+  const receiving = require('../receiving/session');
+  const defects = require('../defects/service');
+  const { zoneOf, todayIn } = require('../warehouses/time');
+  const today = todayIn(await zoneOf(client, warehouseId));
+
+  // Люди: живые заходы — идёт или на паузе.
+  const live = (await client.query(
+    `SELECT w.kind, w.supply_id, w.invoice_id, s.number AS supply_number, i.number AS invoice_number
+       FROM work_sessions w
+       LEFT JOIN supplies s ON s.id = w.supply_id
+       LEFT JOIN invoices i ON i.id = w.invoice_id
+      WHERE w.warehouse_id = $1 AND w.status IN ('active', 'paused')
+      ORDER BY w.started_at`, [warehouseId])).rows;
+
+  // Привозы: открытые приходы, кроме «заказов поставщику» из 1С — это заказ,
+  // а не машина (как в списке грузчика).
+  const arrivals = (await client.query(
+    `SELECT i.id, i.number, c.name AS seller, i.source_document_type, i.external_id, i.status,
+            left(i.source_document_date::text, 10) AS planned_date,
+            to_char(i.planned_from, 'HH24:MI') AS slot_from, to_char(i.planned_to, 'HH24:MI') AS slot_to,
+            i.carrier, i.vehicle, i.boxes, i.pallets, i.arrived_at
+       FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+      WHERE i.warehouse_id = $1 AND i.direction = 'in' AND i.status IN ('open', 'in_progress')
+        AND i.source_document_type IS DISTINCT FROM 'supplier_order'
+      ORDER BY (i.arrived_at IS NULL), i.source_document_date NULLS LAST, i.created_at
+      LIMIT 20`, [warehouseId])).rows;
+
+  const asm = await assembly.statesFor(client, warehouseId, live.filter((r) => r.kind === 'assembly').map((r) => r.supply_id));
+  const rec = await receiving.statesFor(client, warehouseId,
+    live.filter((r) => r.kind === 'receiving').map((r) => r.invoice_id).concat(arrivals.map((a) => a.id)));
+
+  const day = (d) => d.split('-').reverse().slice(0, 2).join('.');
+  const arrivalState = (a, work) => {
+    if (work.who) return 'принимается';
+    if (a.status === 'in_progress') return 'приёмка начата';
+    if (a.arrived_at) return 'машина приехала, приёмку не начали';
+    if (!a.planned_date) return 'ждёт приёмки';
+    if (a.planned_date < today) return `ждали ${day(a.planned_date)}, машина не приехала`;
+    if (a.planned_date === today) return 'ждём сегодня';
+    return `ждём ${day(a.planned_date)}`;
+  };
+
+  const tasks = (await client.query(
+    `SELECT action, count(*)::int AS n, SUM(qty)::int AS units FROM defect_decisions
+      WHERE warehouse_id = $1 AND status = 'pending' GROUP BY action ORDER BY action`, [warehouseId])).rows;
+  const TASK = { return_to_seller: 'выдать продавцу', dispose: 'утилизировать', repack: 'перепаковать', markdown: 'переклеить на уценку' };
+
+  return {
+    today,
+    people: live.map((r) => {
+      const st = r.kind === 'assembly' ? asm.get(r.supply_id) : rec.get(r.invoice_id);
+      return {
+        doing: r.kind === 'assembly' ? `сборка поставки ${r.supply_number}` : `приёмка прихода ${r.invoice_number}`,
+        ...workView(st, r.kind === 'assembly' ? 'шт.' : 'позиций'),
+      };
+    }),
+    arrivals: arrivals.map((a) => {
+      const work = workView(rec.get(a.id), 'позиций');
+      return {
+        number: a.number,
+        seller: a.seller,
+        from: a.source_document_type === 'seller_inbound' ? 'привоз продавца' : a.external_id ? 'приход из 1С' : 'заведён вручную',
+        state: arrivalState(a, work),
+        ...(a.planned_date ? { plannedDate: a.planned_date } : {}),
+        ...(a.slot_from || a.slot_to ? { unloadWindow: [a.slot_from, a.slot_to].filter(Boolean).join('–') } : {}),
+        ...(a.carrier ? { carrier: a.carrier } : {}),
+        ...(a.vehicle ? { vehicle: a.vehicle } : {}),
+        ...(a.boxes ? { boxes: a.boxes } : {}),
+        ...(a.pallets ? { pallets: a.pallets } : {}),
+        ...(a.arrived_at ? { arrivedAt: a.arrived_at } : {}),
+        ...(work.who ? { receiving: work } : work.done ? { done: work.done } : {}),
+      };
+    }),
+    // Склад брака: сколько брака у каждого продавца ещё никто не решил и
+    // какие решения ждут грузчика.
+    defect: {
+      waitingDecision: (await defects.waitingBySeller(client, warehouseId)).map((w) => ({
+        seller: w.seller, qty: w.qty, since: w.since,
+      })),
+      tasks: tasks.map((t) => ({ action: TASK[t.action] || t.action, count: t.n, units: t.units })),
+    },
   };
 }
 
@@ -606,8 +760,6 @@ function runTool(client, warehouseId, name, args = {}) {
   switch (name) {
     case 'find_products':
       return findProducts(client, warehouseId, String(args.query || ''));
-    case 'suggest_cell':
-      return suggestCells(client, warehouseId, String(args.sku || ''));
     case 'list_invoices':
       return listInvoices(client, warehouseId, {
         direction: oneOf(DIRECTIONS, args.direction), status: oneOf(STATUSES, args.status),
@@ -616,8 +768,10 @@ function runTool(client, warehouseId, name, args = {}) {
       return invoiceDetails(client, warehouseId, String(args.number || ''));
     case 'warehouse_summary':
       return warehouseSummary(client, warehouseId);
-    case 'pick_list':
-      return pickList(client, warehouseId);
+    case 'supplies':
+      return suppliesInfo(client, warehouseId, args.number);
+    case 'work_now':
+      return workNow(client, warehouseId);
     case 'list_discrepancies':
       return listDiscrepancies(client, warehouseId, {});
     default:
@@ -628,5 +782,5 @@ function runTool(client, warehouseId, name, args = {}) {
 module.exports = {
   parseCellAddress, cellContents,
   findProducts, suggestCells, listInvoices, invoiceDetails, warehouseSummary, workQueue,
-  listDiscrepancies, pickList, runTool, recordSuggestion, recordSuggestionOutcome,
+  listDiscrepancies, suppliesInfo, workNow, runTool, recordSuggestion, recordSuggestionOutcome,
 };

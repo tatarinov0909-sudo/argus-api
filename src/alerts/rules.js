@@ -234,30 +234,13 @@ async function noFreeCells(client, warehouseId) {
 // по каждому продавцу — сколько штук ещё никто не решил и с какого времени.
 // Руководитель может позвонить продавцу и решить за него в его кабинете.
 async function defectWaiting(client, warehouseId) {
-  const r = await client.query(
-    `WITH stock AS (
-       SELECT cs.company_id, cs.sku, cs.quality::text AS bucket, SUM(cs.qty) AS qty
-         FROM cell_stock cs WHERE cs.warehouse_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
-        GROUP BY cs.company_id, cs.sku, cs.quality),
-     pending AS (
-       SELECT company_id, sku, bucket, SUM(qty) AS qty FROM defect_decisions
-        WHERE warehouse_id = $1 AND status = 'pending' GROUP BY company_id, sku, bucket),
-     waiting AS (
-       SELECT s.company_id, GREATEST(s.qty - COALESCE(p.qty, 0), 0) AS qty,
-              (SELECT MIN(m.created_at) FROM defect_moves m
-                WHERE m.company_id = s.company_id AND m.sku = s.sku AND m.bucket = s.bucket) AS since
-         FROM stock s LEFT JOIN pending p ON p.company_id = s.company_id AND p.sku = s.sku AND p.bucket = s.bucket)
-     SELECT w.company_id, c.name, SUM(w.qty)::int AS qty, MIN(w.since) AS since
-       FROM waiting w JOIN companies c ON c.id = w.company_id AND c.archived_at IS NULL
-      WHERE w.qty > 0 AND w.since < now() - ($2 || ' days')::interval
-      GROUP BY w.company_id, c.name`,
-    [warehouseId, THRESHOLDS.defectWaitingDays],
-  );
-  return r.rows.map((row) => {
+  const { waitingBySeller } = require('../defects/service');
+  const rows = await waitingBySeller(client, warehouseId, { olderThanDays: THRESHOLDS.defectWaitingDays });
+  return rows.map((row) => {
     const d = Math.floor(hoursAgo(row.since) / 24);
     return {
-      key: `defect_waiting:${row.company_id}`,
-      text: `Брак продавца «${row.name}» ждёт решения уже ${d} ${plural(d, 'день', 'дня', 'дней')}: `
+      key: `defect_waiting:${row.companyId}`,
+      text: `Брак продавца «${row.seller}» ждёт решения уже ${d} ${plural(d, 'день', 'дня', 'дней')}: `
         + `${row.qty} шт. на складе брака. Позвоните продавцу — решить за него можно в его кабинете, вкладка «Склад брака».`,
     };
   });
