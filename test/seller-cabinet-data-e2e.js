@@ -78,10 +78,10 @@ const { withTenantContext } = require('../src/db/pool');
 
     const defects = must(await api('GET', '/api/sellers/defects', seller));
     check('брак: сколько лежит сейчас и откуда он с описанием', () => {
-      assert.deepEqual(defects.now.map((r) => [r.sku, r.defective]), [['PB-1', 1]]);
-      assert.equal(defects.events[0].note, 'Раздавлена упаковка');
-      assert.equal(defects.events[0].source, 'Возврат');
-      assert.equal(defects.events[0].document, 'ВЗ-1');
+      assert.deepEqual(defects.balances.map((r) => [r.sku, r.bucket, r.qty, r.undecided]), [['PB-1', 'defective', 1, 1]]);
+      assert.equal(defects.moves[0].note, 'Раздавлена упаковка');
+      assert.equal(defects.moves[0].sourceName, 'возврат');
+      assert.equal(defects.moves[0].document, 'ВЗ-1');
     });
 
     // Заказ уехал поставкой — «в пути», пока WB его не принял.

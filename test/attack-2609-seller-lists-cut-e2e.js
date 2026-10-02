@@ -48,10 +48,10 @@ function check(name, fn) {
         cellBlockId: cells[1].id, defectNote: `царапина ${i + 1}` });
     }
     const d = await ok('GET', '/api/sellers/defects', seller);
-    const nowQty = d.now.reduce((s, r) => s + r.defective + r.packaging, 0);
-    console.log('  брака сейчас:', nowQty, '; случаев отдано:', d.events.length, '; признак неполного списка:', d.hasMore);
+    const nowQty = d.balances.reduce((s, r) => s + r.qty, 0);
+    console.log('  брака сейчас:', nowQty, '; случаев отдано:', d.moves.length, '; признак неполного списка:', d.hasMore);
     check('продавец видит все случаи брака или признак «показана часть»',
-      () => assert.ok(d.events.length === 501 || d.hasMore === true, `отдано ${d.events.length}, признака нет`));
+      () => assert.ok(d.moves.length === 501 || d.hasMore === true, `отдано ${d.moves.length}, признака нет`));
   } catch (err) { failed += 1; console.error('  FAIL  исключение:', err); }
   finally { await stop(); }
   if (failed) { console.log(`FAIL ${failed}`); process.exitCode = 1; }

@@ -1,3 +1,4 @@
+const defects = require('../defects/service');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const outbox = require('../sync/outbox');
@@ -538,6 +539,17 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
           quality: line.quality, taskId, countedByStaffKeyId: task.worker_key_id,
           resolvedByOwnerId: ownerId || null, resolvedByStaffKeyId: staffKeyId || null }), task.worker_key_id],
     );
+  }
+
+  // Брака на полке оказалось больше, чем числилось, — разница на склад брака
+  // продавца документом (владелец 02.10.2026). Товар без продавца (чей —
+  // неизвестно) на склад брака не попадает: решать по нему некому.
+  for (const line of changes) {
+    if (!line.companyId || !line.quality || line.quality === 'good' || !(line.diff > 0)) continue;
+    await defects.createMove(client, {
+      warehouseId, companyId: line.companyId, sku: line.sku, qty: line.diff, bucket: line.quality,
+      source: 'inventory', cellBlockId: task.cell_block_id, staffKeyId: task.worker_key_id || null,
+    });
   }
 
   await client.query(

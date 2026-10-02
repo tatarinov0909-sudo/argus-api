@@ -150,8 +150,12 @@ async function cellOperations(client, warehouseId, cellBlockId) {
         AND op.created_at > now() - interval '${CELL_HISTORY}'
         AND ((op.kind IN ('initial_load', 'kit_assemble') AND op.to_cell_block_id = $2)
           OR (op.kind = 'initial_load_undo' AND op.from_cell_block_id = $2)
-          OR (op.kind IN ('move', 'repack') AND op.from_cell_block_id = $2
-              AND op.to_cell_block_id IS DISTINCT FROM $2))
+          OR (op.kind IN ('move', 'repack', 'defect_in') AND op.from_cell_block_id = $2
+              AND op.to_cell_block_id IS DISTINCT FROM $2)
+          -- Склад брака (02.10.2026): решение выполнено — брак взят из этой
+          -- ячейки (журнал пишет одну ячейку, а брать могли из нескольких).
+          OR (op.kind IN ('defect_return_to_seller', 'defect_dispose', 'defect_repack', 'defect_markdown')
+              AND op.from_cell_block_id = $2))
       ORDER BY op.created_at DESC LIMIT 200`,
     [warehouseId, cellBlockId],
   );
@@ -217,6 +221,11 @@ async function cellOperations(client, warehouseId, cellBlockId) {
       kit_assemble: `Собран набор ${what} — ${qty(op.qty)}.`,
       move: `Переложено ${qty(op.qty)} ${what} в ячейку ${op.to_label || '—'}.`,
       repack: `Перепаковано ${qty(op.qty)} ${what}, положено в ячейку ${op.to_label || '—'}.`,
+      defect_in: `Отмечено браком ${qty(op.qty)} ${what}, брак положен в ячейку ${op.to_label || '—'}.`,
+      defect_return_to_seller: `Склад брака: ${qty(op.qty)} ${what} взято отсюда — выдано продавцу.`,
+      defect_dispose: `Склад брака: ${qty(op.qty)} ${what} взято отсюда — утилизировано.`,
+      defect_repack: `Склад брака: ${qty(op.qty)} ${what} перепаковано и положено в продажу в ячейку ${op.to_label || '—'}.`,
+      defect_markdown: `Склад брака: ${qty(op.qty)} ${what} переклеено на уценку, положено в ячейку ${op.to_label || '—'}.`,
     }[op.kind];
     return {
       id: `op-${op.id}`,

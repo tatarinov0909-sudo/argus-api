@@ -6,7 +6,7 @@
 // состояние «брак» — src/cells/initialStock.js), в «случаи» не попадает.
 // Продавец видит «Брак 5 шт.» и тут же «Склад ещё не признавал ваш товар
 // браком» (seller-cabinet.js, renderDefects) — откуда брак, узнать не из чего.
-const { startApp, warehouse, assert } = require('../attack-helpers');
+const { startApp, warehouse, assert } = require('./attack-helpers');
 
 let failed = 0;
 function check(name, fn) {
@@ -30,9 +30,9 @@ function check(name, fn) {
     console.log('  загрузка остатков:', done.applied, JSON.stringify(done.summary));
 
     const d = await ok('GET', '/api/sellers/defects', seller);
-    const nowQty = d.now.reduce((s, r) => s + r.defective + r.packaging, 0);
-    const eventsQty = d.events.filter((e) => e.sku === 'DF-1').reduce((s, e) => s + e.qty, 0);
-    console.log('  «Сейчас на складе»:', JSON.stringify(d.now), '; «Когда признан браком»:', JSON.stringify(d.events));
+    const nowQty = d.balances.reduce((s, r) => s + r.qty, 0);
+    const eventsQty = d.moves.filter((e) => e.sku === 'DF-1').reduce((s, e) => s + e.qty, 0);
+    console.log('  «Сейчас на складе»:', JSON.stringify(d.balances), '; «Как брак попал на склад»:', JSON.stringify(d.moves));
     check('у брака, который лежит на складе, есть «случай» — откуда он взялся',
       () => assert.ok(eventsQty >= nowQty, `сейчас брака ${nowQty} шт., в случаях ${eventsQty} шт.`));
   } catch (err) { failed += 1; console.error('  FAIL  исключение:', err); }

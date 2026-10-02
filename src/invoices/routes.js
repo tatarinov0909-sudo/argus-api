@@ -56,7 +56,7 @@ router.get('/', requireAuth, async (req, res, next) => {
            -- Работнику: закрытые на площадке не нужны, а заказы площадки —
            -- только отправленные на сборку, то есть в поставке.
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
-           AND (NOT $2::boolean OR i.source = '1c' OR i.supply_id IS NOT NULL)
+           AND (NOT $2::boolean OR i.direction <> 'out' OR i.source = '1c' OR i.supply_id IS NOT NULL)
            -- «Заказ поставщику» из 1С — это заказ, а не привоз: грузчику его
            -- принимать нечего (решение владельца 27.09.2026). В кабинете он
            -- остаётся — под фильтром «Откуда: из 1С».
@@ -206,11 +206,11 @@ router.get('/:id', requireAuth, async (req, res, next) => {
                                    'qty', l.qty, 'cellBlockId', l.cell_block_id,
                                    'rowNum', pwr.row_num, 'rackStart', pcb.rack_start, 'rackEnd', pcb.rack_end,
                                    'tierStart', pcb.tier_start, 'tierEnd', pcb.tier_end,
-                                   'placedAt', l.placed_at) ORDER BY l.first_step)
-                            FROM (SELECT rp.cell_block_id, SUM(rp.qty) AS qty, MIN(rp.step) AS first_step,
+                                   'placedAt', l.placed_at, 'quality', l.quality) ORDER BY l.first_step)
+                            FROM (SELECT rp.cell_block_id, rp.quality, SUM(rp.qty) AS qty, MIN(rp.step) AS first_step,
                                          MIN(rp.placed_at) AS placed_at
                                     FROM receiving_placements rp WHERE rp.receiving_record_id = rr.id
-                                   GROUP BY rp.cell_block_id HAVING SUM(rp.qty) > 0) l
+                                   GROUP BY rp.cell_block_id, rp.quality HAVING SUM(rp.qty) > 0) l
                             LEFT JOIN cell_blocks pcb ON pcb.id = l.cell_block_id
                             LEFT JOIN warehouse_rows pwr ON pwr.id = pcb.warehouse_row_id), '[]') AS placements,
                 -- Сколько принятого разложено: меньше принятого — позиция не

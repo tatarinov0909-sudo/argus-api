@@ -9,6 +9,7 @@ const { LIMITS, normalizeName } = require('../warehouses/naming');
 const { moveStock } = require('./move');
 const initialStock = require('./initialStock');
 const stockAlign = require('./stockAlign');
+const defects = require('../defects/service');
 const journal = require('../journal/repository');
 const { blockContents } = require('./contents');
 const { cellFills } = require('./fill');
@@ -50,7 +51,7 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
         // выражению с ним несовместима, и остаток в карточке стал выводиться
         // в произвольном порядке.
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
-                cb.state, cb.fill_pct, cb.label,
+                cb.state, cb.fill_pct, cb.label, cb.defect_zone,
                 COALESCE((
                   SELECT json_agg(json_build_object(
                     'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
@@ -558,10 +559,11 @@ const QUALITY_LABEL = {
   packaging_defect: 'брак упаковки',
 };
 
-// Переставить товар в другую ячейку и/или сменить его состояние.
-// Главный случай — перепаковка: «брак упаковки» после перепаковки становится
-// годным и возвращается в продажу. Работник, а не владелец: это физическое
-// действие на складе, как приёмка и отбор.
+// Переставить товар в другую ячейку и/или отметить годное браком. Брак
+// обратно в продажу (перепаковка, уценка) — только решением продавца и
+// заданием «Склад брака» (владелец 02.10.2026): иначе брак уходил со склада
+// брака мимо продавца, и его решение потом не на чем было выполнить.
+// Работник, а не владелец: это физическое действие на складе.
 router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
@@ -574,6 +576,9 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
         throw new HttpError(400, 'Состояние может быть good, defective или packaging_defect');
       }
     }
+    if (fromQuality !== 'good' && toQuality && toQuality !== fromQuality) {
+      throw new HttpError(409, 'Брак меняют только по решению продавца — задание придёт в «Склад брака»');
+    }
 
     const moved = await withTenantContext({ warehouseId }, async (client) => {
       const result = await moveStock(client, warehouseId, {
@@ -581,6 +586,14 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
         workerKeyId: req.auth.staffKeyId || null,
       });
 
+      // Годное стало браком — это перемещение на склад брака продавца.
+      if (result.fromQuality === 'good' && result.toQuality !== 'good') {
+        if (!companyId) throw new HttpError(400, 'Укажите продавца товара, который отмечаете браком');
+        await defects.createMove(client, {
+          warehouseId, companyId, sku: result.sku, qty: result.qty, bucket: result.toQuality,
+          source: 'move', cellBlockId: result.toCellBlockId, staffKeyId,
+        });
+      }
       const changedState = result.toQuality !== result.fromQuality;
       const changedCell = result.toCellBlockId !== result.fromCellBlockId;
       const parts = [];

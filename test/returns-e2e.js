@@ -158,16 +158,23 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(midInvoice.body.items[0].buckets.length, 1);
     });
 
+    const noCell = await api('POST', '/api/returns', {
+      token: workerToken,
+      body: { invoiceItemId: itemId, qty: 2, qualityBucket: 'defective', defectNote: 'Раздавлена коробка, потёк сироп' },
+    });
+    check('defective bucket needs a cell (defect warehouse)', () => {
+      assert.equal(noCell.status, 400, JSON.stringify(noCell.body));
+    });
     const defectivePick = await api('POST', '/api/returns', {
       token: workerToken,
       body: {
-        invoiceItemId: itemId, qty: 2, qualityBucket: 'defective',
+        invoiceItemId: itemId, qty: 2, qualityBucket: 'defective', cellBlockId: cell.id,
         defectNote: 'Раздавлена коробка, потёк сироп',
       },
     });
-    check('defective bucket accepted without a cell', () => {
+    check('defective bucket goes to the defect warehouse document', () => {
       assert.equal(defectivePick.status, 201, JSON.stringify(defectivePick.body));
-      assert.equal(defectivePick.body.cell_block_id, null);
+      assert.ok(defectivePick.body.move && defectivePick.body.move.number);
     });
 
     // ---------- Описание дефекта ----------
@@ -192,7 +199,7 @@ async function api(method, path, { token, body } = {}) {
 
     const overshoot = await api('POST', '/api/returns', {
       token: workerToken,
-      body: { invoiceItemId: itemId, qty: 5, qualityBucket: 'packaging_defect' },
+      body: { invoiceItemId: itemId, qty: 5, qualityBucket: 'packaging_defect', cellBlockId: cell.id },
     });
     check('cannot sort more than declared across all buckets', () => {
       assert.equal(overshoot.status, 409, JSON.stringify(overshoot.body));
@@ -200,7 +207,7 @@ async function api(method, path, { token, body } = {}) {
 
     const packagingPick = await api('POST', '/api/returns', {
       token: workerToken,
-      body: { invoiceItemId: itemId, qty: 1, qualityBucket: 'packaging_defect' },
+      body: { invoiceItemId: itemId, qty: 1, qualityBucket: 'packaging_defect', cellBlockId: cell.id },
     });
     check('final bucket closes the line', () => {
       assert.equal(packagingPick.status, 201, JSON.stringify(packagingPick.body));
@@ -217,7 +224,9 @@ async function api(method, path, { token, body } = {}) {
 
     // ---------- Journal: three sorts, all auto (no discrepancy concept here) ----------
     const journal = await api('GET', '/api/journal', { token: ownerToken });
-    const returnEntries = journal.body.filter((e) => e.entity_id === itemId);
+    // Брак пишется документом склада брака — со ссылкой на тот же возврат.
+    const returnEntries = journal.body.filter((e) => e.entity_id === itemId
+      || (e.entity_type === 'defect_move' && e.invoice_id === ret.body.id));
     check('every bucket sort is journalled', () => {
       assert.equal(returnEntries.length, 3, `got ${returnEntries.length} entries`);
     });

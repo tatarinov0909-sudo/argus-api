@@ -113,7 +113,7 @@ function warehouseIdOf(token) {
     });
     await api('POST', '/api/returns', {
       token: workerToken,
-      body: { invoiceItemId: retItemId, qty: 2, qualityBucket: 'defective' },
+      body: { invoiceItemId: retItemId, qty: 2, qualityBucket: 'defective', cellBlockId: blocks[0].id },
     });
 
     const run = (fn) => withTenantContext({ warehouseId }, (client) => fn(client));
@@ -161,7 +161,7 @@ function warehouseIdOf(token) {
       assert.equal(summary.cellsTotal, 4, JSON.stringify(summary));
       assert.equal(summary.cellsOccupied, 1);
       assert.equal(summary.cellsFree, 3);
-      assert.equal(summary.totalUnits, 11, '8 принятых + 3 вернувшихся годных');
+      assert.equal(summary.totalUnits, 13, '8 принятых + 3 вернувшихся годных + 2 брака в ячейке брака');
       assert.equal(summary.distinctSkus, 1);
     });
     check('брак виден отдельно от годного', () => {
@@ -177,7 +177,8 @@ function warehouseIdOf(token) {
     const foundBySku = await run((c) => kladovshchik.findProducts(c, warehouseId, 'PB-LIME'));
     check('находит товар, лежащий в ячейке без карточки в справочнике', () => {
       assert.equal(foundBySku.length, 1, JSON.stringify(foundBySku));
-      assert.equal(foundBySku[0].totalQty, 11, '8 принятых + 3 годных из возврата');
+      assert.equal(foundBySku[0].totalQty, 13, '8 принятых + 3 годных из возврата + 2 брака');
+      assert.equal(foundBySku[0].availableQty, 11, 'годного: 8 принятых + 3 из возврата');
       assert.ok(foundBySku[0].locations.length > 0, 'должен назвать ячейку');
     });
 
@@ -249,10 +250,10 @@ function warehouseIdOf(token) {
     check('годное и брак в поиске разделены, а не свалены в одну цифру', () => {
       // 8 принятых + 3 годных из возврата = 11 к отгрузке; 2 брака лежат
       // на той же полке, но клиенту не уедут — и в ответе это видно.
-      assert.equal(foundBySku[0].totalQty, 11, JSON.stringify(foundBySku[0]));
+      assert.equal(foundBySku[0].totalQty, 13, JSON.stringify(foundBySku[0]));
       assert.equal(foundBySku[0].availableQty, 11);
-      assert.equal(foundBySku[0].notForSaleQty, 0, 'брак в этом тесте без ячейки');
-      assert.ok(foundBySku[0].locations.every((l) => l.state === 'годный'));
+      assert.equal(foundBySku[0].notForSaleQty, 2, 'брак лежит в ячейке брака');
+      assert.deepEqual(foundBySku[0].locations.map((l) => l.state).sort(), ['брак', 'годный']);
     });
 
     const nothing = await run((c) => kladovshchik.findProducts(c, warehouseId, 'ЧЕГО-ТО-НЕТ'));

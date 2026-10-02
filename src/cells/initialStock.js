@@ -31,6 +31,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('./fill');
 const { formatBlockLabel } = require('./label');
 const { plural } = require('../journal/plural');
+const defects = require('../defects/service');
 const journal = require('../journal/repository');
 const { zoneOf } = require('../warehouses/time');
 
@@ -368,6 +369,15 @@ async function apply(client, warehouseId, body, { ownerId, basis = 'count' }) {
     );
   }
   for (const id of cellIds) await refreshCellFill(client, id);
+  // Брак из загрузки — на склад брака продавца, документом на строку (без
+  // записи в журнал на каждую: загрузка пишет одну свою). Владелец 02.10:
+  // «при первом заходе загрузят брак, и дальше всё через Аргус».
+  for (const l of ok.filter((x) => x.quality !== 'good')) {
+    await defects.createMove(client, {
+      warehouseId, companyId: checked.seller.id, sku: l.sku, qty: l.qty, bucket: l.quality,
+      source: 'initial_load', cellBlockId: l.cellId, batch, silent: true,
+    });
+  }
 
   const s = checked.summary;
   // Одна запись на загрузку, а не на строку: журнал только дописывается,
@@ -499,8 +509,21 @@ async function undo(client, warehouseId, batch, { ownerId }) {
     throw new HttpError(409, 'По ячейкам этой загрузки назначен пересчёт — сначала закройте задание');
   }
 
+  // По браку из этой загрузки уже решили — снимать его нельзя: задание
+  // грузчику осталось бы без товара.
+  const decided = await client.query(
+    `SELECT 1 FROM defect_decisions d JOIN defect_moves m
+        ON m.company_id = d.company_id AND m.sku = d.sku AND m.bucket = d.bucket
+      WHERE m.warehouse_id = $1 AND m.batch = $2 AND d.status = 'pending' LIMIT 1`,
+    [warehouseId, batch],
+  );
+  if (decided.rows.length) {
+    throw new HttpError(409, 'По браку из этой загрузки продавец уже решил, а склад ещё не выполнил — сначала выполните задание');
+  }
+
   await client.query('DELETE FROM cell_stock WHERE warehouse_id = $1 AND id::text = ANY($2::text[])',
     [warehouseId, ids]);
+  await client.query('DELETE FROM defect_moves WHERE warehouse_id = $1 AND batch = $2', [warehouseId, batch]);
   for (const o of ops.rows) {
     await client.query(
       `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, from_cell_block_id, details)

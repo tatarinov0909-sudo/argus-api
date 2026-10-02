@@ -6,6 +6,7 @@ const { HttpError } = require('../middleware/errorHandler');
 const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const inbound = require('./inbound');
+const defectsService = require('../defects/service');
 
 const { loadStock, BUCKET_SQL } = require('./stock');
 const { readPage, loadHistory } = require('./history');
@@ -644,54 +645,86 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
   }
 });
 
-// Брак продавца (владелец 26.09.2026): что склад признал браком, откуда он
-// взялся и с каким описанием, и сколько брака лежит на складе сейчас. По этому
-// продавец связывается со складом и решает, что делать. Фото появятся, когда
-// склад начнёт их прикладывать (хранилище файлов — в «Отложено»).
+// Склад брака продавца (владелец 02.10.2026): что лежит на складе брака и
+// сколько ждёт решения, документы «Перемещение на склад брака» (откуда брак,
+// описание, есть ли фото), решения и их выполнение, и решения, которые склад
+// принял за продавца и которые продавец ещё не видел.
 router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
     const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
     if (!companyId) throw new HttpError(400, 'Укажите продавца');
     const out = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
       await requireActiveCompany(c, companyId);
-      const now = (await c.query(
-        `SELECT cs.sku, COALESCE(MAX(p.name), cs.sku) AS name,
-                SUM(cs.qty) FILTER (WHERE cs.quality = 'defective') AS defective,
-                SUM(cs.qty) FILTER (WHERE cs.quality = 'packaging_defect') AS packaging
-           FROM cell_stock cs
-           LEFT JOIN products p ON p.company_id = cs.company_id AND p.sku = cs.sku
-          WHERE cs.company_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
-          GROUP BY cs.sku ORDER BY 2`, [companyId])).rows;
-      const events = (await c.query(
-        `SELECT * FROM (
-           SELECT rr.id::text AS id, rr.finished_at AS at, ii.sku, ii.name, rr.qty, rr.quality_bucket::text AS bucket,
-                  rr.defect_note AS note, 'return' AS source, i.number AS document
-             FROM return_records rr
-             JOIN invoice_items ii ON ii.id = rr.invoice_item_id
-             JOIN invoices i ON i.id = ii.invoice_id
-            WHERE rr.company_id = $1 AND rr.quality_bucket <> 'good'
-           UNION ALL
-           SELECT op.id::text, op.created_at, op.sku, COALESCE(p.name, op.sku), op.qty,
-                  COALESCE(op.details->>'toQuality', op.details->>'quality'), NULL,
-                  op.kind, NULL
-             FROM stock_operations op
-             LEFT JOIN products p ON p.company_id = op.company_id AND p.sku = op.sku
-            WHERE op.company_id = $1
-              AND ((op.kind = 'repack' AND op.details->>'toQuality' IN ('defective', 'packaging_defect'))
-                OR (op.kind = 'inventory' AND op.details->>'quality' IN ('defective', 'packaging_defect')
-                    AND (op.details->>'countedQty')::numeric > (op.details->>'expectedQty')::numeric))
-         ) x ORDER BY at DESC LIMIT 1001`, [companyId])).rows;
-      return { now, events };
+      const balances = await defectsService.balances(c, companyId);
+      const moves = (await c.query(
+        `SELECT m.id, m.number, m.sku, m.name, m.qty, m.bucket, m.note, m.source, m.created_at,
+                m.photo IS NOT NULL AS has_photo, i.number AS document
+           FROM defect_moves m LEFT JOIN invoices i ON i.id = m.invoice_id
+          WHERE m.company_id = $1 ORDER BY m.created_at DESC, m.number DESC LIMIT 1001`, [companyId])).rows;
+      const decisions = (await c.query(
+        `SELECT id, number, sku, name, bucket, qty, action, markdown_barcode, note, decided_role, decided_name,
+                decided_at, seller_seen_at, status, done_at
+           FROM defect_decisions WHERE company_id = $1 ORDER BY decided_at DESC LIMIT 501`, [companyId])).rows;
+      return { balances, moves, decisions };
     });
-    const sourceName = { return: 'Возврат', repack: 'Перепаковка на складе', inventory: 'Пересчёт ячейки' };
+    const sourceName = defectsService.SOURCES;
     res.set('Cache-Control', 'no-store').json({
-      now: out.now.map((r) => ({ sku: r.sku, name: r.name, defective: Number(r.defective || 0), packaging: Number(r.packaging || 0) })),
-      hasMore: out.events.length > 1000,
-      events: out.events.slice(0, 1000).map((r) => ({
-        id: r.id, at: r.at, sku: r.sku, name: r.name, qty: Number(r.qty), bucket: r.bucket,
-        note: r.note || null, source: sourceName[r.source] || 'Склад', document: r.document || null,
+      balances: out.balances,
+      hasMore: out.moves.length > 1000,
+      moves: out.moves.slice(0, 1000).map((m) => ({
+        id: m.id, number: m.number, sku: m.sku, name: m.name, qty: Number(m.qty), bucket: m.bucket, note: m.note,
+        source: m.source, sourceName: sourceName[m.source] || 'склад', document: m.document || null,
+        at: m.created_at, hasPhoto: m.has_photo,
+      })),
+      decisions: out.decisions.slice(0, 500).map((d) => ({
+        id: d.id, number: d.number, sku: d.sku, name: d.name, bucket: d.bucket, qty: Number(d.qty), action: d.action,
+        markdownBarcode: d.markdown_barcode, note: d.note, decidedRole: d.decided_role, decidedName: d.decided_name,
+        decidedAt: d.decided_at, status: d.status, doneAt: d.done_at,
+        unseen: d.decided_role !== 'seller' && !d.seller_seen_at,
       })),
     });
+  } catch (err) { next(err); }
+});
+
+// Решение по браку. Продавец решает за себя; руководитель и менеджер склада —
+// за продавца (например, после звонка): видно, кто решил, и продавцу
+// приходит уведомление в кабинете.
+router.post('/defects/decisions', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : (b.companyId || req.query.companyId);
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    const { warehouseId } = req.auth;
+    const out = await withTenantContext({ warehouseId }, async (c) => {
+      const company = (await c.query(
+        'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL', [companyId, warehouseId])).rows[0];
+      if (!company) throw new HttpError(404, 'Компания не найдена');
+      let name = null;
+      if (req.auth.role === 'owner') name = 'Руководитель склада';
+      if (req.auth.role === 'manager') {
+        const s = (await c.query('SELECT name FROM staff_keys WHERE id = $1', [req.auth.staffKeyId])).rows[0];
+        name = s ? `Менеджер ${s.name}` : 'Менеджер склада';
+      }
+      return defectsService.decide(c, {
+        warehouseId, companyId, sku: String(b.sku || ''), bucket: b.bucket, qty: b.qty, action: b.action,
+        markdownBarcode: b.markdownBarcode, note: b.note,
+        actor: {
+          role: req.auth.role, name,
+          id: req.auth.role === 'seller' ? req.auth.sellerKeyId : (req.auth.staffKeyId || req.auth.ownerId || null),
+        },
+      });
+    });
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+
+// Продавец увидел решения, которые склад принял за него.
+router.post('/defects/seen', requireAuth, requireRole('seller'), async (req, res, next) => {
+  try {
+    const n = await withTenantContext({ warehouseId: req.auth.warehouseId }, async (c) => (await c.query(
+      `UPDATE defect_decisions SET seller_seen_at = now()
+        WHERE company_id = $1 AND decided_role <> 'seller' AND seller_seen_at IS NULL`, [req.auth.companyId])).rowCount);
+    res.json({ seen: n });
   } catch (err) { next(err); }
 });
 

@@ -87,6 +87,46 @@ router.get('/receipt/:id', requireAuth, requireRole('owner', 'manager', 'seller'
   } catch (err) { next(err); }
 });
 
+// Акт по браку (владелец 02.10.2026): выдача брака продавцу или его
+// утилизация — по решению со склада брака. Продавцу — только его.
+router.get('/defect/:id', requireAuth, requireRole('owner', 'manager', 'seller'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    if (!uuid.test(req.params.id)) throw new HttpError(400, 'Некорректный номер решения');
+    const out = await withTenantContext({ warehouseId }, async (c) => {
+      const d = (await c.query(
+        `SELECT d.*, c.name AS seller, p.barcode, m.mp_article
+           FROM defect_decisions d JOIN companies c ON c.id = d.company_id
+           LEFT JOIN products p ON p.warehouse_id = d.warehouse_id AND p.company_id = d.company_id AND p.sku = d.sku
+           LEFT JOIN LATERAL (SELECT mp_article FROM product_marketplace_skus m
+                               WHERE m.company_id = d.company_id AND m.sku = d.sku AND m.mp_article IS NOT NULL LIMIT 1) m ON true
+          WHERE d.warehouse_id = $1 AND d.id = $2`, [warehouseId, req.params.id])).rows[0];
+      if (!d || (req.auth.role === 'seller' && d.company_id !== req.auth.companyId)) throw new HttpError(404, 'Решение не найдено');
+      if (!['return_to_seller', 'dispose'].includes(d.action)) {
+        throw new HttpError(400, 'Акт печатается при выдаче брака продавцу и при утилизации');
+      }
+      return {
+        kind: 'defect',
+        action: d.action,
+        number: d.number,
+        date: d.done_at || d.decided_at,
+        finished: d.status === 'done',
+        seller: d.seller,
+        warehouse: await warehouseOf(c, warehouseId),
+        decidedBy: d.decided_role === 'seller' ? 'продавец' : (d.decided_name || 'склад'),
+        doneBy: d.done_name || null,
+        cells: d.done_cells || [],
+        note: d.note || null,
+        items: [{
+          article: d.mp_article || d.sku, sku: d.sku, name: d.name, barcode: d.barcode || barcodeOf(d.name),
+          qty: Number(d.qty), bucket: d.bucket === 'packaging_defect' ? 'брак упаковки' : 'брак',
+        }],
+      };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 router.get('/shipment/:supplyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;

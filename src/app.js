@@ -90,6 +90,7 @@ function createApp() {
   app.use('/api/alerts', alertRoutes);
   app.use('/api/acts', require('./acts/routes'));
   app.use('/api/inbound', require('./inbound/routes'));
+  app.use('/api/defects', require('./defects/routes'));
 
   app.use(errorHandler);
 

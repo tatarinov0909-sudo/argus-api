@@ -6,6 +6,8 @@ const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
 const outbox = require('../sync/outbox');
 const { requireQty } = require('../middleware/qty');
+const defects = require('../defects/service');
+const { zoneOf, todayIn } = require('../warehouses/time');
 
 const router = express.Router();
 
@@ -38,6 +40,11 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     // Описание дефекта — свободный текст работника, поэтому режем длину:
     // в журнал и продавцу это уходит целиком, и полотно там никому не нужно.
     const note = typeof defectNote === 'string' ? defectNote.trim().slice(0, 300) : null;
+    // Брак — только в ячейку (владелец 02.10.2026): он ложится на склад брака
+    // продавца, и решать по нему продавец будет по конкретной ячейке.
+    if (qualityBucket !== 'good' && !cellBlockId) {
+      throw new HttpError(400, 'Укажите ячейку для брака');
+    }
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
       const itemResult = await client.query(
@@ -124,7 +131,14 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       });
 
       const newTotal = alreadyLogged + Number(qty);
-      await journal.createEntry(client, {
+      // Брак — документ «Перемещение на склад брака» (запись журнала пишет он).
+      let move = null;
+      if (qualityBucket !== 'good') {
+        move = await defects.createMove(client, {
+          warehouseId, companyId: item.company_id, sku: item.sku, qty, bucket: qualityBucket, note,
+          source: 'return', invoiceId: item.invoice_id, cellBlockId, staffKeyId,
+        });
+      } else await journal.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
         // Причина едет в журнал вместе с количеством: владельцу и продавцу
@@ -156,9 +170,69 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       const newStatus = remaining.rows.length === 0 ? 'completed' : 'in_progress';
       await client.query(`UPDATE invoices SET status = $2 WHERE id = $1`, [item.invoice_id, newStatus]);
 
-      return { ...recordResult.rows[0], newTotal, declaredQty: declared };
+      return { ...recordResult.rows[0], newTotal, declaredQty: declared, move };
     });
     res.status(201).json(record);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// «Новый возврат» (владелец 02.10.2026): пока возвраты не приходят из WB,
+// склад заводит пришедшую коробку возвратов сам — продавец, товары,
+// количество — и сразу разбирает её на годное и брак тем же экраном.
+router.post('/manual', requireAuth, requireRole('worker', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const b = req.body || {};
+    if (!Array.isArray(b.items) || !b.items.length) throw new HttpError(400, 'Добавьте хотя бы один товар');
+    if (b.items.length > 200) throw new HttpError(400, 'В одном возврате — не больше 200 строк');
+    const out = await withTenantContext({ warehouseId }, async (client) => {
+      const company = (await client.query(
+        'SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
+        [b.companyId, warehouseId])).rows[0];
+      if (!company) throw new HttpError(404, 'Продавец не найден');
+      const bySku = new Map();
+      for (const it of b.items) {
+        const sku = typeof it?.sku === 'string' ? it.sku.trim() : '';
+        if (!sku) throw new HttpError(400, 'У каждой строки — товар');
+        const q = requireQty(it.qty, 'Количество', { min: 1 });
+        bySku.set(sku, (bySku.get(sku) || 0) + q);
+      }
+      const found = new Map((await client.query(
+        'SELECT sku, name FROM products WHERE company_id = $1 AND sku = ANY($2::text[])',
+        [company.id, [...bySku.keys()]])).rows.map((r) => [r.sku, r.name]));
+      const missing = [...bySku.keys()].filter((sku) => !found.has(sku));
+      if (missing.length) throw new HttpError(400, `Нет в каталоге продавца: ${missing.slice(0, 3).join(', ')}`);
+      // Номер ВЗ-ДДММГГ-N — под замком склада, день по поясу склада.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('manual-return:' || $1))", [warehouseId]);
+      const [y, m, d] = todayIn(await zoneOf(client, warehouseId)).split('-');
+      const head = `ВЗ-${d}${m}${y.slice(2)}-`;
+      const used = (await client.query('SELECT number FROM invoices WHERE warehouse_id = $1 AND number LIKE $2',
+        [warehouseId, `${head}%`])).rows.map((r) => Number(r.number.slice(head.length)) || 0);
+      const number = head + (Math.max(0, ...used) + 1);
+      const inv = (await client.query(
+        `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, source_document_type)
+         VALUES ($1, $2, $3, 'return', 'manual', 'manual_return') RETURNING id, number`,
+        [warehouseId, company.id, number])).rows[0];
+      const items = [...bySku].map(([sku, qty]) => ({ sku, name: found.get(sku), qty }));
+      await client.query(
+        `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
+         SELECT $1, $2, $3, x.name, x.sku, x.qty FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
+        [inv.id, warehouseId, company.id, JSON.stringify(items)]);
+      const units = items.reduce((sum, i) => sum + i.qty, 0);
+      const comment = typeof b.comment === 'string' && b.comment.trim() ? b.comment.trim().slice(0, 300) : null;
+      await journal.createEntry(client, {
+        warehouseId, agent: 'Кладовщик', status: 'auto',
+        actionText: `Заведён возврат ${number} продавца «${company.name}» вручную: ${items.length} товаров, ${units} шт.`
+          + (comment ? ` Комментарий: ${comment}` : '') + ' Возвраты из WB пока не приходят сами.',
+        entityType: 'invoice', entityId: inv.id, invoiceId: inv.id,
+        actorType: req.auth.role === 'seller' ? 'seller' : req.auth.role,
+        actorId: req.auth.staffKeyId || req.auth.ownerId || null,
+      });
+      return { id: inv.id, number, items: items.length, units };
+    });
+    res.status(201).json(out);
   } catch (err) {
     next(err);
   }

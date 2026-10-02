@@ -110,16 +110,26 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(beforeRepack.body.shortfall, 6);
     });
 
-    const repack = await api('POST', '/api/cells/move', {
+    // Мимо продавца брак в продажу не вернуть: только решением и заданием.
+    const sneak = await api('POST', '/api/cells/move', {
       token: workerToken,
       body: {
         sku: 'PB-A', companyId: companyA.body.id, fromCellBlockId: c3.id,
         qty: 6, fromQuality: 'packaging_defect', toQuality: 'good',
       },
     });
+    check('брак не перепаковать без решения продавца', () => assert.equal(sneak.status, 409, JSON.stringify(sneak.body)));
+    const decision = await api('POST', '/api/sellers/defects/decisions', {
+      token: ownerToken,
+      body: { companyId: companyA.body.id, sku: 'PB-A', bucket: 'packaging_defect', qty: 6, action: 'repack' },
+    });
+    const repack = await api('POST', `/api/defects/tasks/${decision.body.id}/done`, {
+      token: workerToken, body: { cellBlockId: c3.id },
+    });
     check('перепаковку можно записать', () => {
-      assert.equal(repack.status, 201, JSON.stringify(repack.body));
-      assert.equal(repack.body.toQuality, 'good');
+      assert.equal(decision.status, 201, JSON.stringify(decision.body));
+      assert.equal(repack.status, 200, JSON.stringify(repack.body));
+      assert.equal(repack.body.toSku, 'PB-A');
     });
 
     // Перепаковка тоже двигает остаток без накладной — значит должна оставлять
@@ -132,7 +142,7 @@ async function api(method, path, { token, body } = {}) {
     ));
     check('перепаковка оставляет след, и в нём виден работник', () => {
       assert.equal(repackTrail.rows.length, 1, 'операция не записана');
-      assert.equal(repackTrail.rows[0].kind, 'repack', 'перепаковку записали как перестановку');
+      assert.equal(repackTrail.rows[0].kind, 'defect_repack', 'перепаковку записали как перестановку');
       assert.ok(repackTrail.rows[0].worker_key_id, 'работник не записан');
       assert.equal(repackTrail.rows[0].details.fromQuality, 'packaging_defect');
     });

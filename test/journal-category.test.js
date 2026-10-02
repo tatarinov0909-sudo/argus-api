@@ -33,6 +33,9 @@ const cases = [
   ['перестановка', { entity_type: 'cell_block', actor_type: 'worker' }, 'cells'],
   ['загрузка остатков', { entity_type: 'company', actor_type: 'owner' }, 'cells'],
   ['движение в истории ячейки', { entity_type: 'stock_operation', actor_type: 'worker' }, 'cells'],
+  // Склад брака (02.10.2026): брак попал на склад брака, решение по нему.
+  ['перемещение на склад брака', { entity_type: 'defect_move', actor_type: 'worker' }, 'defects'],
+  ['решение по браку', { entity_type: 'defect_decision', actor_type: 'seller' }, 'defects'],
   // Сотрудники.
   ['пауза вне работы', { entity_type: 'worker_pause', actor_type: 'worker' }, 'staff'],
   // Всё прочее — Кладовщик.
@@ -42,7 +45,7 @@ const cases = [
 
 test('категория журнала — по полям записи', () => {
   const keys = new Set(CATEGORIES.map(([k]) => k));
-  assert.equal(keys.size, 10);
+  assert.equal(keys.size, 11);
   for (const [label, row, want] of cases) {
     assert.equal(categoryOf({ agent: 'Кладовщик', ...row }), want, label);
     assert.ok(keys.has(want), label);

@@ -4,6 +4,7 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const { requireQty } = require('../middleware/qty');
 const { refreshCellFill } = require('../cells/fill');
+const defects = require('../defects/service');
 const { takeFromCell } = require('../cells/move');
 const { blockLabelSql } = require('../cells/label');
 const journal = require('../journal/repository');
@@ -28,7 +29,8 @@ const MAX_PLACEMENTS = 20;
 // не больше принятого, одна ячейка — один раз. cellBlockId — одна ячейка, всё
 // принятое туда. Принять без ячейки («своё место») нельзя: всё принятое
 // лежит в конкретной ячейке. Ноль класть некуда — «не приехало» без ячейки.
-function planPlacements({ accepted, cellBlockId, placements }) {
+function planPlacements({ accepted, cellBlockId, placements, defectQty = 0 }) {
+  if (defectQty > accepted) throw new HttpError(400, `Брака ${defectQty} шт., а принято ${accepted} — брак входит в принятое`);
   if (placements != null) {
     if (cellBlockId) throw new HttpError(400, 'Ячейка указана и одна, и списком — нужно что-то одно');
     if (!Array.isArray(placements) || !placements.length) throw new HttpError(400, 'Укажите, в какую ячейку кладёте товар');
@@ -43,18 +45,36 @@ function planPlacements({ accepted, cellBlockId, placements }) {
       return { cellBlockId: id, qty: requireQty(p.qty, 'Сколько кладёте в ячейку', { min: 1 }) };
     });
     const sum = plan.reduce((a, p) => a + p.qty, 0);
-    if (sum > accepted) throw new HttpError(400, `Разложено ${sum} шт., а принято ${accepted} — уберите лишние ${sum - accepted}`);
+    if (sum + defectQty > accepted) {
+      throw new HttpError(400, `Разложено ${sum + defectQty} шт.${defectQty ? ` (из них брак ${defectQty})` : ''}, а принято ${accepted} — уберите лишние ${sum + defectQty - accepted}`);
+    }
     return plan;
   }
   if (cellBlockId) {
     if (typeof cellBlockId !== 'string' || !UUID.test(cellBlockId)) throw new HttpError(404, 'Ячейка не найдена');
     // Ноль класть некуда: раньше в ячейке появлялась пустая строка остатка.
-    return accepted > 0 ? [{ cellBlockId, qty: accepted }] : [];
+    if (accepted - defectQty <= 0) throw new HttpError(400, 'Всё принятое — брак: годное в ячейку класть нечего');
+    return [{ cellBlockId, qty: accepted - defectQty }];
   }
+  // Брак отметили до раскладки (кнопка «Брак», владелец 02.10.2026): брак —
+  // в ячейку брака, годное остаётся «разложить» следующими шагами.
+  if (accepted > 0 && defectQty > 0) return [];
   if (accepted > 0) {
     throw new HttpError(400, 'Укажите ячейку: принятый товар кладут в конкретную ячейку, без ячейки принять нельзя');
   }
   return [];
+}
+
+// Брак при приёмке: { qty, bucket, note, cellBlockId }. Нет — null.
+function readDefect(defect) {
+  if (defect == null) return null;
+  if (typeof defect !== 'object') throw new HttpError(400, 'Брак — сколько, вид, описание и ячейка');
+  const qty = requireQty(defect.qty, 'Сколько брака', { min: 1 });
+  defects.requireBucket(defect.bucket);
+  if (typeof defect.cellBlockId !== 'string' || !UUID.test(defect.cellBlockId)) {
+    throw new HttpError(400, 'Укажите ячейку для брака');
+  }
+  return { qty, bucket: defect.bucket, note: defects.cleanNote(defect.note), cellBlockId: defect.cellBlockId };
 }
 
 // Worker submits one line item: actual quantity, the first cell(s) it went
@@ -63,7 +83,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const {
-      invoiceItemId, acceptedQty, cellBlockId, placements, pausedMs, pauseReasons, suggestionId,
+      invoiceItemId, acceptedQty, cellBlockId, placements, pausedMs, pauseReasons, suggestionId, defect,
     } = req.body;
     if (!invoiceItemId || acceptedQty == null) {
       throw new HttpError(400, 'Не хватает данных о принятой позиции');
@@ -74,11 +94,14 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     // при проверке, а в NUMERIC уезжало сырое значение и Postgres отвечал
     // ошибкой — работник видел «внутреннюю ошибку» вместо понятного отказа.
     const accepted = requireQty(acceptedQty, 'Принятое количество', { min: 0 });
-    const plan = planPlacements({ accepted, cellBlockId, placements });
+    // Брак при приёмке (владелец 02.10.2026): часть принятого — брак, он
+    // ложится в ячейку брака, на склад брака продавца.
+    const defectPlan = readDefect(defect);
+    const plan = planPlacements({ accepted, cellBlockId, placements, defectQty: defectPlan ? defectPlan.qty : 0 });
 
     const record = await withTenantContext({ warehouseId }, (client) => receiveItem(client, {
       warehouseId, staffKeyId, invoiceItemId, accepted, placements: plan, pausedMs, pauseReasons, suggestionId,
-      requireWork: true,
+      requireWork: true, defect: defectPlan,
     }));
     res.status(201).json(record);
   } catch (err) {
@@ -217,7 +240,7 @@ async function finishReceiving(client, warehouseId, staffKeyId, invoiceId, { com
 // текстом и комментарием).
 async function receiveItem(client, {
   warehouseId, staffKeyId, invoiceItemId, accepted, placements = [], pausedMs = 0, pauseReasons = [],
-  suggestionId = null, closeWork = true,
+  suggestionId = null, closeWork = true, defect = null,
   // Приход принимает только тот, кто ведёт приёмку, и не на паузе
   // (requireActive). «Закончить приёмку» уже проверила заход сама — ей можно
   // и с паузы.
@@ -314,14 +337,30 @@ async function receiveItem(client, {
       id: row.id, cellBlockId: row.cell_block_id, label: cells.get(p.cellBlockId), qty: Number(row.qty), step: row.step,
     });
   }
+  // Брак — своим шагом: в ячейку брака с состоянием «брак», документ
+  // «Перемещение на склад брака».
+  let defectMove = null;
+  if (defect) {
+    const step = await putStep(client, {
+      warehouseId, staffKeyId, recordId: record.id, item: { ...item, id: invoiceItemId },
+      cellBlockId: defect.cellBlockId, qty: defect.qty, quality: defect.bucket,
+    });
+    defectMove = await defects.createMove(client, {
+      warehouseId, companyId: item.company_id, sku: item.sku, qty: defect.qty, bucket: defect.bucket,
+      note: defect.note, source: 'receiving', invoiceId: item.invoice_id, cellBlockId: defect.cellBlockId, staffKeyId,
+    });
+    placed.push({ id: step.id, cellBlockId: step.cell_block_id, qty: Number(step.qty), step: step.step, defect: true });
+  }
   const unplaced = accepted - placed.reduce((a, p) => a + p.qty, 0);
 
   const hasDiscrepancy = accepted !== Number(item.declared_qty);
   // Несколько ячеек — адреса в тексте: запись журнала ведёт только на первую.
   // Всё в одну ячейку — адрес и так на ссылке записи.
-  const where = placed.length > 1
-    ? ` Разложил по ячейкам: ${placed.map((p) => `${p.label} — ${p.qty} шт.`).join(', ')}`
-    : placed.length && unplaced > 0 ? ` Положил ${placed[0].qty} шт. в ячейку ${placed[0].label}.` : '';
+  const goodPlaced = placed.filter((p) => !p.defect);
+  const where = (goodPlaced.length > 1
+    ? ` Разложил по ячейкам: ${goodPlaced.map((p) => `${p.label} — ${p.qty} шт.`).join(', ')}`
+    : goodPlaced.length && unplaced > 0 ? ` Положил ${goodPlaced[0].qty} шт. в ячейку ${goodPlaced[0].label}.` : '')
+    + (defectMove ? ` Из них брак ${defectMove.qty} шт. — на склад брака (${defectMove.number}).` : '');
   const actionText = (hasDiscrepancy
     ? `Нашёл расхождение по «${item.name}» (${item.sku}): заявлено ${item.declared_qty}, по факту ${accepted}.`
     : `Принял «${item.name}» (${item.sku}) по факту ${accepted} — расхождений не найдено.`) + where
@@ -363,7 +402,8 @@ async function receiveItem(client, {
   });
   return {
     ...record,
-    placements: placed,
+    placements: placed.filter((p) => !p.defect),
+    defects: defectMove ? [{ ...defectMove, cellBlockId: defect.cellBlockId }] : [],
     unplaced,
     invoiceStatus: newStatus,
     // Итог приёмки, если эта позиция закрыла приход: тот же ответ, что у
@@ -422,19 +462,21 @@ async function unplacedItems(client, invoiceId) {
 // Шаг «положил N шт. в ячейку»: строка остатка в ячейке и строка укладки со
 // следующим номером шага. pairId — у второй половины «Переложить»: шаг
 // «забрал», к которому она относится.
-async function putStep(client, { warehouseId, staffKeyId, recordId, item, cellBlockId, qty, pairId = null }) {
+async function putStep(client, {
+  warehouseId, staffKeyId, recordId, item, cellBlockId, qty, pairId = null, quality = 'good',
+}) {
   await client.query(
-    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [cellBlockId, warehouseId, item.company_id, item.sku, qty],
+    `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [cellBlockId, warehouseId, item.company_id, item.sku, qty, quality],
   );
   const row = (await client.query(
     `INSERT INTO receiving_placements
-       (receiving_record_id, invoice_item_id, warehouse_id, company_id, cell_block_id, sku, qty, step, placed_by, kind, pair_id)
+       (receiving_record_id, invoice_item_id, warehouse_id, company_id, cell_block_id, sku, qty, step, placed_by, kind, pair_id, quality)
      VALUES ($1, $2, $3, $4, $5, $6, $7,
-             (SELECT COALESCE(MAX(step), 0) + 1 FROM receiving_placements WHERE receiving_record_id = $1), $8, 'put', $9)
+             (SELECT COALESCE(MAX(step), 0) + 1 FROM receiving_placements WHERE receiving_record_id = $1), $8, 'put', $9, $10)
      RETURNING id, cell_block_id, qty, step, placed_at`,
-    [recordId, item.id, warehouseId, item.company_id, cellBlockId, item.sku, qty, staffKeyId, pairId],
+    [recordId, item.id, warehouseId, item.company_id, cellBlockId, item.sku, qty, staffKeyId, pairId, quality],
   )).rows[0];
   // Процент считается от того, сколько штук в ячейке, а не ставится в
   // сотню при любом приходе: иначе ячейка с пятью штуками горит на карте
@@ -465,19 +507,35 @@ async function takeStep(client, { warehouseId, staffKeyId, recordId, item, cellB
 
 // Раскладка позиции сейчас: ячейка и сколько в ней лежит (сумма шагов), в
 // порядке первой укладки.
-async function layoutOf(client, recordId) {
+async function layoutOf(client, recordId, quality = 'good') {
   const r = await client.query(
     `SELECT rp.cell_block_id, SUM(rp.qty) AS qty, ${blockLabelSql('cb', 'wr')} AS label
        FROM receiving_placements rp
        JOIN cell_blocks cb ON cb.id = rp.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-      WHERE rp.receiving_record_id = $1
+      WHERE rp.receiving_record_id = $1 AND rp.quality = $2
       GROUP BY rp.cell_block_id, cb.id, wr.id
+     HAVING SUM(rp.qty) > 0
+      ORDER BY MIN(rp.step)`,
+    [recordId, quality],
+  );
+  return r.rows.map((x) => ({ cellBlockId: x.cell_block_id, label: x.label, qty: Number(x.qty) }));
+}
+
+// Брак позиции на складе брака — по ячейкам (оба вида брака).
+async function defectLayoutOf(client, recordId) {
+  const r = await client.query(
+    `SELECT rp.cell_block_id, rp.quality, SUM(rp.qty) AS qty, ${blockLabelSql('cb', 'wr')} AS label
+       FROM receiving_placements rp
+       JOIN cell_blocks cb ON cb.id = rp.cell_block_id
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE rp.receiving_record_id = $1 AND rp.quality <> 'good'
+      GROUP BY rp.cell_block_id, rp.quality, cb.id, wr.id
      HAVING SUM(rp.qty) > 0
       ORDER BY MIN(rp.step)`,
     [recordId],
   );
-  return r.rows.map((x) => ({ cellBlockId: x.cell_block_id, label: x.label, qty: Number(x.qty) }));
+  return r.rows.map((x) => ({ cellBlockId: x.cell_block_id, label: x.label, qty: Number(x.qty), bucket: x.quality }));
 }
 
 // Ячейка записи приёмки — первая, где товар позиции лежит сейчас: на неё
@@ -545,7 +603,7 @@ async function cellLabelOf(client, warehouseId, cellBlockId) {
 
 async function inCell(client, recordId, cellBlockId) {
   const r = await client.query(
-    'SELECT COALESCE(SUM(qty), 0) AS n FROM receiving_placements WHERE receiving_record_id = $1 AND cell_block_id = $2',
+    "SELECT COALESCE(SUM(qty), 0) AS n FROM receiving_placements WHERE receiving_record_id = $1 AND cell_block_id = $2 AND quality = 'good'",
     [recordId, cellBlockId],
   );
   return Number(r.rows[0].n);
@@ -553,9 +611,11 @@ async function inCell(client, recordId, cellBlockId) {
 
 // Шаг сделан: ячейка записи приёмки, запись журнала, статус прихода (всё
 // разложено — принят, заход закрыт) и раскладка позиции для экрана.
-async function placingDone(client, { warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId, legacy = false }) {
+async function placingDone(client, {
+  warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId, legacy = false, skipJournal = false,
+}) {
   await syncRecordCell(client, item.record_id);
-  await journal.createEntry(client, {
+  if (!skipJournal) await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
     actionText: journalText,
@@ -575,6 +635,7 @@ async function placingDone(client, { warehouseId, staffKeyId, invoice, item, jou
   return {
     invoiceItemId: item.id,
     placements: await layoutOf(client, item.record_id),
+    defects: await defectLayoutOf(client, item.record_id),
     unplaced: Number(item.accepted_qty) - Number(placed.rows[0].n),
     invoiceStatus: status,
     finished,
@@ -603,6 +664,35 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
         journalText: `Положил ${qty} шт. ${what(item)} в ячейку ${label}. `
           + (left ? `Осталось разложить ${left} шт.` : `Разложено всё принятое — ${Number(item.accepted_qty)} шт.`),
       });
+    });
+    res.status(201).json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// «Брак» на экране приёмки (владелец 02.10.2026): часть уже принятого, но
+// ещё не разложенного — брак. Ложится в ячейку брака, на склад брака.
+router.post('/items/:invoiceItemId/defect', requireAuth, requireRole('worker'), async (req, res, next) => {
+  try {
+    const { warehouseId, staffKeyId } = req.auth;
+    const plan = readDefect(req.body || {});
+    const out = await withTenantContext({ warehouseId }, async (client) => {
+      const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'defect' });
+      if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено — брак отметьте через «Перепаковка и перестановка»');
+      if (plan.qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — брака больше быть не может`);
+      await cellLabelOf(client, warehouseId, plan.cellBlockId);
+      const step = await putStep(client, {
+        warehouseId, staffKeyId, recordId: item.record_id, item, cellBlockId: plan.cellBlockId, qty: plan.qty, quality: plan.bucket,
+      });
+      const move = await defects.createMove(client, {
+        warehouseId, companyId: item.company_id, sku: item.sku, qty: plan.qty, bucket: plan.bucket, note: plan.note,
+        source: 'receiving', invoiceId: invoice.id, cellBlockId: plan.cellBlockId, staffKeyId,
+      });
+      const done = await placingDone(client, {
+        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId: plan.cellBlockId, legacy, skipJournal: true,
+      });
+      return { ...done, move };
     });
     res.status(201).json(out);
   } catch (err) {
