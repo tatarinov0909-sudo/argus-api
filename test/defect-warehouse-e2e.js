@@ -49,6 +49,12 @@ const rules = require('../src/alerts/rules');
     await db(`INSERT INTO products (warehouse_id, company_id, sku, name, barcode) VALUES
       ($1, $2, 'BR-1', 'Ведро мармелада', '4600000000011'), ($1, $2, 'BR-2', 'Сгущенка', '4600000000028'),
       ($1, $2, 'BR-3', 'Пастила', '4600000000035')`, [warehouseId, a.id]);
+    // Годному пустую «ячейку брака» Кладовщик не предлагает.
+    await api('PATCH', `/api/defects/zones/${cells[0]}`, owner, { on: true }, 200);
+    const good = (await api('GET', '/api/agents/kladovshchik/suggest-cell?sku=NEW-SKU', worker)).options.map((o) => o.blockId);
+    assert.ok(good.length > 0 && !good.includes(cells[0]), JSON.stringify(good));
+    await api('PATCH', `/api/defects/zones/${cells[0]}`, owner, { on: false }, 200);
+    check('good goods are never suggested into an empty defect cell');
     const stock = async (cell, sku, quality) => Number((await db(
       'SELECT COALESCE(SUM(qty), 0) AS n FROM cell_stock WHERE cell_block_id = $1 AND sku = $2 AND quality = $3',
       [cell, sku, quality])).rows[0].n);
@@ -185,6 +191,7 @@ const rules = require('../src/alerts/rules');
     const sugg = await api('GET', `/api/defects/cells?companyId=${a.id}`, worker);
     assert.equal(sugg[0].cellBlockId, cells[5]); assert.equal(sugg[1].cellBlockId, cells[2]); assert.equal(sugg[1].reason, 'ячейка брака');
     check('defect cells: own defect cells first, then cells marked by the owner, then empty');
+
 
     // --- Перекладка годного в брак ---
     await api('POST', '/api/cells/move', worker, { sku: 'BR-3', fromCellBlockId: cells[1], toQuality: 'defective', qty: 1 }, 400);

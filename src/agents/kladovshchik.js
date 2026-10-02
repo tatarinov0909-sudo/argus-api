@@ -257,7 +257,7 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        JOIN company_rows crw ON crw.row_id = wr.id
-       WHERE cb.warehouse_id = $1 AND cb.state = 'empty'
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone
          AND cb.id <> ALL($4::uuid[])
        ORDER BY crw.cells DESC, wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $3`,
@@ -270,12 +270,14 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
 
   // 3. Просто свободная. Запасной вариант: новый товар нового продавца, или
   //    склад, который начинает с нуля и своего порядка ещё не нажил.
+  //    «Ячейки брака» (их отмечает руководитель) годному не предлагаем — ни
+  //    здесь, ни в шаге 2: туда кладут брак (владелец 02.10.2026).
   if (options.length < limit) {
     const empty = await client.query(
       `SELECT cb.id, wr.row_num, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-       WHERE cb.warehouse_id = $1 AND cb.state = 'empty'
+       WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone
          AND cb.id <> ALL($3::uuid[])
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $2`,
