@@ -94,12 +94,12 @@ async function listEntries(client, warehouseId, {
      WHERE je.warehouse_id = $1
        AND ($3::uuid IS NULL OR je.cell_block_id = $3::uuid)
        AND ($4::uuid IS NULL OR je.invoice_id = $4::uuid)
-       AND ($5::boolean IS NOT TRUE OR NOT je.urgent)
+       AND ($5::boolean IS NOT TRUE OR NOT (je.urgent AND je.entity_type IS DISTINCT FROM 'vw_transfer'))
        AND (je.id IN (SELECT j2.id FROM journal_entries j2
                        WHERE j2.warehouse_id = $1
                          AND ($3::uuid IS NULL OR j2.cell_block_id = $3::uuid)
                          AND ($4::uuid IS NULL OR j2.invoice_id = $4::uuid)
-                         AND ($5::boolean IS NOT TRUE OR NOT j2.urgent)
+                         AND ($5::boolean IS NOT TRUE OR NOT (j2.urgent AND j2.entity_type IS DISTINCT FROM 'vw_transfer'))
                        ORDER BY j2.created_at DESC LIMIT $2)
             OR (je.urgent AND je.status = 'pending'
                 AND NOT EXISTS (SELECT 1 FROM journal_entries a2 WHERE a2.related_entry_id = je.id)))

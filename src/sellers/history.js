@@ -20,8 +20,14 @@ function readPage(query, companyId, sku) {
   return { limit, cursor };
 }
 
+// Перенос между складами продавца: откуда и куда (проверка 03.10.2026).
+const VW_PATH = `'«' || COALESCE(fv.name, 'Остальной товар') || '» → «' || COALESCE(tv.name, 'Остальной товар') || '»'`;
+const VW_JOIN = `LEFT JOIN virtual_warehouses fv ON op.kind = 'vw_transfer' AND fv.id::text = op.details->>'fromVw'
+    LEFT JOIN virtual_warehouses tv ON op.kind = 'vw_transfer' AND tv.id::text = op.details->>'toVw'`;
+
 // Event identities include their source: the same shipping record contributes
 // a pick and, only after confirmed departure, a separate shipment.
+// $7 — для продавца: без перекладок между ячейками, перенос — одним событием.
 const EVENTS_SQL = `
   SELECT rr.id, 'received:' || rr.id AS event_key, rr.finished_at AS at, 'received' AS kind,
          rr.accepted_qty AS qty, i.number AS document, NULL::text AS note, NULL::text AS quality,
@@ -51,10 +57,24 @@ const EVENTS_SQL = `
     JOIN invoices i ON i.id=ii.invoice_id AND i.company_id=$1
    WHERE rr.company_id=$1 AND ii.sku=$2
   UNION ALL
-  SELECT op.id, 'stock:' || op.id, op.created_at, op.kind, op.qty, NULL, NULL,
+  SELECT op.id, 'stock:' || op.id, op.created_at, op.kind, op.qty,
+         CASE WHEN op.kind = 'vw_transfer' THEN COALESCE(op.details->>'transfer', mtr.number) END,
+         CASE WHEN op.kind = 'vw_transfer' THEN ${VW_PATH} END,
          CASE WHEN op.kind IN ('initial_load', 'initial_load_undo') THEN op.details->>'quality' END, NULL,
          op.from_cell_block_id, op.to_cell_block_id, NULL
-    FROM stock_operations op WHERE op.company_id=$1 AND op.sku=$2`;
+    FROM stock_operations op ${VW_JOIN}
+    LEFT JOIN vw_move_tasks mt ON op.kind = 'vw_transfer' AND mt.id::text = op.details->>'moveTask'
+    LEFT JOIN vw_transfers mtr ON mtr.id = mt.transfer_id
+   WHERE op.company_id=$1 AND op.sku=$2
+     AND NOT ($7::boolean AND (op.kind = 'move' OR (op.kind = 'vw_transfer' AND op.details ? 'transfer')))
+  UNION ALL
+  -- Продавцу перенос, записанный по ячейкам, — одним событием: как товар
+  -- лежит, его не касается (уточнение владельца 03.10.2026).
+  SELECT MIN(op.id::text)::uuid, 'stock:' || MIN(op.id::text), op.created_at, 'vw_transfer', SUM(op.qty),
+         op.details->>'transfer', ${VW_PATH}, NULL, NULL, NULL, NULL, NULL
+    FROM stock_operations op ${VW_JOIN}
+   WHERE $7::boolean AND op.company_id=$1 AND op.sku=$2 AND op.kind = 'vw_transfer' AND op.details ? 'transfer'
+   GROUP BY op.created_at, op.details->>'transfer', fv.name, tv.name`;
 
 function cellFields(alias, rowAlias) {
   return `CASE WHEN ${alias}.id IS NULL THEN NULL ELSE json_build_object(
@@ -63,7 +83,7 @@ function cellFields(alias, rowAlias) {
     'tierStart',${alias}.tier_start,'tierEnd',${alias}.tier_end) END`;
 }
 
-async function loadHistory(client, companyId, sku, page) {
+async function loadHistory(client, companyId, sku, page, { forSeller = false } = {}) {
   const { cursor, limit } = page;
   const result = await client.query(`WITH events AS (${EVENTS_SQL}), page AS (
     SELECT * FROM events WHERE ($3::boolean IS FALSE OR
@@ -88,7 +108,7 @@ async function loadHistory(client, companyId, sku, page) {
       LEFT JOIN cell_blocks tc ON tc.id=p.to_cell_id
       LEFT JOIN warehouse_rows tr ON tr.id=tc.warehouse_row_id
      ORDER BY p.at DESC NULLS LAST,p.event_key DESC`,
-  [companyId, sku, !!cursor, cursor?.at ?? null, cursor?.key ?? null, limit+1]);
+  [companyId, sku, !!cursor, cursor?.at ?? null, cursor?.key ?? null, limit+1, forSeller]);
   const rows = result.rows.slice(0, limit);
   const hasMore = result.rows.length > limit;
   const last = rows[rows.length-1];

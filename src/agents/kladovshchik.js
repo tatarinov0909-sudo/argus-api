@@ -730,7 +730,7 @@ async function workNow(client, warehouseId) {
 
   const vw = await vwReminders(client, warehouseId);
   const tasks = (await client.query(
-    `SELECT action, count(*)::int AS n, SUM(qty)::int AS units FROM defect_decisions
+    `SELECT action, count(*)::int AS n, SUM(qty - done_qty)::int AS units FROM defect_decisions
       WHERE warehouse_id = $1 AND status = 'pending' GROUP BY action ORDER BY action`, [warehouseId])).rows;
   const TASK = { return_to_seller: 'выдать продавцу', dispose: 'утилизировать', repack: 'перепаковать', markdown: 'переклеить на уценку' };
 

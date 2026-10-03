@@ -643,7 +643,7 @@ router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), a
           WHERE m.company_id = $1 ORDER BY m.created_at DESC, m.number DESC LIMIT 1001`, [companyId])).rows;
       const decisions = (await c.query(
         `SELECT id, number, sku, name, bucket, qty, action, markdown_barcode, note, decided_role, decided_name,
-                decided_at, seller_seen_at, status, done_at
+                decided_at, seller_seen_at, status, done_at, done_qty
            FROM defect_decisions WHERE company_id = $1 ORDER BY decided_at DESC LIMIT 501`, [companyId])).rows;
       return { balances, moves, decisions };
     });
@@ -659,7 +659,7 @@ router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), a
       decisions: out.decisions.slice(0, 500).map((d) => ({
         id: d.id, number: d.number, sku: d.sku, name: d.name, bucket: d.bucket, qty: Number(d.qty), action: d.action,
         markdownBarcode: d.markdown_barcode, note: d.note, decidedRole: d.decided_role, decidedName: d.decided_name,
-        decidedAt: d.decided_at, status: d.status, doneAt: d.done_at,
+        decidedAt: d.decided_at, status: d.status, doneAt: d.done_at, doneQty: Number(d.done_qty || 0),
         unseen: d.decided_role !== 'seller' && !d.seller_seen_at,
       })),
     });
@@ -717,7 +717,7 @@ router.get('/history', requireAuth, requireRole('seller', 'owner', 'manager'), a
     const page = readPage(req.query, companyId, sku);
     const result = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
-      return loadHistory(client, companyId, sku, page);
+      return loadHistory(client, companyId, sku, page, { forSeller: req.auth.role === 'seller' });
     });
     if (req.auth.role === 'seller') {
       result.events = result.events.map(({ fromCell, toCell, toCells, ...event }) => event);

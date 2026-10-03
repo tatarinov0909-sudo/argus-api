@@ -347,6 +347,52 @@ async function cancelTask(client, warehouseId, { taskId, note, actor }) {
   return { ok: true };
 }
 
+// Склад больше не хранится отдельно (или его брак — вместе с общим):
+// задания «переложить» по нему не нужны. Разделение снимается, перенос
+// дописывается на месте — склады снова «вместе» (проверка 03.10.2026).
+async function releaseSeparate(client, warehouseId, { companyId, vwId }) {
+  const lay = await layout(client, companyId);
+  const open = (await client.query(
+    `SELECT * FROM vw_move_tasks WHERE warehouse_id = $1 AND company_id = $2 AND status = 'open'
+        AND (from_vw = $3 OR to_vw = $3) FOR UPDATE`, [warehouseId, companyId, vwId])).rows;
+  let canceled = 0; let finished = 0;
+  const transfers = new Set();
+  for (const t of open) {
+    if (t.kind === 'separate') {
+      if (lay.separate(t.to_vw, t.quality)) continue;
+      await client.query(`UPDATE vw_move_tasks SET status = 'canceled', done_at = now(), cancel_note = 'склад больше не хранится отдельно' WHERE id = $1`, [t.id]);
+      canceled += 1;
+      continue;
+    }
+    if (lay.separate(t.from_vw, t.quality) || lay.separate(t.to_vw, t.quality)) continue;
+    // Перенос: остаток — учётом в той же ячейке, без перекладки (сколько
+    // там ещё лежит — ячейку могли разобрать отбором).
+    const have = Number((await client.query(
+      `SELECT COALESCE(SUM(qty), 0) AS q FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2 AND sku = $3
+          AND quality = $4 AND virtual_warehouse_id IS NOT DISTINCT FROM $5::uuid`,
+      [t.from_cell_block_id, t.company_id, t.sku, t.quality, t.from_vw])).rows[0].q);
+    const n = Math.min(t.qty - t.moved, have);
+    if (n > 0) {
+      await takeFromCell(client, warehouseId, {
+        cellBlockId: t.from_cell_block_id, sku: t.sku, companyId: t.company_id, quality: t.quality, qty: n,
+        verb: 'перенести', vw: t.from_vw || null,
+      });
+      await client.query(
+        `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`, [t.from_cell_block_id, warehouseId, t.company_id, t.sku, n, t.quality, t.to_vw]);
+      await client.query(
+        `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, from_cell_block_id, to_cell_block_id, details, worker_key_id)
+         VALUES ($1, $2, 'vw_transfer', $3, $4, $5, $5, $6::jsonb, NULL)`,
+        [warehouseId, t.company_id, t.sku, n, t.from_cell_block_id, JSON.stringify({ moveTask: t.id, fromVw: t.from_vw, toVw: t.to_vw, quality: t.quality })]);
+    }
+    await client.query(`UPDATE vw_move_tasks SET moved = moved + $2, status = 'done', done_at = now() WHERE id = $1`, [t.id, n]);
+    finished += 1;
+    if (t.transfer_id) transfers.add(t.transfer_id);
+  }
+  for (const id of transfers) await finishTransferIfDone(client, warehouseId, id);
+  return { canceled, finished };
+}
+
 // Зоны складов, в которых нет пустой ячейки, — для предупреждений.
 async function fullZones(client, warehouseId) {
   return (await client.query(
@@ -388,5 +434,5 @@ async function warnFullZones(client, warehouseId, invoiceId, when) {
 
 module.exports = {
   layout, conflict, checkPut, zoneInfo, setZone, mixedCells, createSeparateTasks, createTransferTasks, needsMove,
-  listTasks, step, cancelTask, finishTransferIfDone, fullZones, warnFullZones, emptyZoneCell,
+  listTasks, step, cancelTask, finishTransferIfDone, fullZones, warnFullZones, emptyZoneCell, releaseSeparate,
 };

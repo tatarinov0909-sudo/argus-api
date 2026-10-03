@@ -20,6 +20,7 @@ const separate = require('./separate');
 const MAIN_NAME = 'Остальной товар';
 // «Основной» — весь товар продавца: склад так назвать нельзя.
 const TOTAL_NAME = 'Основной';
+const DEFECT_NAME = 'Склад брака';
 const MARKETPLACES = { wb: 'WB', ozon: 'Озон', yandex: 'Яндекс Маркет', other: 'иное' };
 // «Права склада» (вопрос 14): что склад может делать с товаром продавца без
 // его согласия. Нет ключа в ff_rights — право есть.
@@ -71,7 +72,7 @@ function cleanName(value) {
   const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
   if (!name) throw new HttpError(400, 'Назовите склад, например «Озон» или «ООО Ромашка»');
   if (name.length > 100) throw new HttpError(400, 'Название склада — не длиннее 100 знаков');
-  if ([MAIN_NAME, TOTAL_NAME].some((n) => n.toLowerCase() === name.toLowerCase())) {
+  if ([MAIN_NAME, TOTAL_NAME, DEFECT_NAME].some((n) => n.toLowerCase() === name.toLowerCase())) {
     throw new HttpError(400, `«${name}» — так называется часть учёта продавца, назовите склад иначе`);
   }
   return name;
@@ -184,6 +185,12 @@ async function update(client, {
     changes.push(`уже лежащее вместе (${mixed.length} яч.) не разделяем — отдельно только новый товар`);
   }
   if (row.defect_separate !== cur.defect_separate) changes.push(row.defect_separate ? 'брак тоже отдельно' : 'брак — в общих ячейках брака');
+  // Выключили «хранить отдельно» (или брак — снова в общих ячейках): задания
+  // «переложить» по нему больше не нужны.
+  if ((cur.keep_separate && !row.keep_separate) || (cur.defect_separate && !row.defect_separate)) {
+    const rel = await separate.releaseSeparate(client, warehouseId, { companyId, vwId: id });
+    if (rel.canceled || rel.finished) changes.push(`снято заданий «переложить» — ${rel.canceled}, переносов дописано — ${rel.finished}`);
+  }
   let zoneOut = null;
   if (zone !== undefined) {
     zoneOut = await separate.setZone(client, warehouseId, { vwId: id, rows: zone?.rows || [], cells: zone?.cells || [] });
@@ -227,6 +234,13 @@ async function archive(client, { warehouseId, companyId, id, actor }) {
   const task = (await client.query(
     `SELECT 1 FROM vw_move_tasks WHERE (from_vw = $1 OR to_vw = $1) AND status = 'open' LIMIT 1`, [id])).rows[0];
   if (task) throw new HttpError(409, 'По этому складу не закончено задание грузчику «переложить»');
+  // Ждёт решение продавца, где этот склад — одна из частей (проверка 03.10.2026:
+  // иначе решение записывало товар на убранный склад).
+  const waiting = (await client.query(
+    `SELECT 1 FROM vw_decisions d WHERE d.company_id = $1 AND d.status = 'pending'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(d.parts) p WHERE p->>'vw' = $2::text) LIMIT 1`,
+    [companyId, id])).rows[0];
+  if (waiting) throw new HttpError(409, `По складу «${cur.name}» ждёт решение продавца — убрать склад можно после его решения`);
   await client.query('UPDATE cell_blocks SET reserved_vw_id = NULL WHERE reserved_vw_id = $1', [id]);
   await client.query('UPDATE virtual_warehouses SET archived_at = now() WHERE id = $1', [id]);
   await journal.createEntry(client, {
@@ -255,9 +269,16 @@ async function transferable(client, companyId, sku, vwId) {
            AND i.status IN ('open', 'in_progress') AND i.mp_closed_at IS NULL
            AND (i.supply_id IS NOT NULL OR i.source = '1c')
            AND NOT EXISTS (SELECT 1 FROM shipping_records f WHERE f.invoice_item_id = ii.id AND f.is_final)
-           AND ii.virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid) AS to_pick`,
+           AND ii.virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid) AS to_pick,
+       -- Обещано переносу, который грузчик ещё перекладывает (проверка 03.10.2026).
+       (SELECT COALESCE(SUM(t.qty - t.moved), 0) FROM vw_move_tasks t
+         WHERE t.company_id = $1 AND t.sku = $2 AND t.status = 'open' AND t.kind = 'transfer'
+           AND t.quality = 'good' AND t.from_vw IS NOT DISTINCT FROM $3::uuid) AS promised`,
     [companyId, sku, vwId])).rows[0];
-  return { inCells: Number(r.in_cells), toPick: Number(r.to_pick), free: Math.max(0, Number(r.in_cells) - Number(r.to_pick)) };
+  return {
+    inCells: Number(r.in_cells), toPick: Number(r.to_pick), promised: Number(r.promised),
+    free: Math.max(0, Number(r.in_cells) - Number(r.to_pick) - Number(r.promised)),
+  };
 }
 
 // Сам перенос: строки годного остатка склада-источника (с самых давних)
@@ -491,9 +512,11 @@ async function notifications(client, companyId, { limit = 50 } = {}) {
   }));
 }
 
-async function markSeen(client, companyId) {
+// ids — только эти (кнопка «Понятно» у своего блока); без них — все.
+async function markSeen(client, companyId, ids = null) {
   return (await client.query(
-    'UPDATE seller_notifications SET seen_at = now() WHERE company_id = $1 AND seen_at IS NULL', [companyId])).rowCount;
+    `UPDATE seller_notifications SET seen_at = now() WHERE company_id = $1 AND seen_at IS NULL
+        AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))`, [companyId, ids])).rowCount;
 }
 
 // Заказ ушёл из поставки (убрали, разобрали поставку): склад его строк
@@ -531,14 +554,17 @@ async function assignOrders(client, warehouseId, invoiceIds, vwId) {
 // vw null — «Основной»), counted — сколько насчитали. Излишек — на
 // «Основной» (чей он — неизвестно); недостача — сначала с «Основного», потом
 // с самого большого склада. Возвращает итог по складам и что списано.
-function allocateCount(parts, counted) {
+// home — чья это ячейка: зона склада или ячейка склада «хранить отдельно»;
+// лишнее записывается на него, иначе — на «Остальной товар» (проверка
+// 03.10.2026: лишнее «Остального товара» в зоне «Озона» ломало зону).
+function allocateCount(parts, counted, home = null) {
   const rows = parts.map((p) => ({ vw: p.vw || null, qty: Number(p.qty) })).filter((p) => p.qty > 0);
   const total = rows.reduce((n, p) => n + p.qty, 0);
   const cut = [];
   if (counted >= total) {
     if (counted > total) {
-      const main = rows.find((p) => p.vw === null);
-      if (main) main.qty += counted - total; else rows.push({ vw: null, qty: counted - total });
+      const to = rows.find((p) => p.vw === (home || null));
+      if (to) to.qty += counted - total; else rows.push({ vw: home || null, qty: counted - total });
     }
     return { result: rows, cut, surplus: counted - total };
   }
@@ -682,6 +708,9 @@ async function listDecisions(client, companyId, { open = false, limit = 100 } = 
 
 // Перенос по решению продавца: сразу выполнен, со своим номером.
 async function retag(client, warehouseId, { companyId, sku, name, fromVw, toVw, qty, quality, note, actor }) {
+  // Оба склада должны быть живыми: на убранный товар не записываем.
+  await requireVw(client, companyId, fromVw);
+  await requireVw(client, companyId, toVw);
   if (quality === 'good') {
     const free = (await transferable(client, companyId, sku, fromVw)).free;
     if (free < qty) {

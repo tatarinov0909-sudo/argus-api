@@ -115,11 +115,13 @@ router.get('/defect/:id', requireAuth, requireRole('owner', 'manager', 'seller')
         warehouse: await warehouseOf(c, warehouseId),
         decidedBy: d.decided_role === 'seller' ? 'продавец' : (d.decided_name || 'склад'),
         doneBy: d.done_name || null,
-        cells: d.done_cells || [],
+        // Ячейки — складу; продавцу — без адресов (уточнение владельца 03.10.2026).
+        cells: req.auth.role === 'seller' ? [] : (d.done_cells || []),
         note: d.note || null,
         items: [{
           article: d.mp_article || d.sku, sku: d.sku, name: d.name, barcode: d.barcode || barcodeOf(d.name),
-          qty: Number(d.qty), bucket: d.bucket === 'packaging_defect' ? 'брак упаковки' : 'брак',
+          // Выполнено — сколько сделали (брака могло оказаться меньше).
+          qty: d.status === 'done' ? Number(d.done_qty || d.qty) : Number(d.qty), bucket: d.bucket === 'packaging_defect' ? 'брак упаковки' : 'брак',
         }],
       };
     });

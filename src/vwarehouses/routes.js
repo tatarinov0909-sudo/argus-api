@@ -39,6 +39,9 @@ router.get('/', requireAuth, requireRole('seller', 'owner', 'manager', 'worker')
       const list = await vw.list(c, companyId);
       if (req.auth.role !== 'seller') {
         for (const w of list) w.zone = await separate.zoneInfo(c, req.auth.warehouseId, w.id);
+      } else {
+        // Как товар хранится, продавцу не отдаём (уточнение владельца 03.10.2026).
+        for (const w of list) { delete w.keepSeparate; delete w.defectSeparate; }
       }
       return {
         main: { id: null, name: vw.MAIN_NAME },
@@ -220,7 +223,11 @@ router.get('/notifications', requireAuth, requireRole('seller', 'owner', 'manage
 
 router.post('/notifications/seen', requireAuth, requireRole('seller'), async (req, res, next) => {
   try {
-    const n = await inSeller(req, (c) => vw.markSeen(c, req.auth.companyId));
+    const ids = (req.body || {}).ids;
+    if (ids !== undefined && (!Array.isArray(ids) || ids.length > 500 || ids.some((x) => !/^[0-9a-f-]{36}$/i.test(String(x))))) {
+      throw new HttpError(400, 'Какие уведомления отметить — список номеров');
+    }
+    const n = await inSeller(req, (c) => vw.markSeen(c, req.auth.companyId, ids || null));
     res.json({ seen: n });
   } catch (err) { next(err); }
 });

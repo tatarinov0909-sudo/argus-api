@@ -583,23 +583,24 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
     // Виртуальный склад строк (02.10.2026): не передан — любые строки, каждая
     // переезжает со своим складом; null — «Основной».
     const vw = Object.prototype.hasOwnProperty.call(req.body, 'vw') ? (req.body.vw || null) : undefined;
+    // Годное → брак — тем же путём, что кнопка «Брак» у грузчика: склад не
+    // назван, а в ячейке товар разных складов продавца, — спорная ситуация
+    // с решением продавца (проверка 03.10.2026).
+    if (fromQuality === 'good' && toQuality && toQuality !== 'good') {
+      if (!companyId) throw new HttpError(400, 'Укажите продавца товара, который отмечаете браком');
+      const out = await withTenantContext({ warehouseId }, (client) => defects.markFromShelf(client, {
+        warehouseId, companyId, sku, fromCellBlockId, toCellBlockId: toCellBlockId || null, qty,
+        bucket: toQuality, source: 'move', staffKeyId, vw,
+      }));
+      res.status(201).json(out);
+      return;
+    }
     const moved = await withTenantContext({ warehouseId }, async (client) => {
       const result = await moveStock(client, warehouseId, {
         sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality, toQuality,
         workerKeyId: req.auth.staffKeyId || null, vw,
       });
 
-      // Годное стало браком — это перемещение на склад брака продавца:
-      // документ на каждый склад, с которого брак.
-      if (result.fromQuality === 'good' && result.toQuality !== 'good') {
-        if (!companyId) throw new HttpError(400, 'Укажите продавца товара, который отмечаете браком');
-        for (const part of result.parts) {
-          await defects.createMove(client, {
-            warehouseId, companyId, sku: result.sku, qty: part.qty, bucket: result.toQuality,
-            source: 'move', cellBlockId: result.toCellBlockId, staffKeyId, vw: part.vw,
-          });
-        }
-      }
       const changedState = result.toQuality !== result.fromQuality;
       const changedCell = result.toCellBlockId !== result.fromCellBlockId;
       const parts = [];

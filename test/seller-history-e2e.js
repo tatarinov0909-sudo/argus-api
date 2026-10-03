@@ -77,12 +77,14 @@ const { withTenantContext, pool } = require('../src/db/pool');
     const historical=await api('GET','/api/sellers/history?sku=SharedCase',seller);
     assert.equal(historical.events.find(e=>e.kind==='shipped'&&e.document==='HISTORY-SUPPLY-ORDER').at,departed.shipped_at);
 
+    // «Корректировка», а не «Перемещение»: перекладку между ячейками продавцу
+    // не показываем (уточнение владельца 03.10.2026).
     await withTenantContext({warehouseId},c=>c.query(`
       INSERT INTO stock_operations(warehouse_id,company_id,sku,kind,qty,to_cell_block_id,created_at)
-      SELECT $1,$2,'SharedCase','move',1,$3,'2025-01-01 00:00:00.123456+00'::timestamptz FROM generate_series(1,235)`,[warehouseId,alpha.id,blocks[0].id]));
+      SELECT $1,$2,'SharedCase','adjust',1,$3,'2025-01-01 00:00:00.123456+00'::timestamptz FROM generate_series(1,235)`,[warehouseId,alpha.id,blocks[0].id]));
     const first=await api('GET','/api/sellers/history?sku=SharedCase&limit=17',seller);
     assert.equal(first.events.length,17);assert.ok(first.nextCursor);
-    await withTenantContext({warehouseId},c=>c.query(`INSERT INTO stock_operations(warehouse_id,company_id,sku,kind,qty,to_cell_block_id) VALUES ($1,$2,'SharedCase','move',1,$3)`,[warehouseId,alpha.id,blocks[0].id]));
+    await withTenantContext({warehouseId},c=>c.query(`INSERT INTO stock_operations(warehouse_id,company_id,sku,kind,qty,to_cell_block_id) VALUES ($1,$2,'SharedCase','adjust',1,$3)`,[warehouseId,alpha.id,blocks[0].id]));
     const all=[...first.events];let cursor=first.nextCursor,pages=1;
     while(cursor){const page=await api('GET','/api/sellers/history?sku=SharedCase&limit=17&cursor='+encodeURIComponent(cursor),seller);all.push(...page.events);cursor=page.nextCursor;assert.ok(++pages<50);}
     assert.equal(all.length,240); // 1 receipt, 2 picks, 2 departures, 235 operations.

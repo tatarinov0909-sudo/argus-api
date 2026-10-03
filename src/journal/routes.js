@@ -88,7 +88,10 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
       if (original.rows[0].answered) throw new HttpError(409, 'По этой записи уже решено');
       // Срочную отметку решает тот, кому она адресована: менеджер без права
       // «отметки о нехватке» её и не видит.
-      if (original.rows[0].urgent && role === 'manager' && !(req.auth.grants || []).includes('shortages')) {
+      // Заявка продавца на перенос — не отметка «нет товара»: её решает любой
+      // менеджер (переносы ему разрешены; проверка 03.10.2026).
+      if (original.rows[0].urgent && original.rows[0].entity_type !== 'vw_transfer'
+          && role === 'manager' && !(req.auth.grants || []).includes('shortages')) {
         throw new HttpError(403, 'Отметки «нет товара» решает владелец или менеджер с этим правом');
       }
       if (original.rows[0].agent === 'Обмен с WB') {

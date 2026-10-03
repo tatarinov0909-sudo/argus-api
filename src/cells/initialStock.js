@@ -33,6 +33,7 @@ const { formatBlockLabel } = require('./label');
 const { plural } = require('../journal/plural');
 const defects = require('../defects/service');
 const journal = require('../journal/repository');
+const separate = require('../vwarehouses/separate');
 const { zoneOf } = require('../warehouses/time');
 
 // Столько строк за раз. У склада ячеек несколько тысяч; больше — частями,
@@ -310,6 +311,26 @@ async function plan(client, warehouseId, { companyId, rows, defaultVw }, { lock 
           + 'загрузка кладёт только в пустое место; уберите строку из файла';
       }
     }
+  }
+
+  // «Хранить отдельно» и зоны (проверка 03.10.2026): загрузка кладёт по тем
+  // же правилам, что приёмка, — ни в чужую зону, ни вместе с отдельным складом.
+  const lay = await separate.layout(client, seller.id);
+  const inFile = new Map();
+  for (const l of lines) {
+    if (l.error || l.already || !l.cellId) continue;
+    const why = await separate.conflict(client, { cellBlockId: l.cellId, companyId: seller.id, vw: l.vw || null, quality: l.quality }, lay);
+    if (why) { l.error = `сюда нельзя: ${why}`; continue; }
+    const key = `${l.cellId}|${l.quality === 'good'}`;
+    const other = (inFile.get(key) || []).find((o) => (o.vw || null) !== (l.vw || null)
+      && (lay.separate(o.vw, o.quality) || lay.separate(l.vw, l.quality)));
+    if (other) {
+      l.error = `в этой ячейке по файлу уже товар склада «${lay.name(other.vw)}» (строка ${other.line}), `
+        + `а склад «${lay.name(lay.separate(l.vw, l.quality) ? l.vw : other.vw)}» хранится отдельно`;
+      continue;
+    }
+    if (!inFile.has(key)) inFile.set(key, []);
+    inFile.get(key).push(l);
   }
 
   const ok = lines.filter((l) => !l.error && !l.already);

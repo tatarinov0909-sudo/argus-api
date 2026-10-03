@@ -187,6 +187,19 @@ async function suggestCells(client, warehouseId, companyId, limit = 6, opts = {}
   // Склад брака известен (02.10.2026): не предлагать ячейку, куда его брак
   // класть нельзя (брак склада «хранить отдельно» — отдельно).
   const out = [];
+  if (opts.vw === undefined && companyId) {
+    const separate = require('../vwarehouses/separate');
+    const lay = await separate.layout(client, companyId);
+    if (lay.vws.some((v) => v.keep_separate && v.defect_separate)) {
+      // Склад брака неизвестен: ячейка с браком продавца может быть «чужой»
+      // для склада, чей брак хранится отдельно, — подсказываем только без него.
+      const mine = new Set((await client.query(
+        `SELECT DISTINCT cell_block_id FROM cell_stock WHERE company_id = $1 AND quality <> 'good' AND qty > 0`,
+        [companyId])).rows.map((r) => r.cell_block_id));
+      return rows.filter((r) => !mine.has(r.id)).slice(0, limit)
+        .map((r) => ({ cellBlockId: r.id, label: r.label, reason: r.reason }));
+    }
+  }
   if (opts.vw !== undefined && companyId) {
     const separate = require('../vwarehouses/separate');
     const lay = await separate.layout(client, companyId);
@@ -208,7 +221,7 @@ async function balances(client, companyId) {
       WHERE cs.company_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
       GROUP BY cs.sku, cs.quality`, [companyId])).rows;
   const pending = (await client.query(
-    `SELECT sku, bucket, SUM(qty)::int AS qty FROM defect_decisions
+    `SELECT sku, bucket, SUM(qty - done_qty)::int AS qty FROM defect_decisions
       WHERE company_id = $1 AND status = 'pending' GROUP BY sku, bucket`, [companyId])).rows;
   const since = (await client.query(
     `SELECT sku, bucket, MIN(created_at) AS at FROM defect_moves WHERE company_id = $1 GROUP BY sku, bucket`,
@@ -237,6 +250,14 @@ async function decide(client, {
     barcode = typeof markdownBarcode === 'string' ? markdownBarcode.replace(/\s+/g, '') : '';
     if (!/^[0-9A-Za-z-]{4,64}$/.test(barcode)) {
       throw new HttpError(400, 'Для уценки впишите штрихкод уценённой карточки на WB — цифры, от 4 знаков');
+    }
+    // Штрихкод уже у обычного товара продавца — уценка стала бы его остатком
+    // без предупреждения (проверка 03.10.2026). Своя прежняя уценка — можно.
+    const taken = (await client.query(
+      `SELECT name FROM products WHERE company_id = $1 AND btrim(barcode) = $2 AND sku NOT LIKE 'УЦ-%' LIMIT 1`,
+      [companyId, barcode])).rows[0];
+    if (taken) {
+      throw new HttpError(409, `Штрихкод ${barcode} уже у товара «${taken.name}» — у уценки на WB своя карточка и свой штрихкод`);
     }
   }
   // Решения по одному продавцу — по очереди: два решения сразу не должны
@@ -284,7 +305,7 @@ async function defectCells(client, warehouseId, companyId, sku, bucket) {
 // Задания грузчику: решения, которые склад ещё не выполнил.
 async function tasks(client, warehouseId) {
   const rows = (await client.query(
-    `SELECT d.id, d.number, d.company_id, c.name AS company, d.sku, d.name, d.bucket, d.qty, d.action,
+    `SELECT d.id, d.number, d.company_id, c.name AS company, d.sku, d.name, d.bucket, d.qty, d.done_qty, d.action,
             d.markdown_barcode, d.note, d.decided_role, d.decided_name, d.decided_at
        FROM defect_decisions d JOIN companies c ON c.id = d.company_id AND c.archived_at IS NULL
       WHERE d.warehouse_id = $1 AND d.status = 'pending'
@@ -293,7 +314,9 @@ async function tasks(client, warehouseId) {
   for (const r of rows) {
     out.push({
       id: r.id, number: r.number, companyId: r.company_id, company: r.company, sku: r.sku, name: r.name,
-      bucket: r.bucket, qty: Number(r.qty), action: r.action, markdownBarcode: r.markdown_barcode, note: r.note,
+      // qty — сколько ещё сделать; total — сколько решили.
+      bucket: r.bucket, qty: Number(r.qty) - Number(r.done_qty || 0), total: Number(r.qty), doneQty: Number(r.done_qty || 0),
+      action: r.action, markdownBarcode: r.markdown_barcode, note: r.note,
       decidedRole: r.decided_role, decidedName: r.decided_name, decidedAt: r.decided_at,
       cells: await defectCells(client, warehouseId, r.company_id, r.sku, r.bucket),
     });
@@ -319,6 +342,12 @@ async function markdownProduct(client, warehouseId, companyId, decision) {
 // Выполнить решение: снять брак со склада брака (из ячеек, начиная с самого
 // давнего) и сделать с ним то, что решили. cellBlockId — куда положить товар,
 // который возвращается в продажу (перепаковка, уценка).
+//
+// Частями (проверка 03.10.2026): брак разных складов продавца, один из
+// которых «хранить отдельно», в одну ячейку не кладут — что к ячейке не
+// подходит, остаётся до следующего захода с другой ячейкой. Брака на складе
+// оказалось меньше, чем решено (пересчёт), — выполняется найденное, решение
+// закрывается, продавцу уведомление о разнице.
 async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockId }) {
   if (!UUID.test(String(decisionId || ''))) throw new HttpError(404, 'Задание не найдено');
   const d = (await client.query(
@@ -327,35 +356,61 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
   if (!d) throw new HttpError(404, 'Задание не найдено');
   if (d.status !== 'pending') throw new HttpError(409, `Задание ${d.number} уже выполнено`);
   const backToSale = d.action === 'repack' || d.action === 'markdown';
+  const total = Number(d.qty);
+  const remaining = total - Number(d.done_qty || 0);
+  // Брак этого товара по ячейкам и складам продавца — самые давние строки первыми.
+  const rows = (await client.query(
+    `SELECT cs.cell_block_id, cs.virtual_warehouse_id AS vw, SUM(cs.qty)::int AS qty, ${blockLabelSql('cb', 'wr')} AS label
+       FROM cell_stock cs JOIN cell_blocks cb ON cb.id = cs.cell_block_id JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3 AND cs.quality = $4 AND cs.qty > 0
+      GROUP BY cs.cell_block_id, cs.virtual_warehouse_id, cb.id, wr.id
+      ORDER BY MIN(cs.updated_at)`, [warehouseId, d.company_id, d.sku, d.bucket])).rows;
+  const have = rows.reduce((n, r) => n + r.qty, 0);
   let target = null;
-  if (backToSale) {
+  if (backToSale && have > 0) {
     if (!cellBlockId) throw new HttpError(400, 'Укажите ячейку, куда кладёте товар для продажи');
     target = await cellLabel(client, warehouseId, cellBlockId);
   }
-  const qty = Number(d.qty);
-  const cells = await defectCells(client, warehouseId, d.company_id, d.sku, d.bucket);
-  const have = cells.reduce((s, c) => s + c.qty, 0);
-  if (have < qty) {
-    throw new HttpError(409, `На складе брака ${have} шт. «${d.name}», а в задании ${qty} — пересчитайте ячейки брака`);
-  }
-  let left = qty;
+  const separate = backToSale && have > 0 ? require('../vwarehouses/separate') : null;
+  const lay = separate ? await separate.layout(client, d.company_id) : null;
+  let left = Math.min(remaining, have);
   const took = [];
   const byVw = new Map();
-  for (const c of cells) {
+  const fits = new Map();
+  let refusal = null;
+  for (const r of rows) {
     if (left <= 0) break;
-    const n = Math.min(left, c.qty);
+    const key = r.vw || '';
+    if (backToSale) {
+      if (!fits.has(key)) {
+        // Подходит ли товар этого склада к ячейке — с тем, что в ней уже лежит,
+        // и с тем, что кладём этим же заходом.
+        const why = await separate.conflict(client, { cellBlockId, companyId: d.company_id, vw: r.vw || null, quality: 'good' }, lay);
+        const clash = [...byVw.keys()].some((k) => k !== key
+          && (lay.separate(k || null, 'good') || lay.separate(r.vw || null, 'good')));
+        fits.set(key, !why && !clash);
+        if (why && !refusal) refusal = why;
+      }
+      if (!fits.get(key)) continue;
+    }
+    const n = Math.min(left, r.qty);
     const parts = await takeFromCell(client, warehouseId, {
-      cellBlockId: c.cellBlockId, sku: d.sku, companyId: d.company_id, quality: d.bucket, qty: n, verb: 'взять',
+      cellBlockId: r.cell_block_id, sku: d.sku, companyId: d.company_id, quality: d.bucket, qty: n, verb: 'взять', vw: r.vw || null,
     });
     for (const part of parts) byVw.set(part.vw || '', (byVw.get(part.vw || '') || 0) + part.qty);
-    took.push({ cellBlockId: c.cellBlockId, label: c.label, qty: n });
+    const same = took.find((t) => t.cellBlockId === r.cell_block_id);
+    if (same) same.qty += n; else took.push({ cellBlockId: r.cell_block_id, label: r.label, qty: n });
     left -= n;
   }
+  const placed = took.reduce((n, t) => n + t.qty, 0);
+  if (backToSale && have > 0 && placed === 0) {
+    throw new HttpError(409, `Сюда нельзя: ${refusal || 'эта ячейка не подходит'}. Положите в другую ячейку.`);
+  }
   let toSku = null;
-  if (backToSale) {
+  if (backToSale && placed > 0) {
     toSku = d.action === 'markdown' ? await markdownProduct(client, warehouseId, d.company_id, d) : d.sku;
     for (const [vwKey, n] of byVw) {
-      await require('../vwarehouses/separate').checkPut(client, warehouseId, { cellBlockId, companyId: d.company_id, vw: vwKey || null, quality: 'good' });
+      await separate.checkPut(client, warehouseId, { cellBlockId, companyId: d.company_id, vw: vwKey || null, quality: 'good' });
       await client.query(
         `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
          VALUES ($1, $2, $3, $4, $5, 'good', $6)`, [cellBlockId, warehouseId, d.company_id, toSku, n, vwKey || null]);
@@ -369,14 +424,20 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
         JSON.stringify({ decision: d.number, fromQuality: d.bucket, toQuality: backToSale ? 'good' : null, toSku }), staffKeyId || null]);
     await refreshCellFill(client, t.cellBlockId);
   }
-  if (backToSale) await refreshCellFill(client, cellBlockId);
+  if (backToSale && placed > 0) await refreshCellFill(client, cellBlockId);
+  const doneQty = Number(d.done_qty || 0) + placed;
+  // Закрыто: сделано всё — или брака этого товара на складе больше нет.
+  const finished = doneQty >= total || have - placed <= 0;
+  const short = finished ? total - doneQty : 0;
   const who = await staffName(client, staffKeyId);
   await client.query(
-    `UPDATE defect_decisions SET status = 'done', done_by = $2, done_name = $3, done_at = now(),
-            done_cell_block_id = $4, done_cells = $5::jsonb, markdown_sku = COALESCE($6, markdown_sku)
+    `UPDATE defect_decisions SET done_qty = $7, status = CASE WHEN $8 THEN 'done' ELSE 'pending' END,
+            done_by = $2, done_name = $3, done_at = CASE WHEN $8 THEN now() ELSE done_at END,
+            done_cell_block_id = COALESCE($4, done_cell_block_id),
+            done_cells = COALESCE(done_cells, '[]'::jsonb) || $5::jsonb, markdown_sku = COALESCE($6, markdown_sku)
       WHERE id = $1`,
-    [d.id, staffKeyId || null, who, backToSale ? cellBlockId : null, JSON.stringify(took),
-      d.action === 'markdown' ? toSku : null]);
+    [d.id, staffKeyId || null, who, backToSale && placed > 0 ? cellBlockId : null, JSON.stringify(took),
+      d.action === 'markdown' ? toSku : null, doneQty, finished]);
   const from = took.map((t) => `${t.label} — ${t.qty} шт.`).join(', ');
   const what = {
     return_to_seller: 'выдал продавцу (акт выдачи брака)',
@@ -386,11 +447,26 @@ async function execute(client, { warehouseId, decisionId, staffKeyId, cellBlockI
   }[d.action];
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик', status: 'auto',
-    actionText: `Выполнено решение по браку ${d.number} продавца «${d.company}»: «${d.name}», ${qty} шт. — ${what}. Взято из ${from}.`,
-    entityType: 'defect_decision', entityId: d.id, cellBlockId: backToSale ? cellBlockId : took[0].cellBlockId,
+    actionText: (placed > 0
+      ? `Выполнено решение по браку ${d.number} продавца «${d.company}»: «${d.name}», ${placed} шт. — ${what}. Взято из ${from}.`
+      : `Решение по браку ${d.number} продавца «${d.company}» («${d.name}») закрыто: брака на складе нет.`)
+      + (!finished ? ` Осталось ${total - doneQty} шт. — товар другого склада продавца, его кладут в другую ячейку.` : '')
+      + (short > 0 && placed > 0 ? ` Брака оказалось меньше: выполнено ${doneQty} из ${total} шт., продавцу сообщено.` : ''),
+    entityType: 'defect_decision', entityId: d.id,
+    cellBlockId: backToSale && placed > 0 ? cellBlockId : (took[0] ? took[0].cellBlockId : null),
     actorType: 'worker', actorId: staffKeyId || null,
   });
-  return { id: d.id, number: d.number, action: d.action, qty, took, toSku };
+  if (short > 0) {
+    // Продавцу — о разнице (вариант «выполнить на найденное», 03.10.2026).
+    await client.query(
+      `INSERT INTO seller_notifications (warehouse_id, company_id, kind, text, entity_id) VALUES ($1, $2, 'defect_short', $3, $4)`,
+      [warehouseId, d.company_id, `Решение по браку ${d.number}, «${d.name}» (${ACTIONS[d.action]}): брака на складе оказалось меньше `
+        + `— выполнено ${doneQty} из ${total} шт. Остальное не нашлось при пересчёте.`, d.id]);
+  }
+  return {
+    id: d.id, number: d.number, action: d.action, qty: placed, doneQty, total, took, toSku,
+    status: finished ? 'done' : 'pending', left: finished ? 0 : total - doneQty, short,
+  };
 }
 
 // Сколько брака у каждого продавца ещё никто не решил и с какого времени
@@ -403,7 +479,7 @@ async function waitingBySeller(client, warehouseId, { olderThanDays = 0 } = {}) 
          FROM cell_stock cs WHERE cs.warehouse_id = $1 AND cs.quality <> 'good' AND cs.qty > 0
         GROUP BY cs.company_id, cs.sku, cs.quality),
      pending AS (
-       SELECT company_id, sku, bucket, SUM(qty) AS qty FROM defect_decisions
+       SELECT company_id, sku, bucket, SUM(qty - done_qty) AS qty FROM defect_decisions
         WHERE warehouse_id = $1 AND status = 'pending' GROUP BY company_id, sku, bucket),
      waiting AS (
        SELECT s.company_id, GREATEST(s.qty - COALESCE(p.qty, 0), 0) AS qty,

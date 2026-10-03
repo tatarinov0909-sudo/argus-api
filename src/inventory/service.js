@@ -503,6 +503,23 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
     [warehouseId, task.cell_block_id])).rows;
   const partsOf = (line) => before.filter((b) => (b.company_id || null) === (line.companyId || null)
     && b.sku === line.sku && b.quality === (line.quality || 'good'));
+  // Чья ячейка: зона склада продавца или ячейка, где лежит только товар его
+  // склада «хранить отдельно», — туда и лишнее (проверка 03.10.2026).
+  const separate = require('../vwarehouses/separate');
+  const zoneOwner = (await client.query(
+    `SELECT v.id, v.company_id FROM cell_blocks cb JOIN virtual_warehouses v ON v.id = cb.reserved_vw_id AND v.archived_at IS NULL
+      WHERE cb.id = $1`, [task.cell_block_id])).rows[0];
+  const layouts = new Map();
+  const homeOf = async (line) => {
+    if (!line.companyId) return null;
+    if (zoneOwner && zoneOwner.company_id === line.companyId) return zoneOwner.id;
+    if (!layouts.has(line.companyId)) layouts.set(line.companyId, await separate.layout(client, line.companyId));
+    const lay = layouts.get(line.companyId);
+    const good = (line.quality || 'good') === 'good';
+    const present = [...new Set(before.filter((b) => b.company_id === line.companyId && (b.quality === 'good') === good)
+      .map((b) => b.vw || null))];
+    return present.length === 1 && lay.separate(present[0], line.quality || 'good') ? present[0] : null;
+  };
   const cuts = [];
   await client.query(
     `DELETE FROM cell_stock cs
@@ -515,7 +532,7 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
   const seen = new Set();
   for (const line of counted) {
     seen.add(`${line.companyId || ''}|${line.sku}|${line.quality || 'good'}`);
-    const plan = vwarehouses.allocateCount(partsOf(line), Number(line.qty));
+    const plan = vwarehouses.allocateCount(partsOf(line), Number(line.qty), await homeOf(line));
     if (plan.cut.length || plan.surplus) cuts.push({ line, ...plan });
     for (const part of plan.result) {
       await client.query(
