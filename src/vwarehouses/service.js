@@ -666,6 +666,7 @@ function howText(kind, parts, rows) {
 // знать не нужно (владелец 03.10.2026); title — складу, с адресом.
 async function splitSituation(client, { warehouseId, companyId, kind, sku, name, quality = 'good', title, sellerTitle, parts }) {
   const st = sellerTitle || title;
+  const end = /[.!?]$/.test(st) ? ' ' : '. ';
   const company = await companyRow(client, warehouseId, companyId);
   const rows = await list(client, companyId, { withArchived: true });
   if (!rows.length) return null;
@@ -674,7 +675,7 @@ async function splitSituation(client, { warehouseId, companyId, kind, sku, name,
   }));
   const how = howText(kind, clean, rows);
   if (rightsOf(company).decide) {
-    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${st}. Склад решил так — ${dot(how)}${DECIDED_SELF}` });
+    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${st}${end}Склад решил так — ${dot(how)}${DECIDED_SELF}` });
     return null;
   }
   const d = (await client.query(
@@ -682,7 +683,7 @@ async function splitSituation(client, { warehouseId, companyId, kind, sku, name,
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb) RETURNING id`,
     [warehouseId, companyId, kind, sku, name || sku, quality, st.slice(0, 500), JSON.stringify(clean)])).rows[0];
   await notifySeller(client, { warehouseId, companyId, kind: 'vw_decision', entityId: d.id,
-    text: `${st}. Пока учёт записан по правилу склада — ${dot(how)} Вы запретили складу решать такое без вас: согласитесь или разделите по-своему на странице «Товары».` });
+    text: `${st}${end}Пока учёт записан по правилу склада — ${dot(how)} Вы запретили складу решать такое без вас: согласитесь или разделите по-своему на странице «Товары».` });
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик', status: 'auto',
     actionText: `${title} (продавец «${company.name}»). Учёт записан по правилу — ${dot(how)} Продавец запретил складу решать такое без него — решение за ним.`,

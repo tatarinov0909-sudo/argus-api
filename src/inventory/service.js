@@ -582,7 +582,7 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
     if (candidates.length < 2) {
       await vwarehouses.notifySeller(client, {
         warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus',
-        text: `${sellerTitle.replace(/\.$/, '')}, ${c.cut.length ? 'списано с' : 'записаны на'} «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
+        text: `${sellerTitle} ${c.cut.length ? 'Списано с' : 'Записаны на'} склад «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
       });
       continue;
     }
