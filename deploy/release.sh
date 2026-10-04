@@ -39,18 +39,23 @@ remote "set -e; mkdir -p $backup; chmod 700 $backup; cd $APP
   sudo -u postgres pg_dump -Fc argus > $backup/database.dump; chmod 600 $backup/database.dump
   test -s $backup/database.dump"
 
-echo "3/6 выкладка"
-tar cf - "${files[@]}" | remote "set -e; in=$APP/.incoming-$ts; mkdir -p \$in; tar xf - -C \$in
-  cd \$in; find . -type f | while read -r f; do mkdir -p \"$APP/\$(dirname \"\$f\")\"; mv -f \"\$f\" \"$APP/\$f\"; done
-  rm -rf \$in"
-
 rollback() {
+  trap - ERR
   echo "ОТКАТ приложения из $backup"
   remote "cd $APP; tar xf $backup/application.tar; while read -r f; do rm -f \"\$f\"; done < $backup/new-files
     pm2 restart argus-api --update-env >/dev/null; sleep 4; curl -sf http://127.0.0.1:3000/health" \
     && echo "откат выполнен, прод здоров" || echo "ВНИМАНИЕ: после отката прод не отвечает"
   exit 1
 }
+
+# Во время замены и миграций старый процесс не должен обслуживать запросы
+# частично новой версией. Любой сбой после бэкапа возвращает приложение.
+trap rollback ERR
+remote "pm2 stop argus-api >/dev/null"
+echo "3/6 выкладка"
+tar cf - "${files[@]}" | remote "set -e; in=$APP/.incoming-$ts; mkdir -p \$in; tar xf - -C \$in
+  cd \$in; find . -type f | while read -r f; do mkdir -p \"$APP/\$(dirname \"\$f\")\"; mv -f \"\$f\" \"$APP/\$f\"; done
+  rm -rf \$in"
 
 if [ $migrate = 1 ]; then
   echo "4/6 миграции"
