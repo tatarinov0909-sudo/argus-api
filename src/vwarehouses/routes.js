@@ -1,10 +1,11 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const { HttpError } = require('../middleware/errorHandler');
 const vw = require('./service');
 const separate = require('./separate');
+const batch = require('./batch');
 const kladovshchik = require('../agents/kladovshchik');
 
 // Виртуальные склады продавца (владелец 02.10.2026). Склады заводит склад
@@ -132,6 +133,26 @@ router.delete('/:id([0-9a-fA-F-]{36})', requireAuth, requireRole('owner', 'manag
       warehouseId: req.auth.warehouseId, companyId: companyOf(req), id: req.params.id, actor: await actorOf(c, req.auth),
     }));
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Пакетный выбор, проверка Excel и запись. Права проверяются на сервере.
+router.get('/transfer-candidates', requireAuth, requireRole('owner', 'manager'), requireGrant('warehouse'), async (req, res, next) => {
+  try {
+    const out = await inWarehouse(req, c => batch.candidates(c, req.auth.warehouseId, req.query));
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+router.post('/transfers/preview', requireAuth, requireRole('owner', 'manager'), requireGrant('warehouse'), async (req, res, next) => {
+  try {
+    const out = await inWarehouse(req, c => batch.preview(c, req.auth.warehouseId, req.body));
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+router.post('/transfers/batch', requireAuth, requireRole('owner', 'manager'), requireGrant('warehouse'), async (req, res, next) => {
+  try {
+    const out = await inWarehouse(req, async c => batch.commit(c, req.auth.warehouseId, req.body, await actorOf(c, req.auth)));
+    res.status(out.replayed ? 200 : 201).set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }
 });
 
