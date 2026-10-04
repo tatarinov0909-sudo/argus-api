@@ -130,6 +130,17 @@ const whIdOf = (token) => JSON.parse(
       );
     });
 
+    // «Сегодня» считает сразу, без порогов сторожа: решение ждёт уже сейчас.
+    const today = await api('GET', '/api/alerts/today', { token: ownerToken });
+    check('«Сегодня»: расхождение сразу в «Ждут решения», отгружать нечего', () => {
+      assert.equal(today.status, 200, JSON.stringify(today.body));
+      assert.equal(today.body.decide.discrepancies, 1, JSON.stringify(today.body));
+      assert.equal(today.body.ship.supplies + today.body.ship.ready + today.body.ship.onec, 0);
+      assert.deepEqual(today.body.exchange.sync, []);
+    });
+    const todayWorker = await api('GET', '/api/alerts/today', { token: workerToken });
+    check('«Сегодня» работнику не отдаётся', () => assert.equal(todayWorker.status, 403));
+
     // Состарим запись журнала — иначе пришлось бы ждать 12 часов.
     const agedOk = await ageRows(
       `UPDATE journal_entries SET created_at = now() - interval '20 hours'

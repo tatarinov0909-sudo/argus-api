@@ -58,6 +58,48 @@ router.post('/:id/seen', requireAuth, requireRole('owner'), async (req, res, nex
   }
 });
 
+// «Сегодня» — четыре цифры на первом экране владельца (отчёт рецензии 03.10,
+// раздел 30): что отгрузить, что принять, что ждёт его решения, что не так с
+// обменом. Только числа: каждое открывает уже существующий список. Работа
+// считается тем же правилом, что у грузчика и Кладовщика (workQueue), обмен —
+// по живым тревогам сторожа, чтобы «1С молчит» не считалось вторым способом.
+router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { workQueue } = require('../agents/kladovshchik');
+    const data = await withTenantContext({ warehouseId }, async (client) => {
+      const work = await workQueue(client, warehouseId);
+      const d = (await client.query(
+        `SELECT
+           (SELECT count(*)::int FROM journal_entries je
+             WHERE je.warehouse_id = $1 AND je.status = 'pending'
+               AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS discrepancies,
+           (SELECT count(*)::int FROM vw_transfers WHERE warehouse_id = $1 AND status = 'requested') AS seller_requests,
+           (SELECT count(*)::int FROM inventory_tasks WHERE warehouse_id = $1 AND status = 'waiting_owner') AS recounts,
+           (SELECT count(DISTINCT i.id)::int FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+              JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+             WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.supply_id IS NULL
+               AND i.status <> 'shipped' AND i.mp_closed_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM products p WHERE p.warehouse_id = ii.warehouse_id
+                                 AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped`,
+        [warehouseId],
+      )).rows[0];
+      const sync = (await client.query(
+        `SELECT text FROM alerts WHERE warehouse_id = $1 AND resolved_at IS NULL AND alert_key LIKE 'sync\\_%'
+          ORDER BY created_at`, [warehouseId])).rows.map((r) => r.text);
+      return {
+        ship: { supplies: work.suppliesToPick, orders: work.ordersToPick, ready: work.suppliesReady, onec: work.onecToPick },
+        receive: { arrivals: work.toReceive, arrived: work.arrived, returns: work.returnsToSort },
+        decide: { discrepancies: d.discrepancies, sellerRequests: d.seller_requests, recounts: d.recounts },
+        exchange: { sync, wbUnmapped: d.wb_unmapped },
+      };
+    });
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Прогнать проверку прямо сейчас — для отладки и для тестов, чтобы не ждать
 // десять минут до следующего прохода.
 router.post('/check', requireAuth, requireRole('owner'), async (req, res, next) => {

@@ -638,7 +638,7 @@ router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), a
       const balances = await defectsService.balances(c, companyId);
       const moves = (await c.query(
         `SELECT m.id, m.number, m.sku, m.name, m.qty, m.bucket, m.note, m.source, m.created_at,
-                m.photo IS NOT NULL AS has_photo, i.number AS document
+                m.photo IS NOT NULL AS has_photo, i.number AS document, m.invoice_id
            FROM defect_moves m LEFT JOIN invoices i ON i.id = m.invoice_id
           WHERE m.company_id = $1 ORDER BY m.created_at DESC, m.number DESC LIMIT 1001`, [companyId])).rows;
       const decisions = (await c.query(
@@ -654,7 +654,7 @@ router.get('/defects', requireAuth, requireRole('seller', 'owner', 'manager'), a
       moves: out.moves.slice(0, 1000).map((m) => ({
         id: m.id, number: m.number, sku: m.sku, name: m.name, qty: Number(m.qty), bucket: m.bucket, note: m.note,
         source: m.source, sourceName: sourceName[m.source] || 'склад', document: m.document || null,
-        at: m.created_at, hasPhoto: m.has_photo,
+        invoiceId: m.invoice_id || null, at: m.created_at, hasPhoto: m.has_photo,
       })),
       decisions: out.decisions.slice(0, 500).map((d) => ({
         id: d.id, number: d.number, sku: d.sku, name: d.name, bucket: d.bucket, qty: Number(d.qty), action: d.action,
