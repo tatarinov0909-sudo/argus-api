@@ -1,5 +1,6 @@
 const express = require('express');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
+const billing = require('../billing/service');
 const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const sellerWarehouses = require('../marketplaces/sellerWarehouses');
@@ -59,6 +60,34 @@ router.get('/me/readiness', requireAuth, requireRole('owner'), async (req, res, 
   } catch (err) {
     next(err);
   }
+});
+
+// Расчёты с продавцами: прайс склада и начисления за месяц (04.10.2026).
+// Деньги — право «тариф и деньги»: владелец всегда, менеджер — если открыли.
+router.get('/billing/tariff', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const t = await withTenantContext({ warehouseId }, (c) => billing.tariff(c, warehouseId));
+    res.json({ ...t, services: billing.SERVICES, storageUnits: billing.STORAGE_UNITS });
+  } catch (err) { next(err); }
+});
+
+router.put('/billing/tariff', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const who = req.auth.name || req.auth.ownerName || (req.auth.role === 'owner' ? 'руководитель' : 'менеджер');
+    res.json(await withTenantContext({ warehouseId }, (c) => billing.saveTariff(c, warehouseId, req.body, who)));
+  } catch (err) { next(err); }
+});
+
+router.get('/billing/charges', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const companyId = req.query.companyId || null;
+    if (companyId && !/^[0-9a-f-]{36}$/i.test(companyId)) throw new HttpError(400, 'Неверный продавец');
+    res.set('Cache-Control', 'no-store').json(await withTenantContext({ warehouseId },
+      (c) => billing.charges(c, warehouseId, { month: req.query.month, companyId })));
+  } catch (err) { next(err); }
 });
 
 // Сверка перед сменой учёта остатков: сколько товара продавцов по 1С и

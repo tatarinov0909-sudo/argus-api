@@ -7,6 +7,7 @@ const { transliteratePrefix } = require('../auth/service');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const inbound = require('./inbound');
 const defectsService = require('../defects/service');
+const billingService = require('../billing/service');
 
 const { loadStock, BUCKET_SQL, summarize, stockBySeller } = require('./stock');
 const { readPage, loadHistory } = require('./history');
@@ -283,6 +284,31 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
     // Пояс склада: «сегодня» и «вчера» в кабинете продавца — по дню склада.
     profile.timezone = wh.rows[0]?.timezone || 'Europe/Moscow';
     res.set('Cache-Control','no-store').json(profile);
+  } catch (err) { next(err); }
+});
+
+// Расчёт продавцу за месяц — тот же, что видит склад, и только если склад
+// включил показ. Руководитель видит всегда (смотрит глазами продавца, прежде
+// чем включить); менеджер — с правом «тариф и деньги».
+router.get('/billing', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    if (req.auth.role === 'manager' && !(req.auth.grants || []).includes('billing')) return res.json({ enabled: false });
+    const company = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
+      const r = (await c.query('SELECT id, warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
+      if (!r) throw new HttpError(404, 'Компания не найдена');
+      return r;
+    });
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
+      const t = await billingService.tariff(c, company.warehouse_id);
+      if (!t.showSellers && req.auth.role === 'seller') return { enabled: false };
+      const month = req.query.month;
+      const r = await billingService.charges(c, company.warehouse_id, { month, companyId: company.id });
+      const mine = r.sellers[0] || { lines: [], total: 0 };
+      return { enabled: true, shownToSeller: t.showSellers, month: r.month, approximate: r.approximate,
+        storageSince: r.storageSince, lines: mine.lines, total: mine.total };
+    });
+    res.set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }
 });
 

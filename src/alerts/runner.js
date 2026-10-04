@@ -3,6 +3,7 @@ const { collect } = require('./rules');
 const { workQueue, vwReminders } = require('../agents/kladovshchik');
 const { plural } = require('../journal/plural');
 const { zoneOf, todayIn, hourIn } = require('../warehouses/time');
+const billing = require('../billing/service');
 
 // Проход сторожа по одному складу.
 //
@@ -160,6 +161,10 @@ async function runOnce() {
         await checkWarehouse(client, row.id);
         await maybeDigest(client, row.id);
       });
+      // Занятость продавцов за сутки — для расчёта хранения. Отдельно: сбой
+      // здесь не должен глушить тревоги, и наоборот.
+      await withTenantContext({ warehouseId: row.id }, (client) => billing.snapshotStorage(client, row.id))
+        .catch((err) => console.error(`billing: склад ${row.id} без снимка занятости:`, err.message));
       checked += 1;
     } catch (err) {
       // Один сломанный склад не должен останавливать проверку остальных.
