@@ -103,4 +103,10 @@ Pure regressions: `node --test test/billing-values.test.js test/journal-paging.t
 Database regressions: `test/billing-e2e.js`, `test/billing-migration-e2e.js`, and
 `test/journal-day.integration.test.js`. Their write guards require an explicitly
 selected isolated test database and `ARGUS_TEST_ALLOW_WRITES=1`; migration tests
-require a fresh pre-upgrade database. Production was not changed in this stage.
+require a fresh pre-upgrade database. This stage was published on 4 October 2026:
+application and database backups preceded both migrations and the API restart,
+followed by the matching frontend. Production checks covered the restricted
+application role, RLS/grants, immutable-record triggers, journal indexes and
+authenticated read contracts. No test invoices or payments were written to
+production. Deployment pauses the API while replacing files and migrating;
+upload or migration failure restores the previous application.
