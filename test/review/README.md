@@ -9,8 +9,9 @@
   транзакций ждала их на позднем шаге; после починки второй запрос ждёт
   раньше, и тест не может «поймать» гонку. Вместо них —
   `*-simple-e2e.js` (проверено: без починки падают, с ней проходят).
-- `supply-disband-during-wb-handoff-orphans-e2e.js` (R11) — отложено до
-  включения записи в WB, копия в `test/deferred/`.
+- `supply-disband-during-wb-handoff-orphans-e2e.js` (R11) — починено 04.10.2026
+  (отметка «идёт передача в WB»); рабочая копия —
+  `test/supply-disband-during-wb-handoff-e2e.js`, входит в общий прогон.
 - `owner-controls-violate-formatting-e2e.js` (R20, R21) — оформление
   кабинета руководителя отложено решением владельца.
 

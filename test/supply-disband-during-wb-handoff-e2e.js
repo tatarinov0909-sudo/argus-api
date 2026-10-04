@@ -1,5 +1,5 @@
 // Одноразовая локальная БД. Весь WB — функция в памяти, ни одного внешнего запроса.
-const {startApp,stand,verdicts,fail}=require('../attack-0310/_lib');
+const {startApp,stand,verdicts,fail}=require('./attack-0310/_lib');
 (async()=>{const a=await startApp();const v=verdicts('Разбор поставки во время передачи WB');let release;
 try{
  const s=await stand(a);await s.receive([{qty:10,cell:s.cells[0]}]);

@@ -891,13 +891,27 @@ async function pendingOrders(client, warehouseId, companyId) {
 // Собрали не то — надо иметь возможность вернуть заказы в очередь. Разрешено
 // только пока поставка «собирается»: после отбора товар уже снят с полок,
 // а уехавшую поставку не разбирают в базе, её разгружают руками.
+// Передача в WB идёт (R11). Отметку снимает сама передача; если процесс
+// упал посреди неё, через 15 минут отметка считается устаревшей — иначе
+// поставка была бы заперта навсегда.
+// ponytail: 15 минут — запас на медленный WB; если передача бывает дольше, увеличить.
+const HANDOFF_STALE = "now() - interval '15 minutes'";
+function refuseDuringHandoff(row, number) {
+  if (row.handoff_live) {
+    throw new HttpError(409, `Поставка «${number}» сейчас передаётся в WB — дождитесь ответа площадки `
+      + '(обычно несколько секунд) и обновите экран.');
+  }
+}
+
 async function disband(client, warehouseId, supplyId, { actor }) {
   const s = await client.query(
-    'SELECT id, number, status, mp_supply_id FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE',
+    `SELECT id, number, status, mp_supply_id, mp_handoff_at > ${HANDOFF_STALE} AS handoff_live
+       FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
   );
   const supply = s.rows[0];
   if (!supply) throw new HttpError(404, 'Поставка не найдена');
+  refuseDuringHandoff(supply, supply.number);
   if (supply.status !== 'collecting') {
     throw new HttpError(409,
       `Поставка «${supply.number}» уже ${STATUS_NAMES[supply.status] || supply.status}`
@@ -963,7 +977,7 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
   const supplyId = await lockSupplyOfInvoice(client, warehouseId, invoiceId);
   const inv = await client.query(
     `SELECT i.id, i.number, i.supply_id, s.number AS supply_number, s.status AS supply_status,
-            s.mp_supply_id
+            s.mp_supply_id, s.mp_handoff_at > ${HANDOFF_STALE} AS handoff_live
        FROM invoices i LEFT JOIN supplies s ON s.id = i.supply_id
       WHERE i.warehouse_id = $1 AND i.id = $2 FOR UPDATE OF i`,
     [warehouseId, invoiceId],
@@ -976,6 +990,7 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
   if (order.supply_status === 'shipped') {
     throw new HttpError(409, `Поставка «${order.supply_number}» уже уехала — назад её не вернуть`);
   }
+  refuseDuringHandoff(order, order.supply_number);
   // Поставка уже заведена на площадке: там заказ числится в её составе, и
   // убрать его только у себя — значит разойтись с WB.
   if (order.mp_supply_id) {

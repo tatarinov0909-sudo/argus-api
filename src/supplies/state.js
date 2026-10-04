@@ -23,6 +23,7 @@ async function refreshSupplyStatus(client, warehouseId, supplyId) {
   const dropped = await client.query(
     `DELETE FROM supplies s
       WHERE s.warehouse_id = $1 AND s.id = $2 AND s.status = 'collecting' AND s.mp_supply_id IS NULL
+        AND (s.mp_handoff_at IS NULL OR s.mp_handoff_at < now() - interval '15 minutes')
         AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.warehouse_id = $1 AND i.supply_id = s.id)
       RETURNING s.number`,
     [warehouseId, supplyId],

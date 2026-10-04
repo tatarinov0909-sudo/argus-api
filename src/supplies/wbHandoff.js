@@ -50,12 +50,28 @@ async function detachRejected(client, warehouseId, supply, rejected) {
 // Создать поставку на площадке и подтвердить в ней заказы.
 //
 // `api` и `withTx` подменяются в тестах: сети и базы в проверках нет.
-async function handOver({
-  warehouseId, companyId, supply, orders, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
-}) {
+async function handOver(args) {
+  const { warehouseId, companyId, supply, withTx, tokenFor = credentials.writeTokenFor } = args;
   const token = await withTx((client) => tokenFor(client, warehouseId, companyId, 'wb'));
   if (!token) return { skipped: 'write_disabled' };
+  // Отметка «идёт передача» — до первого запроса к WB (R11): пока она стоит,
+  // поставку не разобрать и заказ из неё не убрать. Поставку успели разобрать
+  // раньше — к WB не идём вовсе: передавать нечего.
+  const marked = await withTx((client) => client.query(
+    `UPDATE supplies SET mp_handoff_at = now()
+      WHERE warehouse_id = $1 AND id = $2 AND status = 'collecting' AND mp_supply_id IS NULL`,
+    [warehouseId, supply.id]));
+  if (!marked.rowCount) return { skipped: 'supply_gone' };
+  try {
+    return await handOverMarked({ ...args, token });
+  } finally {
+    await withTx((client) => client.query(
+      'UPDATE supplies SET mp_handoff_at = NULL WHERE warehouse_id = $1 AND id = $2', [warehouseId, supply.id]))
+      .catch(() => { /* отметка сама устареет — см. HANDOFF_STALE в supplies/service.js */ });
+  }
+}
 
+async function handOverMarked({ warehouseId, companyId, supply, orders, withTx, api = wbWrite, token }) {
   const mpSupplyId = await api.createSupply(token, supply.number);
   let confirmed = [];
   let rejected = [];
