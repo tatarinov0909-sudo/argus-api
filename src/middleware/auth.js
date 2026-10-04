@@ -28,9 +28,9 @@ async function keyState(role, id) {
     ));
     const h = r.rows[0]?.h;
     state = { active: Boolean(h), stamp: h ? require('../auth/service').passwordStamp(h) : null };
-  } else if (role === 'seller') {
+  } else if (role === 'seller' || role === 'integration') {
     const r = await withoutTenantContext((client) => client.query(
-      'SELECT seller_key_is_active($1) AS active', [id],
+      `SELECT ${role === 'seller' ? 'seller' : 'integration'}_key_is_active($1) AS active`, [id],
     ));
     state = { active: r.rows[0]?.active === true };
   } else {
@@ -91,7 +91,9 @@ async function requireAuth(req, res, next) {
   // и продлевался дальше).
   const keyId = payload.role === 'seller' ? payload.sellerKeyId
     : (payload.role === 'worker' || payload.role === 'manager') ? payload.staffKeyId
-      : payload.role === 'owner' ? payload.ownerId : null;
+      : payload.role === 'owner' ? payload.ownerId
+        // Обмен с 1С: отозванный ключ закрывает все пути, не только обмен.
+        : payload.role === 'integration' ? payload.integrationKeyId : null;
   if (keyId) {
     let state;
     try {
@@ -107,7 +109,7 @@ async function requireAuth(req, res, next) {
       }
     } else if (!state.active) {
       return res.status(401).json({ error: 'Ваш ключ отозван. Обратитесь к руководителю склада.' });
-    } else if (payload.role !== 'seller') {
+    } else if (payload.role !== 'seller' && payload.role !== 'integration') {
       // Руководитель перевёл ключ из менеджеров в работники или обратно —
       // старый вход в чужой кабинет не годится, нужен новый.
       const role = state.kind === 'manager' ? 'manager' : 'worker';

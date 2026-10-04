@@ -60,6 +60,9 @@ function createApp() {
         'req.headers.cookie',
         'req.headers["x-api-key"]',
         'res.headers["set-cookie"]',
+        // Продлённый вход (X-Argus-Token) — тот же действующий ключ, что и
+        // Authorization (проверка 03.10.2026).
+        'res.headers["x-argus-token"]',
       ],
       censor: '[скрыто]',
     },

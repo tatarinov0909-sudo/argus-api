@@ -45,7 +45,10 @@ async function callDeepseek(apiKey, messages) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
+  // Срок ожидания — на весь ответ, вместе с телом: заголовки могли прийти
+  // сразу, а тело тянуться дольше (проверка 03.10.2026).
   let res;
+  let text;
   try {
     res = await fetch(API_URL, {
       method: 'POST',
@@ -61,6 +64,7 @@ async function callDeepseek(apiKey, messages) {
       }),
       signal: controller.signal,
     });
+    text = await res.text();
   } catch (err) {
     if (err.name === 'AbortError') {
       throw new HttpError(504, 'Оркестратор не ответил вовремя, попробуйте ещё раз');
@@ -73,15 +77,15 @@ async function callDeepseek(apiKey, messages) {
   if (!res.ok) {
     // Тело ответа DeepSeek может содержать внутренние детали — в лог, не в
     // ответ клиенту. 429 стоит явно отличать: это "подождите", а не поломка.
-    const body = await res.text().catch(() => '');
-    console.error(`DeepSeek ${res.status}: ${body}`);
+    console.error(`DeepSeek ${res.status}: ${text}`);
     if (res.status === 429) {
       throw new HttpError(429, 'Слишком много запросов, попробуйте через минуту');
     }
     throw new HttpError(502, 'Сервис объяснений временно недоступен');
   }
 
-  const data = await res.json();
+  let data;
+  try { data = JSON.parse(text); } catch { throw new HttpError(502, 'Сервис объяснений вернул непонятный ответ'); }
   if (!data.choices?.[0]?.message) {
     console.error('DeepSeek: ответ без choices/message', JSON.stringify(data));
     throw new HttpError(502, 'Сервис объяснений вернул пустой ответ');

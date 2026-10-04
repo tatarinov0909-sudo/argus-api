@@ -13,8 +13,9 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const barcodeOf = (name) => (String(name || '').match(/(\d{8,14})\s*$/) || [])[1] || null;
 
 async function warehouseOf(client, warehouseId) {
-  const w = (await client.query('SELECT name, city, legal_name FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
-  return { name: w.name, city: w.city, legalName: w.legal_name };
+  const w = (await client.query('SELECT name, city, legal_name, timezone FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
+  // Пояс склада — дата акта одна у всех, где бы ни открыли (проверка 03.10.2026).
+  return { name: w.name, city: w.city, legalName: w.legal_name, timezone: w.timezone || 'Europe/Moscow' };
 }
 
 // Продавец тоже получает акт приёмки — по своему приходу.
@@ -121,7 +122,7 @@ router.get('/defect/:id', requireAuth, requireRole('owner', 'manager', 'seller')
         items: [{
           article: d.mp_article || d.sku, sku: d.sku, name: d.name, barcode: d.barcode || barcodeOf(d.name),
           // Выполнено — сколько сделали (брака могло оказаться меньше).
-          qty: d.status === 'done' ? Number(d.done_qty || d.qty) : Number(d.qty), bucket: d.bucket === 'packaging_defect' ? 'брак упаковки' : 'брак',
+          qty: d.status === 'done' ? Number(d.done_qty) : Number(d.qty), bucket: d.bucket === 'packaging_defect' ? 'брак упаковки' : 'брак',
         }],
       };
     });

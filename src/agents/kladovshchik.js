@@ -831,12 +831,16 @@ async function sellerStock(client, warehouseId, seller) {
   // Склады продавца (02.10.2026): итог по каждому и товары, что лежат не на
   // «Основном».
   const split = rows.filter((r) => r.byWarehouse);
+  // Неизвестное у товара (учёт 1С ещё не прислал число) — и в итоге склада
+  // «неизвестно», а не ноль (проверка 03.10.2026).
+  const total = (k, key) => (split.some((r) => r.byWarehouse[k][key] == null)
+    ? null : split.reduce((n, r) => n + Number(r.byWarehouse[k][key] || 0), 0));
   const warehouses = split.length ? split[0].byWarehouse.map((w, k) => ({
     warehouse: w.name,
-    onHand: split.reduce((n, r) => n + Number(r.byWarehouse[k].onHand || 0), 0),
-    inAssembly: split.reduce((n, r) => n + Number(r.byWarehouse[k].inAssembly || 0), 0),
-    available: split.reduce((n, r) => n + Number(r.byWarehouse[k].available || 0), 0),
-    defect: split.reduce((n, r) => n + Number(r.byWarehouse[k].defect || 0), 0),
+    onHand: total(k, 'onHand'),
+    inAssembly: total(k, 'inAssembly'),
+    available: total(k, 'available'),
+    defect: total(k, 'defect'),
   })) : null;
   return {
     ...brief(s),

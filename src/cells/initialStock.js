@@ -554,6 +554,18 @@ async function undo(client, warehouseId, batch, { ownerId }) {
   if (counting.rows.length) {
     throw new HttpError(409, 'По ячейкам этой загрузки назначен пересчёт — сначала закройте задание');
   }
+  // Задание «переложить» берёт товар из этих ячеек — после отмены ему нечего
+  // было бы перекладывать (проверка 03.10.2026).
+  const moving = await client.query(
+    `SELECT 1 FROM vw_move_tasks t WHERE t.warehouse_id = $1 AND t.status = 'open'
+        AND t.from_cell_block_id = ANY($2::uuid[])
+        AND EXISTS (SELECT 1 FROM unnest($3::text[], $4::uuid[]) AS x(sku, company) WHERE x.sku = t.sku AND x.company = t.company_id)
+      LIMIT 1`,
+    [warehouseId, cellIds, ops.rows.map((o) => o.sku), ops.rows.map((o) => o.company_id)],
+  );
+  if (moving.rows.length) {
+    throw new HttpError(409, 'Товар этой загрузки ждёт задания «переложить» — сначала выполните или снимите задание');
+  }
 
   // По браку из этой загрузки уже решили — снимать его нельзя: задание
   // грузчику осталось бы без товара.

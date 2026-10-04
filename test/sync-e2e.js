@@ -516,7 +516,19 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(authRevoked.status, 403, JSON.stringify(authRevoked.body));
     });
 
+    // Отозванный ключ закрыт на любом пути, в том числе в обмене
+    // (рецензия 03.10.2026, R09): старый токен больше ничего не присылает.
+    const afterRevoke = await api('POST', '/api/sync/push/companies', {
+      token: syncToken, body: { records: [{ externalId: 'late', name: 'Late' }] },
+    });
+    check('revoked key token is refused at once', () => {
+      assert.equal(afterRevoke.status, 401, JSON.stringify(afterRevoke.body));
+    });
+
     // ---------- Batch limits ----------
+    // Пределы пачки — живым ключом: отозванный отвечает «отозван» раньше.
+    const freshKey = await api('POST', '/api/sync/keys', { token: ownerToken, body: {} });
+    syncToken = (await api('POST', '/api/sync/auth', { body: { keyCode: freshKey.body.key_code } })).body.token;
     const empty = await api('POST', '/api/sync/push/companies', {
       token: syncToken, body: { records: [] },
     });

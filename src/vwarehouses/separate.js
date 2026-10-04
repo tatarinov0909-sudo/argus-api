@@ -94,6 +94,9 @@ async function emptyZoneCell(client, zoneIds) {
 // пустой ячейки, и руководителю уведомление, куда положили.
 async function checkPut(client, warehouseId, { cellBlockId, companyId, vw = null, quality = 'good' }) {
   if (!cellBlockId) return;
+  // Ячейка — на запись до проверки: два одновременных «положить» товар разных
+  // складов в пустую ячейку иначе проходили оба (проверка 03.10.2026).
+  await client.query('SELECT id FROM cell_blocks WHERE id = $1 FOR UPDATE', [cellBlockId]);
   const lay = companyId ? await layout(client, companyId) : null;
   const why = await conflict(client, { cellBlockId, companyId, vw, quality }, lay);
   if (why) throw new HttpError(409, `Сюда нельзя: ${why}. Положите в другую ячейку.`);
@@ -214,14 +217,20 @@ async function createSeparateTasks(client, warehouseId, { companyId, vwId, defec
 // Перенос на склад «хранить отдельно» (или с него): задания по ячейкам, где
 // лежит товар склада-источника, — с самых давних строк.
 async function createTransferTasks(client, warehouseId, t) {
+  // Минус то, что уже обещано открытым заданиям из той же ячейки: иначе два
+  // переноса рассчитывали на один и тот же товар (проверка 03.10.2026).
   const rows = (await client.query(
-    `SELECT cell_block_id, SUM(qty)::int AS qty, MIN(updated_at) AS at FROM cell_stock
-      WHERE company_id = $1 AND sku = $2 AND quality::text = $4 AND qty > 0
-        AND virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid
-      GROUP BY cell_block_id ORDER BY at`, [t.company_id, t.sku, t.from_vw, t.quality || 'good'])).rows;
+    `SELECT cs.cell_block_id, SUM(cs.qty)::int - COALESCE((SELECT SUM(m.qty - m.moved) FROM vw_move_tasks m
+              WHERE m.status = 'open' AND m.company_id = $1 AND m.sku = $2 AND m.quality = $4
+                AND m.from_cell_block_id = cs.cell_block_id AND m.from_vw IS NOT DISTINCT FROM $3::uuid), 0)::int AS qty,
+            MIN(cs.updated_at) AS at FROM cell_stock cs
+      WHERE cs.company_id = $1 AND cs.sku = $2 AND cs.quality::text = $4 AND cs.qty > 0
+        AND cs.virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid
+      GROUP BY cs.cell_block_id ORDER BY at`, [t.company_id, t.sku, t.from_vw, t.quality || 'good'])).rows;
   let left = Number(t.qty);
   for (const r of rows) {
     if (left <= 0) break;
+    if (r.qty <= 0) continue;
     const q = Math.min(left, r.qty);
     await client.query(
       `INSERT INTO vw_move_tasks (warehouse_id, company_id, kind, transfer_id, sku, name, quality, from_cell_block_id, from_vw, to_vw, qty)

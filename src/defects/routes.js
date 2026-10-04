@@ -83,6 +83,20 @@ async function findMove(client, auth, id) {
   return m;
 }
 
+// Похоже ли содержимое на целую картинку заявленного вида (проверка
+// 03.10.2026: текст или обрезанный файл с заголовком image/png принимался
+// и уходил продавцу как «фото»). Проверяем подпись начала и, где формат
+// это позволяет, целый конец файла.
+function looksLikeImage(buf, type) {
+  const at = (i, bytes) => bytes.every((b, k) => buf[i + k] === b);
+  const ascii = (i, s) => buf.toString('latin1', i, i + s.length) === s;
+  if (type === 'image/jpeg') return buf.length > 4 && at(0, [0xff, 0xd8, 0xff]) && at(buf.length - 2, [0xff, 0xd9]);
+  if (type === 'image/png') return buf.length > 20 && at(0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) && ascii(buf.length - 8, 'IEND');
+  if (type === 'image/webp') return buf.length > 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP') && buf.readUInt32LE(4) + 8 === buf.length;
+  if (type === 'image/heic' || type === 'image/heif') return buf.length > 12 && ascii(4, 'ftyp');
+  return false;
+}
+
 // Фото брака. Файл читаем после проверки входа: чужой не зальёт 3 МБ.
 const rawPhoto = express.raw({ type: () => true, limit: MAX_PHOTO });
 const readPhoto = (req, res, next) => rawPhoto(req, res, (err) => next(err && err.type === 'entity.too.large'
@@ -93,6 +107,7 @@ router.put('/moves/:id/photo', requireAuth, requireRole('worker', 'owner', 'mana
     const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
     if (!PHOTO_TYPES.includes(type)) throw new HttpError(400, 'Фото — JPG, PNG, WEBP или HEIC');
     if (!Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Фото пустое');
+    if (!looksLikeImage(req.body, type)) throw new HttpError(400, 'Файл не похож на фото или повреждён — снимите ещё раз');
     await inWarehouse(req, async (c) => {
       const m = await findMove(c, req.auth, req.params.id);
       await c.query(

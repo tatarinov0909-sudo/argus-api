@@ -156,6 +156,9 @@ function reasonFor(row) {
 }
 
 async function createRun(client, warehouseId, ownerId) {
+  // Один запуск за раз на склад: два одновременных нажатия иначе оба
+  // проходили проверки ниже и назначали пересчёт дважды (проверка 03.10.2026).
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('inventory-run:' || $1))", [warehouseId]);
   const settings = await getSettings(client, warehouseId);
 
   // Пауза между заходами — главный ограничитель. Без неё пересчёт станет

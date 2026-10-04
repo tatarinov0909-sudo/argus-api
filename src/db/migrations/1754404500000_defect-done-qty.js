@@ -12,6 +12,16 @@ exports.up = (pgm) => {
   `);
 };
 
+// Откат не должен молча терять сделанное: решение, выполненное частично,
+// после отката выглядело бы невыполненным (проверка 03.10.2026).
 exports.down = (pgm) => {
-  pgm.sql('ALTER TABLE defect_decisions DROP COLUMN IF EXISTS done_qty;');
+  pgm.sql(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM defect_decisions WHERE status = 'pending' AND done_qty > 0) THEN
+        RAISE EXCEPTION 'Есть решения по браку, выполненные частично, — откат потерял бы сделанное';
+      END IF;
+    END $$;
+    ALTER TABLE defect_decisions DROP COLUMN IF EXISTS done_qty;
+  `);
 };

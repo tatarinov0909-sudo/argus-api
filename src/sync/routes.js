@@ -1,5 +1,5 @@
 const express = require('express');
-const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
+const { requireAuth, requireRole, requireGrant, forgetKey } = require('../middleware/auth');
 const { withTenantContext, withoutTenantContext } = require('../db/pool');
 const { keyLoginLimiter } = require('../middleware/rateLimit');
 const { HttpError } = require('../middleware/errorHandler');
@@ -95,6 +95,8 @@ router.patch('/keys/:id/toggle', requireAuth, requireGrant('integration'), async
       return result.rows[0] || null;
     });
     if (!key) throw new HttpError(404, 'Ключ не найден');
+    // Отзыв действует с этой секунды, без двухсекундного запаса памяти.
+    forgetKey('integration', key.id);
     res.json(key);
   } catch (err) {
     next(err);

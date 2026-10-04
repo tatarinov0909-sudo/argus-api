@@ -27,7 +27,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const {
-      invoiceItemId, qty, qualityBucket, cellBlockId, pausedMs, pauseReasons, defectNote,
+      invoiceItemId, qty, qualityBucket, cellBlockId, pausedMs, pauseReasons, defectNote, seenQty,
     } = req.body;
     if (!invoiceItemId || qty == null || !qualityBucket) {
       throw new HttpError(400, 'Нужны позиция накладной, количество и категория качества');
@@ -46,8 +46,19 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     if (qualityBucket !== 'good' && !cellBlockId) {
       throw new HttpError(400, 'Укажите ячейку для брака');
     }
+    // Годное — тоже только в ячейку (проверка 03.10.2026): без ячейки возврат
+    // закрывался, а в остаток товар не попадал и потом не размещался.
+    if (!cellBlockId) throw new HttpError(400, 'Укажите ячейку, куда кладёте товар');
 
     const record = await withTenantContext({ warehouseId }, async (client) => {
+      // Возврат целиком — на запись первым: две последние строки одного
+      // возврата, разобранные одновременно, иначе не видели друг друга и
+      // возврат оставался «в работе» (проверка 03.10.2026).
+      await client.query(
+        `SELECT i.id FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+          WHERE ii.id = $1 AND ii.warehouse_id = $2 FOR UPDATE OF i`,
+        [invoiceItemId, warehouseId],
+      );
       const itemResult = await client.query(
         // Идентификаторы 1С забираем сразу: событие для обмена собирается в
         // той же транзакции, и второй заход в базу ради них не нужен.
@@ -78,6 +89,11 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       );
       const alreadyLogged = Number(soFar.rows[0].total);
       const declared = Number(item.declared_qty);
+      // Экран видел другое «уже разобрано» — эту часть разобрали в другой
+      // вкладке или повтором (проверка 03.10.2026).
+      if (seenQty != null && Number(seenQty) !== alreadyLogged) {
+        throw new HttpError(409, `По позиции уже разобрано ${alreadyLogged} шт. — обновите экран`);
+      }
       if (alreadyLogged + Number(qty) > declared) {
         throw new HttpError(
           409,
