@@ -54,7 +54,7 @@ rollback() {
 
 if [ $migrate = 1 ]; then
   echo "4/6 миграции"
-  remote "cd $APP && sudo -u postgres DATABASE_URL='postgres:///argus?host=/var/run/postgresql' npx node-pg-migrate up -m src/db/migrations --no-single-transaction 2>&1 | tail -3" || rollback
+  remote "set -euo pipefail; cd $APP; sudo -u postgres DATABASE_URL='postgres:///argus?host=/var/run/postgresql' npx node-pg-migrate up -m src/db/migrations --no-single-transaction 2>&1 | tail -3" || rollback
 else
   echo "4/6 миграций нет"
 fi
