@@ -6,6 +6,8 @@ const { HttpError } = require('../middleware/errorHandler');
 const repository = require('./repository');
 const assembly = require('../shipping/assembly');
 const receiving = require('../receiving/session');
+const { zoneOf } = require('../warehouses/time');
+const { readDay, dayPage } = require('./paging');
 
 const router = express.Router();
 
@@ -25,14 +27,24 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
     };
     const cellBlockId = one(req.query.cellBlockId, 'cellBlockId');
     const invoiceId = one(req.query.invoiceId, 'invoiceId');
+    const selectedDay = req.query.date !== undefined;
+    // Validate before settle, so an invalid calendar request cannot run work
+    // state transitions. Legacy callers continue receiving the array.
+    if (selectedDay) readDay(req.query);
 
     const hideUrgent = req.auth.role === 'manager' && !(req.auth.grants || []).includes('shortages');
     const entries = await withTenantContext({ warehouseId }, async (client) => {
+      const scope = { cellBlockId, invoiceId, hideUrgent };
+      const page = selectedDay ? dayPage(req.query, {
+        warehouseId, ...scope, timezone: await zoneOf(client, warehouseId),
+      }) : null;
       // Зависшие заходы — закрыть до чтения: иначе у принятого прихода в
       // журнале висело бы «принимает» (защита, work/sessions.js — settle).
       await receiving.settle(client, warehouseId);
       await assembly.settle(client, warehouseId);
-      const rows = await repository.listEntries(client, warehouseId, { cellBlockId, invoiceId, hideUrgent });
+      const result = page ? await repository.listDay(client, warehouseId, page, scope)
+        : await repository.listEntries(client, warehouseId, scope);
+      const rows = page ? [...result.entries, ...result.pending] : result;
       // Сборка поставки уходит в кабинет одной записью с полосой готовности,
       // поэтому к строкам этой поставки прикладываем её счёт позиций.
       const supplyIds = [...new Set(rows.map((r) => r.invoice_supply_id).filter(Boolean))];
@@ -47,7 +59,7 @@ router.get('/', requireAuth, requireRole('owner', 'manager'), async (req, res, n
       // работа идёт сейчас (этап и прогресс для строки состояния).
       const works = await repository.workStates(client, warehouseId, rows.map((r) => r.work_key), { receiving, assembly });
       rows.forEach((row) => { row.work = works.get(row.work_key) || null; });
-      return rows;
+      return result;
     });
     res.json(entries);
   } catch (err) {

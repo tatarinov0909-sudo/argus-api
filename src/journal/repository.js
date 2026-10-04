@@ -1,5 +1,6 @@
 const { blockLabelSql } = require('../cells/label');
 const { categoryOf, CATEGORIES } = require('./category');
+const { encodeCursor } = require('./paging');
 
 // Append-only by construction: this module exports no update/delete
 // function, the DB grants for the argus_app role REVOKE UPDATE/DELETE on
@@ -44,14 +45,11 @@ async function createEntry(client, {
 // hideUrgent — менеджеру без права «отметки о нехватке» срочные отметки не
 // показываются. Неотвеченные срочные попадают в ленту всегда, даже старше
 // двухсот последних записей: по ним стоит поставка.
-async function listEntries(client, warehouseId, {
-  limit = 200, cellBlockId = null, invoiceId = null, hideUrgent = false,
-} = {}) {
+function entriesSelect(extra = '') {
   // Номер накладной и адрес ячейки собираем здесь, а не на клиенте: иначе
   // кабинету пришлось бы держать в памяти всю карту склада только ради подписи.
-  const result = await client.query(
-    `SELECT je.*,
-            EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id) AS answered,
+  return `SELECT je.*, ${extra}
+            EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id AND a.warehouse_id = je.warehouse_id) AS answered,
             i.number AS invoice_number,
             i.direction AS invoice_direction,
             -- Документ, на который запись ссылается как на сущность («отменил
@@ -79,18 +77,25 @@ async function listEntries(client, warehouseId, {
                  WHEN COALESCE(wsup.id, wi.supply_id) IS NOT NULL THEN 'supply:' || COALESCE(wsup.id, wi.supply_id)
                  WHEN wi.id IS NOT NULL THEN wi.direction || ':' || wi.id END AS work_key
      FROM journal_entries je
-     LEFT JOIN invoices i ON i.id = je.invoice_id
-     LEFT JOIN invoices ei ON je.entity_type = 'invoice' AND ei.id = je.entity_id
-     LEFT JOIN supplies s ON s.id = i.supply_id
-     LEFT JOIN journal_entries o ON o.id = je.related_entry_id
-     LEFT JOIN invoices wi ON wi.id = COALESCE(je.invoice_id, o.invoice_id)
+     LEFT JOIN invoices i ON i.id = je.invoice_id AND i.warehouse_id = je.warehouse_id
+     LEFT JOIN invoices ei ON je.entity_type = 'invoice' AND ei.id = je.entity_id AND ei.warehouse_id = je.warehouse_id
+     LEFT JOIN supplies s ON s.id = i.supply_id AND s.warehouse_id = je.warehouse_id
+     LEFT JOIN journal_entries o ON o.id = je.related_entry_id AND o.warehouse_id = je.warehouse_id
+     LEFT JOIN invoices wi ON wi.id = COALESCE(je.invoice_id, o.invoice_id) AND wi.warehouse_id = je.warehouse_id
      LEFT JOIN supplies wsup ON wsup.warehouse_id = je.warehouse_id
       AND COALESCE(je.invoice_id, o.invoice_id) IS NULL
       AND COALESCE(o.entity_type, je.entity_type) IN ('supply_assembly', 'paper_pick', 'worker_pause')
       AND wsup.id = COALESCE(o.entity_id, je.entity_id)
-     LEFT JOIN staff_keys sk ON sk.id = je.actor_id AND je.actor_type IN ('worker', 'manager')
-     LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id
-     LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+     LEFT JOIN staff_keys sk ON sk.id = je.actor_id AND sk.warehouse_id = je.warehouse_id AND je.actor_type IN ('worker', 'manager')
+     LEFT JOIN cell_blocks cb ON cb.id = je.cell_block_id AND cb.warehouse_id = je.warehouse_id
+     LEFT JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id AND wr.warehouse_id = je.warehouse_id`;
+}
+
+async function listEntries(client, warehouseId, {
+  limit = 200, cellBlockId = null, invoiceId = null, hideUrgent = false,
+} = {}) {
+  const result = await client.query(
+    `${entriesSelect()}
      WHERE je.warehouse_id = $1
        AND ($3::uuid IS NULL OR je.cell_block_id = $3::uuid)
        AND ($4::uuid IS NULL OR je.invoice_id = $4::uuid)
@@ -100,7 +105,7 @@ async function listEntries(client, warehouseId, {
                          AND ($3::uuid IS NULL OR j2.cell_block_id = $3::uuid)
                          AND ($4::uuid IS NULL OR j2.invoice_id = $4::uuid)
                          AND ($5::boolean IS NOT TRUE OR NOT (j2.urgent AND j2.entity_type IS DISTINCT FROM 'vw_transfer'))
-                       ORDER BY j2.created_at DESC LIMIT $2)
+                       ORDER BY j2.created_at DESC, j2.id DESC LIMIT $2)
             OR (je.urgent AND je.status = 'pending'
                 AND NOT EXISTS (SELECT 1 FROM journal_entries a2 WHERE a2.related_entry_id = je.id)))
        -- История ячейки — за последний год: трёхлетний хвост никому не
@@ -109,7 +114,7 @@ async function listEntries(client, warehouseId, {
      -- Записи одной транзакции до 27.09.2026 имели одно время (now()); из
      -- них «закончил приёмку» — последний шаг работы, а не первый.
      ORDER BY je.created_at DESC,
-              (je.entity_type IN ('receiving_session', 'supply_assembly', 'paper_pick')) DESC`,
+              (je.entity_type IN ('receiving_session', 'supply_assembly', 'paper_pick')) DESC, je.id DESC`,
     [warehouseId, limit, cellBlockId, invoiceId, hideUrgent === true],
   );
   if (!cellBlockId) return withCategory(result.rows);
@@ -117,6 +122,48 @@ async function listEntries(client, warehouseId, {
   return withCategory([...result.rows, ...ops]
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     .slice(0, limit));
+}
+
+// Selected days are read in the warehouse's time zone, before LIMIT. Keyset
+// pages retain PostgreSQL microseconds; Javascript Date would lose them and
+// skip events sharing one millisecond. Pending decisions have their own page
+// and deliberately ignore the selected day.
+async function listDay(client, warehouseId, page, {
+  cellBlockId = null, invoiceId = null, hideUrgent = false,
+} = {}) {
+  const step = "CASE WHEN je.entity_type IN ('receiving_session', 'supply_assembly', 'paper_pick') THEN 1 ELSE 0 END";
+  const waiting = `je.status = 'pending' AND NOT EXISTS (
+    SELECT 1 FROM journal_entries answer
+     WHERE answer.warehouse_id = je.warehouse_id AND answer.related_entry_id = je.id)`;
+  const load = async (kind, cursor) => {
+    const result = await client.query(
+      `${entriesSelect(`je.created_at::text AS cursor_at, ${step} AS cursor_step,`)}
+       WHERE je.warehouse_id = $1
+         AND ($3::uuid IS NULL OR je.cell_block_id = $3::uuid)
+         AND ($4::uuid IS NULL OR je.invoice_id = $4::uuid)
+         AND ($5::boolean IS NOT TRUE OR NOT (je.urgent AND je.entity_type IS DISTINCT FROM 'vw_transfer'))
+         AND ($3::uuid IS NULL OR je.created_at > now() - interval '${CELL_HISTORY}')
+         AND (${kind === 'pending' ? waiting : `NOT (${waiting})`})
+         AND ($11::boolean OR (je.created_at >= ($6::date::timestamp AT TIME ZONE $7)
+           AND je.created_at < (($6::date + 1)::timestamp AT TIME ZONE $7)))
+         AND ($8::timestamptz IS NULL OR (je.created_at, ${step}, je.id) < ($8::timestamptz, $9::int, $10::uuid))
+       ORDER BY je.created_at DESC, ${step} DESC, je.id DESC LIMIT $2`,
+      [warehouseId, page.limit + 1, cellBlockId, invoiceId, hideUrgent === true,
+        page.date, page.timezone, cursor?.at || null, cursor?.step ?? 0, cursor?.id || null, kind === 'pending'],
+    );
+    const hasMore = result.rows.length > page.limit;
+    const rows = result.rows.slice(0, page.limit);
+    const nextCursor = hasMore ? encodeCursor(page.scope, kind, rows.at(-1)) : null;
+    rows.forEach((row) => { delete row.cursor_at; delete row.cursor_step; });
+    return { rows: withCategory(rows), nextCursor };
+  };
+  const history = await load('history', page.cursor);
+  const pending = await load('pending', page.pendingCursor);
+  return {
+    date: page.date, timezone: page.timezone,
+    entries: history.rows, pending: pending.rows,
+    nextCursor: history.nextCursor, pendingNextCursor: pending.nextCursor,
+  };
 }
 
 const CATEGORY_LABEL = new Map(CATEGORIES);
@@ -397,4 +444,4 @@ async function itemNotes(client, warehouseId, { invoiceId = null, supplyId = nul
   }));
 }
 
-module.exports = { createEntry, listEntries, supplyPickProgress, resolveEntry, itemNotes, workStates };
+module.exports = { createEntry, listEntries, listDay, supplyPickProgress, resolveEntry, itemNotes, workStates };
