@@ -93,6 +93,20 @@ const whIdOf = (token) => JSON.parse(
 
     const run = (fn) => withTenantContext({ warehouseId }, (client) => fn(client));
 
+    // ---------- Запуск склада: шаги по фактическому состоянию ----------
+    const step = (body, key) => body.steps.find((s) => s.key === key);
+    const ready1 = await api('GET', '/api/warehouses/me/readiness', { token: ownerToken });
+    check('готовность: продавец, работник, ячейки есть, первой операции нет', () => {
+      assert.equal(ready1.status, 200, JSON.stringify(ready1.body));
+      assert.equal(step(ready1.body, 'seller').done, true);
+      assert.equal(step(ready1.body, 'worker').done, true);
+      assert.equal(step(ready1.body, 'cells').done, true);
+      assert.equal(step(ready1.body, 'seller_key').done, false);
+      assert.equal(step(ready1.body, 'first_operation').done, false);
+    });
+    const readyWorker = await api('GET', '/api/warehouses/me/readiness', { token: workerToken });
+    check('готовность склада работнику не отдаётся', () => assert.equal(readyWorker.status, 403));
+
     // ---------- Пустой склад молчит ----------
     const first = await api('POST', '/api/alerts/check', { token: ownerToken });
     check('на спокойном складе тревог нет', () => {
@@ -129,6 +143,9 @@ const whIdOf = (token) => JSON.parse(
         JSON.stringify(freshList.body.alerts.map((a) => a.alert_key)),
       );
     });
+
+    const ready2 = await api('GET', '/api/warehouses/me/readiness', { token: ownerToken });
+    check('после первой приёмки шаг «первая операция» отмечен сам', () => assert.equal(step(ready2.body, 'first_operation').done, true));
 
     // «Сегодня» считает сразу, без порогов сторожа: решение ждёт уже сейчас.
     const today = await api('GET', '/api/alerts/today', { token: ownerToken });

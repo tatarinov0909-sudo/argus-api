@@ -26,6 +26,41 @@ router.get('/me', requireAuth, requireRole('owner', 'manager', 'worker'), async 
   }
 });
 
+// Готовность нового склада (рецензия 04.10, рекомендация 6): шаги по
+// фактическому состоянию, а не по ручным галочкам. Последний шаг — первая
+// настоящая операция: приход, который видят и склад, и продавец.
+router.get('/me/readiness', requireAuth, requireRole('owner'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const r = await withTenantContext({ warehouseId }, async (client) => (await client.query(
+      `SELECT w.setup_at IS NOT NULL AS survey, w.stock_source,
+              EXISTS (SELECT 1 FROM cell_blocks WHERE warehouse_id = w.id) AS cells,
+              EXISTS (SELECT 1 FROM companies WHERE warehouse_id = w.id AND archived_at IS NULL) AS seller,
+              EXISTS (SELECT 1 FROM products p JOIN companies c ON c.id = p.company_id AND c.archived_at IS NULL
+                       WHERE p.warehouse_id = w.id) AS catalog,
+              EXISTS (SELECT 1 FROM integration_keys WHERE warehouse_id = w.id AND active AND last_seen_at IS NOT NULL) AS onec,
+              EXISTS (SELECT 1 FROM cell_stock WHERE warehouse_id = w.id AND qty > 0) AS argus_stock,
+              EXISTS (SELECT 1 FROM staff_keys WHERE warehouse_id = w.id AND active AND kind = 'worker') AS worker,
+              EXISTS (SELECT 1 FROM seller_keys WHERE warehouse_id = w.id AND active) AS seller_key,
+              EXISTS (SELECT 1 FROM receiving_records WHERE warehouse_id = w.id) AS first_operation
+         FROM warehouses w WHERE w.id = $1`, [warehouseId])).rows[0]);
+    const viaOneC = r.stock_source === '1c';
+    res.json({ steps: [
+      { key: 'survey', done: r.survey },
+      { key: 'seller', done: r.seller },
+      { key: 'catalog', done: r.catalog },
+      // Учёт в Аргусе: пустой склад — тоже известный остаток, он наполнится приходами.
+      viaOneC ? { key: 'stock_1c', done: r.onec } : { key: 'stock_argus', done: r.argus_stock, optional: true },
+      { key: 'cells', done: r.cells, optional: true },
+      { key: 'worker', done: r.worker },
+      { key: 'seller_key', done: r.seller_key },
+      { key: 'first_operation', done: r.first_operation },
+    ] });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Сверка перед сменой учёта остатков: сколько товара продавцов по 1С и
 // сколько годного в ячейках Аргуса. Меняя ответ, владелец видит, насколько
 // сдвинется «Всего товара» у продавцов, — а не узнаёт это от них.
