@@ -300,13 +300,54 @@ router.get('/billing', requireAuth, requireRole('seller', 'owner', 'manager'), a
       return r;
     });
     const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
-      const t = await billingService.tariff(c, company.warehouse_id);
+      const t = await billingService.tariff(c, company.warehouse_id, company.id);
       if (!t.showSellers && req.auth.role === 'seller') return { enabled: false };
-      const month = req.query.month;
-      const r = await billingService.charges(c, company.warehouse_id, { month, companyId: company.id });
+      const r = await billingService.charges(c, company.warehouse_id, { month: req.query.month,
+        from: req.query.from, to: req.query.to, companyId: company.id });
       const mine = r.sellers[0] || { lines: [], total: 0 };
+      const invoices = await billingService.listInvoices(c, company.warehouse_id,
+        { companyId: company.id, cursor: req.query.invoiceCursor });
       return { enabled: true, shownToSeller: t.showSellers, month: r.month, approximate: r.approximate,
-        storageSince: r.storageSince, lines: mine.lines, total: mine.total };
+        from: r.from, to: r.to, configured: mine.configured, missingTariff: mine.missingTariff,
+        storageSince: r.storageSince, lines: mine.lines, total: mine.total, totalCents: mine.totalCents,
+        tariff: t, schedule: t.schedule, invoices: invoices.items, nextInvoiceCursor: invoices.nextCursor };
+    });
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+
+// Продавец читает только свои счета; все финансовые изменения — у склада.
+router.get('/billing/invoices', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    if (req.auth.role === 'manager' && !(req.auth.grants || []).includes('billing')) throw new HttpError(403, 'Нет права на расчёты');
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    const company = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
+      const r = (await c.query('SELECT id,warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
+      if (!r) throw new HttpError(404, 'Продавец не найден');
+      return r;
+    });
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
+      const t = await billingService.tariff(c, company.warehouse_id, company.id);
+      if (!t.showSellers && req.auth.role === 'seller') return { enabled: false, items: [], nextCursor: null };
+      return billingService.listInvoices(c, company.warehouse_id,
+        { companyId: company.id, limit: req.query.limit || 30, cursor: req.query.cursor });
+    });
+    res.set('Cache-Control', 'no-store').json(out);
+  } catch (err) { next(err); }
+});
+router.get('/billing/invoices/:id', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
+  try {
+    if (req.auth.role === 'manager' && !(req.auth.grants || []).includes('billing')) throw new HttpError(403, 'Нет права на расчёты');
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.query.companyId;
+    const company = await withTenantContext(tenantContextFromAuth(req.auth), async (c) => {
+      const r = (await c.query('SELECT id,warehouse_id FROM companies WHERE id=$1 AND archived_at IS NULL', [companyId])).rows[0];
+      if (!r) throw new HttpError(404, 'Продавец не найден');
+      return r;
+    });
+    const out = await withTenantContext({ warehouseId: company.warehouse_id }, async (c) => {
+      const t = await billingService.tariff(c, company.warehouse_id, company.id);
+      if (!t.showSellers && req.auth.role === 'seller') throw new HttpError(404, 'Счёт не найден');
+      return billingService.getInvoice(c, company.warehouse_id, req.params.id, company.id);
     });
     res.set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }

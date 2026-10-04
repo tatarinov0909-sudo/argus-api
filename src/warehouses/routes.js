@@ -62,12 +62,12 @@ router.get('/me/readiness', requireAuth, requireRole('owner'), async (req, res, 
   }
 });
 
-// Расчёты с продавцами: прайс склада и начисления за месяц (04.10.2026).
+// Персональные прайсы, начисления за период, сохранённые счета и оплаты.
 // Деньги — право «тариф и деньги»: владелец всегда, менеджер — если открыли.
 router.get('/billing/tariff', requireAuth, requireGrant('billing'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const t = await withTenantContext({ warehouseId }, (c) => billing.tariff(c, warehouseId));
+    const t = await withTenantContext({ warehouseId }, (c) => billing.tariff(c, warehouseId, req.query.companyId, req.query.at));
     res.json({ ...t, services: billing.SERVICES, storageUnits: billing.STORAGE_UNITS });
   } catch (err) { next(err); }
 });
@@ -83,10 +83,53 @@ router.put('/billing/tariff', requireAuth, requireGrant('billing'), async (req, 
 router.get('/billing/charges', requireAuth, requireGrant('billing'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const companyId = req.query.companyId || null;
-    if (companyId && !/^[0-9a-f-]{36}$/i.test(companyId)) throw new HttpError(400, 'Неверный продавец');
     res.set('Cache-Control', 'no-store').json(await withTenantContext({ warehouseId },
-      (c) => billing.charges(c, warehouseId, { month: req.query.month, companyId })));
+      (c) => billing.charges(c, warehouseId, { month: req.query.month, from: req.query.from,
+        to: req.query.to, companyId: req.query.companyId })));
+  } catch (err) { next(err); }
+});
+
+router.get('/billing/schedule', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.set('Cache-Control', 'no-store').json(await withTenantContext({ warehouseId }, async (c) => {
+      await billing.company(c, warehouseId, req.query.companyId);
+      return billing.settings(c, warehouseId, req.query.companyId);
+    }));
+  } catch (err) { next(err); }
+});
+router.put('/billing/schedule', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, (c) => billing.saveSchedule(c, warehouseId, req.body,
+      req.auth.name || req.auth.ownerName || req.auth.role)));
+  } catch (err) { next(err); }
+});
+router.get('/billing/invoices', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.set('Cache-Control', 'no-store').json(await withTenantContext({ warehouseId }, (c) => billing.listInvoices(c, warehouseId,
+      { companyId: req.query.companyId, limit: req.query.limit || 30, cursor: req.query.cursor })));
+  } catch (err) { next(err); }
+});
+router.post('/billing/invoices', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.status(201).json(await withTenantContext({ warehouseId }, (c) => billing.issueInvoice(c, warehouseId, req.body,
+      req.auth.name || req.auth.ownerName || req.auth.role)));
+  } catch (err) { next(err); }
+});
+router.get('/billing/invoices/:id', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.set('Cache-Control', 'no-store').json(await withTenantContext({ warehouseId }, (c) => billing.getInvoice(c, warehouseId, req.params.id)));
+  } catch (err) { next(err); }
+});
+router.post('/billing/invoices/:id/payments', requireAuth, requireGrant('billing'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.status(201).json(await withTenantContext({ warehouseId }, (c) => billing.recordPayment(c, warehouseId, req.params.id, req.body,
+      req.auth.name || req.auth.ownerName || req.auth.role)));
   } catch (err) { next(err); }
 });
 

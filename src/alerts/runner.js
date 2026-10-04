@@ -165,6 +165,8 @@ async function runOnce() {
       // здесь не должен глушить тревоги, и наоборот.
       await withTenantContext({ warehouseId: row.id }, (client) => billing.snapshotStorage(client, row.id))
         .catch((err) => console.error(`billing: склад ${row.id} без снимка занятости:`, err.message));
+      await withTenantContext({ warehouseId: row.id }, (client) => billing.generateScheduled(client, row.id))
+        .catch((err) => console.error('billing: не удалось обработать расписание счетов:', err.message));
       checked += 1;
     } catch (err) {
       // Один сломанный склад не должен останавливать проверку остальных.

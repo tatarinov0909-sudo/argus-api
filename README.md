@@ -67,3 +67,40 @@ existing examples (`find_staff_key_for_login`, `find_seller_key_for_login`,
 `find_owner_warehouse`). A plain `SELECT` under `argus_app` in that situation
 silently returns zero rows instead of erroring — it looks like "not found,"
 not like a permissions problem, so it's easy to miss.
+
+## Fulfillment workspace, 4 October 2026
+
+Apply migrations `1754404900000_personal-billing` and
+`1754405000000_journal_date_indexes` with the matching frontend version.
+The billing migration grants the application role access to its new tables,
+enables tenant RLS, and makes issued invoices and recorded payments immutable.
+Only explicitly saved old rates are copied into independent customer tariffs,
+effective on the migration date in the warehouse timezone. Unsaved defaults and
+historical prices are never invented. Automatic schedules start disabled.
+
+Billing endpoints under `/api/warehouses/billing` require the `billing` grant:
+`tariff`, `charges`, `schedule`, `invoices`, invoice details, and invoice
+`payments`. A customer's complete four-service tariff is versioned by
+`effectiveFrom`. Charges accept a month or an inclusive `from`/`to` period;
+invoices accept only completed days in the warehouse timezone. Missing rates
+block invoice creation. Amounts are calculated in integer kopecks and returned
+as decimal strings, with companion cents fields. Schedules fill only periods
+not already covered by manual invoices; invoice frequency and payment deadline
+are separate settings. Storage uses the existing observed daily snapshots.
+Payments record money already received; they do not execute a bank transfer.
+
+`GET /api/sellers/billing` returns the client's tariff, schedule and read-only
+invoices, including `invoiceCursor`/`nextInvoiceCursor` pagination. All ownership
+checks are server-side. Archived clients retain their existing financial records.
+
+`GET /api/journal?date=YYYY-MM-DD&limit=100` returns entries for a warehouse-local
+day and unanswered pending entries independently, with `nextCursor` and
+`pendingNextCursor`. Cursors retain microseconds and are bound to tenant, scope,
+permissions, date and timezone. The no-date array and cell/invoice history
+contract remain compatible.
+
+Pure regressions: `node --test test/billing-values.test.js test/journal-paging.test.js`.
+Database regressions: `test/billing-e2e.js`, `test/billing-migration-e2e.js`, and
+`test/journal-day.integration.test.js`. Their write guards require an explicitly
+selected isolated test database and `ARGUS_TEST_ALLOW_WRITES=1`; migration tests
+require a fresh pre-upgrade database. Production was not changed in this stage.
