@@ -17,7 +17,7 @@ try{
  await context.addInitScript(t=>{localStorage.setItem('argus_token',t);localStorage.setItem('argus_role','owner');},owner.token);
  const p=await context.newPage();const errors=[];p.on('pageerror',e=>errors.push(e.message));
  await p.goto('http://127.0.0.1:8099/cabinet_main.html');
- await p.locator('#nav-warehouse').click();
+ await p.locator('#nav-products').click();await p.locator('#tab-warehouse').click();
  await p.locator('[onclick="openConstructor()"]').click();
  await p.waitForTimeout(250);
  const actual=await p.locator('#whConstructor').evaluate(el=>({visible:el.getBoundingClientRect().width>0&&el.getBoundingClientRect().height>0,parent:el.parentElement.className,active:el.classList.contains('active')}));

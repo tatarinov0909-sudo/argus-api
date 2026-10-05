@@ -310,7 +310,9 @@ router.get('/billing', requireAuth, requireRole('seller', 'owner', 'manager'), a
       return { enabled: true, shownToSeller: t.showSellers, month: r.month, approximate: r.approximate,
         from: r.from, to: r.to, configured: mine.configured, missingTariff: mine.missingTariff,
         storageSince: r.storageSince, lines: mine.lines, total: mine.total, totalCents: mine.totalCents,
-        tariff: t, schedule: t.schedule, invoices: invoices.items, nextInvoiceCursor: invoices.nextCursor };
+        // Кто из склада менял прайс — внутреннее дело склада (проверка 05.10).
+        tariff: req.auth.role === 'seller' ? { ...t, history: t.history.map(({ updatedBy, ...h }) => h) } : t,
+        schedule: t.schedule, invoices: invoices.items, nextInvoiceCursor: invoices.nextCursor };
     });
     res.set('Cache-Control', 'no-store').json(out);
   } catch (err) { next(err); }

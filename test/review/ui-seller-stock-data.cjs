@@ -10,8 +10,8 @@ async function seed(app){
  const inbound=await app.ok('POST','/api/invoices',s.owner,{companyId:s.company,number:'ПРИХОД-ДЛЯ-КОММЕНТАРИЕВ',items:[{sku:'UI-LONG',name:LONG,declaredQty:10}]});await app.ok('POST','/api/inbound/'+inbound.id+'/comments',s.seller,{body:'Проверочный комментарий продавца: прошу сверить количество и упаковку при приёмке.'});
  const order=async(number,qty)=>app.ok('POST','/api/invoices',s.owner,{companyId:s.company,number,direction:'out',items:[{sku:'UI-LONG',name:LONG,declaredQty:qty}]});
  const queued=await order('ЗАКАЗ-В-ОЧЕРЕДИ',3),assembly=await order('ЗАКАЗ-В-СБОРКЕ',7),transit=await order('ЗАКАЗ-В-ПУТИ',4);
- const supply=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[assembly.id],marketplace:'wb',destination:'Тестовый пункт назначения поставки',shipDate:'2026-10-05',virtualWarehouseId:a.id});
- const departed=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[transit.id],marketplace:'wb',destination:'Тестовый пункт в пути',shipDate:'2026-10-04',virtualWarehouseId:null});
+ const supply=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[assembly.id],marketplace:'wb',destination:'Тестовый пункт назначения поставки',shipDate:new Date().toLocaleDateString('sv-SE',{timeZone:'Europe/Moscow'}),virtualWarehouseId:a.id});
+ const departed=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[transit.id],marketplace:'wb',destination:'Тестовый пункт в пути',shipDate:new Date().toLocaleDateString('sv-SE',{timeZone:'Europe/Moscow'}),virtualWarehouseId:null});
  // Visual fixture: completed historical transport. No WB calls or shipping writes.
  await s.q("UPDATE invoices SET source='wb',external_id=number WHERE id=ANY($1::uuid[])",[[queued.id,assembly.id,transit.id]]);
  await s.q("UPDATE invoices SET status='shipped',shipped_at=now() WHERE id=$1",[transit.id]);await s.q("UPDATE supplies SET status='shipped',shipped_at=now() WHERE id=$1",[departed.id]);

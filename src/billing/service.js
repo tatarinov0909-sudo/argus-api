@@ -36,7 +36,9 @@ async function saveTariff(client,wid,body,who) {
     try {prices[key]=money(moneyCents(body?.prices?.[key],1000000n));}
     catch(e) {if(e instanceof HttpError) throw new HttpError(400,`Цена «${SERVICES[key].title}» — от 0 до 1 000 000, с точностью до копейки`); throw e;}
   }
-  if (!STORAGE_UNITS[body.storageUnit]) throw new HttpError(400,'Хранение берём за ячейку или за штуку в сутки');
+  // Своё свойство, а не любое имя объекта: «constructor» иначе проходил и
+  // падал в базе «внутренней ошибкой» (проверка 05.10).
+  if (!Object.hasOwn(STORAGE_UNITS,String(body?.storageUnit))) throw new HttpError(400,'Хранение берём за ячейку или за штуку в сутки');
   const used=(await client.query(`SELECT 1 FROM billing_invoices b JOIN billing_company_tariffs t
     ON t.warehouse_id=b.warehouse_id AND t.company_id=b.company_id WHERE t.warehouse_id=$1 AND t.company_id=$2
     AND t.effective_from=$3::date AND b.lines @> jsonb_build_array(jsonb_build_object('tariffId',t.id::text)) LIMIT 1`,[wid,cid,effectiveFrom])).rowCount;
@@ -64,21 +66,28 @@ async function charges(client,wid,options) {
   if(cid) await company(client,wid,cid);
   const zone=await zoneOf(client,wid),today=todayIn(zone);
   if(span.from<=today && span.to>=today) await snapshotStorage(client,wid,cid);
-  const p=[wid,span.from,span.to,cid,zone];
-  const during=col=>`${col}>=$2::date::timestamp AT TIME ZONE $5 AND ${col}<($3::date+1)::timestamp AT TIME ZONE $5 AND ($4::uuid IS NULL OR x.company_id=$4)`;
+  // Границы — начало первого и конец последнего дня в поясе склада, либо
+  // точные границы соседних счетов (fromAt/toAt, issueInvoice): после смены
+  // пояса работа не попадает в два счёта и не выпадает из обоих (проверка 05.10).
+  const p=[wid,span.from,span.to,cid,zone,options.fromAt || null,options.toAt || null];
+  const lower='COALESCE($6::timestamptz,$2::date::timestamp AT TIME ZONE $5)',upper='COALESCE($7::timestamptz,($3::date+1)::timestamp AT TIME ZONE $5)';
+  const during=col=>`${col}>=${lower} AND ${col}<${upper} AND ($4::uuid IS NULL OR x.company_id=$4)`;
+  // День работы не выходит за период: продолжение соседнего счёта по новому
+  // поясу может начаться накануне.
+  const dayOf=col=>`to_char(LEAST(GREATEST((${col} AT TIME ZONE $5)::date,$2::date),$3::date),'YYYY-MM-DD')`;
   const receiving=(await client.query(`SELECT x.company_id,i.id AS document_id,i.number,
-    to_char(x.finished_at AT TIME ZONE $5,'YYYY-MM-DD') AS day,sum(x.accepted_qty)::text AS qty
+    ${dayOf('x.finished_at')} AS day,sum(x.accepted_qty)::text AS qty
     FROM receiving_records x JOIN invoice_items ii ON ii.id=x.invoice_item_id JOIN invoices i ON i.id=ii.invoice_id
     WHERE x.warehouse_id=$1 AND ${during('x.finished_at')} GROUP BY x.company_id,i.id,i.number,day ORDER BY day,i.number`,p)).rows;
   // Заказ один раз: по первой записанной сборке, а не каждой товарной строке.
-  const picking=(await client.query(`SELECT x.company_id,to_char(x.at AT TIME ZONE $5,'YYYY-MM-DD') AS day,count(*)::bigint AS qty
+  const picking=(await client.query(`SELECT x.company_id,${dayOf('x.at')} AS day,count(*)::bigint AS qty
     FROM (SELECT sr.company_id,ii.invoice_id,min(sr.finished_at) AS at FROM shipping_records sr
       JOIN invoice_items ii ON ii.id=sr.invoice_item_id WHERE sr.warehouse_id=$1 AND sr.company_id IS NOT NULL
       AND sr.finished_at IS NOT NULL AND sr.picked_qty>0 AND ($4::uuid IS NULL OR sr.company_id=$4)
-      AND sr.finished_at<($3::date+1)::timestamp AT TIME ZONE $5 GROUP BY sr.company_id,ii.invoice_id) x
+      AND sr.finished_at<${upper} GROUP BY sr.company_id,ii.invoice_id) x
     WHERE ${during('x.at')} GROUP BY x.company_id,day ORDER BY day`,p)).rows;
   const returns=(await client.query(`SELECT x.company_id,i.id AS document_id,i.number,
-    to_char(x.finished_at AT TIME ZONE $5,'YYYY-MM-DD') AS day,sum(x.qty)::text AS qty
+    ${dayOf('x.finished_at')} AS day,sum(x.qty)::text AS qty
     FROM return_records x JOIN invoice_items ii ON ii.id=x.invoice_item_id JOIN invoices i ON i.id=ii.invoice_id
     WHERE x.warehouse_id=$1 AND ${during('x.finished_at')} GROUP BY x.company_id,i.id,i.number,day ORDER BY day,i.number`,p)).rows;
   const storage=(await client.query(`SELECT x.company_id,to_char(x.day,'YYYY-MM-DD') AS day,x.cells,x.units
@@ -147,7 +156,7 @@ async function saveSchedule(client,wid,body,who) {
   return settings(client,wid,cid);
 }
 
-const FIELDS=`id,company_id,company_name,to_char(period_from,'YYYY-MM-DD') AS period_from,
+const FIELDS=`id,number,company_id,company_name,to_char(period_from,'YYYY-MM-DD') AS period_from,
   to_char(period_to,'YYYY-MM-DD') AS period_to,issued_at,to_char(due_date,'YYYY-MM-DD') AS due_date,lines,total_cents,
   to_char(issued_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_at`;
 async function views(client,wid,rows) {
@@ -158,7 +167,8 @@ async function views(client,wid,rows) {
   for(const p of payments) {if(!byInvoice.has(p.invoice_id)) byInvoice.set(p.invoice_id,[]); byInvoice.get(p.invoice_id).push(p);}
   return rows.map(r=>{
     const pp=byInvoice.get(r.id) || [],paid=pp.reduce((sum,p)=>sum+BigInt(p.amount_cents),0n),total=BigInt(r.total_cents),balance=total-paid;
-    return {id:r.id,number:`СЧ-${r.id.slice(0,8).toUpperCase()}`,companyId:r.company_id,companyName:r.company_name,
+    // Порядковый номер у склада; у счетов до 05.10.2026 — прежний.
+    return {id:r.id,number:r.number?`СЧ-${r.number}`:`СЧ-${r.id.slice(0,8).toUpperCase()}`,companyId:r.company_id,companyName:r.company_name,
       from:r.period_from,to:r.period_to,issuedAt:r.issued_at,dueDate:r.due_date,lines:r.lines,total:money(total),totalCents:String(total),
       paid:money(paid),paidCents:String(paid),balance:money(balance),balanceCents:String(balance),
       status:balance===0n?'paid':r.due_date<today?'overdue':paid>0n?'partial':'unpaid',
@@ -184,19 +194,32 @@ async function listInvoices(client,wid,{companyId=null,limit=30,cursor=null}={})
   return {items:await views(client,wid,visible),nextCursor:rows.length>n?Buffer.from(JSON.stringify({at:last.cursor_at,id:last.id})).toString('base64url'):null};
 }
 async function issueInvoice(client,wid,body,who) {
-  const cid=body?.companyId,c=await company(client,wid,cid,true),span=period(body),today=todayIn(await zoneOf(client,wid));
+  const cid=body?.companyId,c=await company(client,wid,cid,true),span=period(body),zone=await zoneOf(client,wid),today=todayIn(zone);
   if(span.to>=today) throw new HttpError(400,'Счёт выставляется только за завершённые дни. Сегодняшние услуги пока доступны в предварительном расчёте');
   const old=(await client.query(`SELECT id,to_char(period_from,'YYYY-MM-DD') AS f,to_char(period_to,'YYYY-MM-DD') AS t
     FROM billing_invoices WHERE warehouse_id=$1 AND company_id=$2 AND period_from<=$4::date AND period_to>=$3::date ORDER BY issued_at LIMIT 1`,[wid,cid,span.from,span.to])).rows[0];
   if(old) {if(old.f===span.from && old.t===span.to) return getInvoice(client,wid,old.id); throw new HttpError(409,'Период пересекается с уже выставленным счётом');}
-  const seller=(await charges(client,wid,{...span,companyId:cid})).sellers[0];
+  // Счёт продолжает соседний ровно с той секунды, где тот закончился, и
+  // помнит свои границы (covers_*): иначе смена пояса склада переносила
+  // вечерние работы в следующий счёт ещё раз или мимо обоих (проверка 05.10).
+  const bounds=(await client.query(`SELECT
+      COALESCE((SELECT COALESCE(covers_to,(period_to+1)::timestamp AT TIME ZONE $5) FROM billing_invoices
+        WHERE warehouse_id=$1 AND company_id=$2 AND period_to=$3::date-1 ORDER BY issued_at DESC LIMIT 1),
+        $3::date::timestamp AT TIME ZONE $5) AS from_at,
+      COALESCE((SELECT COALESCE(covers_from,period_from::timestamp AT TIME ZONE $5) FROM billing_invoices
+        WHERE warehouse_id=$1 AND company_id=$2 AND period_from=$4::date+1 ORDER BY issued_at DESC LIMIT 1),
+        ($4::date+1)::timestamp AT TIME ZONE $5) AS to_at`,[wid,cid,span.from,span.to,zone])).rows[0];
+  const seller=(await charges(client,wid,{...span,companyId:cid,fromAt:bounds.from_at,toAt:bounds.to_at})).sellers[0];
   if(seller.missingTariff) throw new HttpError(409,'За часть операций нет персонального прайса. Заполните ставки и дату действия');
   if(!seller.lines.length) throw new HttpError(409,'За этот период нет записанных услуг для счёта');
   const s=await settings(client,wid,cid),dueDate=body.dueDate?date(body.dueDate,'Срок оплаты'):addDays(today,s.paymentDays);
   if(dueDate<today) throw new HttpError(400,'Срок оплаты не может быть в прошлом');
   if(BigInt(seller.totalCents)>MAX_CENTS) throw new HttpError(409,'Сумма счёта слишком велика');
-  const row=(await client.query(`INSERT INTO billing_invoices (warehouse_id,company_id,period_from,period_to,due_date,company_name,lines,total_cents,issued_by)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[wid,cid,span.from,span.to,dueDate,c.name,JSON.stringify(seller.lines),seller.totalCents,who || null])).rows[0];
+  // Номер — следующий у склада; замок склада — чтобы два счёта не взяли один.
+  await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('billing-number:'||$1::text,0))`,[wid]);
+  const row=(await client.query(`INSERT INTO billing_invoices (warehouse_id,company_id,period_from,period_to,due_date,company_name,lines,total_cents,issued_by,covers_from,covers_to,number)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,(SELECT COALESCE(max(number),0)+1 FROM billing_invoices WHERE warehouse_id=$1)) RETURNING id`,
+  [wid,cid,span.from,span.to,dueDate,c.name,JSON.stringify(seller.lines),seller.totalCents,who || null,bounds.from_at,bounds.to_at])).rows[0];
   return getInvoice(client,wid,row.id);
 }
 async function recordPayment(client,wid,id,body,who) {

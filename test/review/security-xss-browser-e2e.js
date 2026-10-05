@@ -11,7 +11,7 @@ try{
  const inbound=await app.ok('POST','/api/invoices',s.owner,{companyId:s.company,number:PAYLOAD,items:[{sku:'XSS-1',name:PAYLOAD,declaredQty:3}]});
  await app.ok('POST','/api/inbound/'+inbound.id+'/comments',s.seller,{body:PAYLOAD});
  const outbound=await app.ok('POST','/api/invoices',s.owner,{companyId:s.company,number:'XSS-OUT',direction:'out',items:[{sku:'XSS-1',name:PAYLOAD,declaredQty:1}]});
- const supply=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[outbound.id],marketplace:'wb',destination:PAYLOAD,shipDate:'2026-10-04'});
+ const supply=await app.ok('POST','/api/supplies',s.owner,{invoiceIds:[outbound.id],marketplace:'wb',destination:PAYLOAD,shipDate:new Date().toLocaleDateString('sv-SE',{timeZone:'Europe/Moscow'})});
  browser=await chromium.launch({headless:true,channel:'chrome',proxy:{server:'http://127.0.0.1:9',bypass:'127.0.0.1,localhost'},args:['--disable-background-networking','--disable-component-update','--disable-sync']});
  async function page(token,role,file){
   const c=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:'block'});

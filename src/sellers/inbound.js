@@ -111,8 +111,10 @@ function parseInboundSheet(grid) {
 }
 
 // Каталог продавца одним заходом: строк в файле до пяти тысяч, и запрос на
-// каждую держал бы соединение с базой всё это время.
-async function loadCatalog(client, companyId) {
+// каждую держал бы соединение с базой всё это время. Ключи — штрихкоды
+// (карточки, в конце названия, WB) и артикулы (Аргуса и продавца на WB, без
+// учёта регистра). Общий для прихода и переноса в виртуальный склад.
+async function catalogIndex(client, companyId) {
   const products = (await client.query(
     `SELECT sku, name, btrim(barcode) AS barcode,
             substring(name from '([0-9]{8,14})[[:space:]]*$') AS name_barcode
@@ -139,6 +141,11 @@ async function loadCatalog(client, companyId) {
     add(byBarcode, m.mp_barcode, m.sku);
     add(byArticle, m.mp_article && m.mp_article.toUpperCase(), m.sku);
   }
+  return { products, names, byBarcode, byArticle, byName };
+}
+
+async function loadCatalog(client, companyId) {
+  const { names, byBarcode, byArticle, byName } = await catalogIndex(client, companyId);
   // Товар узнаём, только если ключ указывает ровно на один товар.
   const one = (map, key) => {
     const set = key && map.get(key);
@@ -413,4 +420,4 @@ async function run(client, {
   return { applied: true, summary, lines: found, invoice: { id: inv.id, number: inv.number }, created: created.length };
 }
 
-module.exports = { parseInboundSheet, run, readDetails, saveDetails, describe, placesText, lockEditable };
+module.exports = { parseInboundSheet, run, readDetails, saveDetails, describe, placesText, lockEditable, catalogIndex };

@@ -86,13 +86,19 @@ const catalog = ['A-1', 'A-2', 'A-3', 'A-4'].map((sku) => ({ sku, name: `Тов�
     const act = (name) => page.locator(`#warehouseVwStockPane [data-action="${name}"]`);
     await act('import').click();
 
-    // Файл: заголовок и четыре товара; служебный размер листа — ref.
+    // Файл: заголовок и четыре товара; служебный размер листа (<dimension>) — ref.
+    // Поправлено при починке 05.10: SheetJS при записи не пишет ячейки за
+    // пределами !ref, и прежний файл на деле содержал 2 товара, а не 4. Теперь
+    // все 4 строки в файле, а занижена только пометка — как у программ выгрузки.
     const upload = async (ref) => {
       const bytes = await page.evaluate((r) => {
         const ws = XLSX.utils.aoa_to_sheet([['Артикул', 'Количество'], ['A-1', 1], ['A-2', 1], ['A-3', 1], ['A-4', 1]]);
-        ws['!ref'] = r;
         const b = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(b, ws, 'Товары');
-        return Array.from(new Uint8Array(XLSX.write(b, { type: 'array', bookType: 'xlsx' })));
+        const zip = XLSX.CFB.read(new Uint8Array(XLSX.write(b, { type: 'array', bookType: 'xlsx' })), { type: 'array' });
+        const entry = zip.FileIndex[zip.FullPaths.findIndex((x) => /worksheets\/sheet1\.xml$/.test(x))];
+        const xml = new TextDecoder().decode(entry.content).replace(/<dimension ref="[^"]+"\/>/, `<dimension ref="${r}"/>`);
+        entry.content = new TextEncoder().encode(xml); entry.size = entry.content.length;
+        return Array.from(new Uint8Array(XLSX.CFB.write(zip, { type: 'array', fileType: 'zip' })));
       }, ref);
       await page.locator('#warehouseVwStockPane input[type=file]').setInputFiles({ name: `rows-${ref}.xlsx`,
         mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from(bytes) });

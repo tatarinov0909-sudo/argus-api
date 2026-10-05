@@ -127,11 +127,17 @@ async function candidates(client, warehouseId, query) {
 }
 async function preview(client, warehouseId, body) {
   const b = input(body), ctx = await context(client, warehouseId, b.companyId, b.toVw, b.items.map(r => r.fromVw));
-  const products = (await client.query(`SELECT sku,name,barcode FROM products WHERE warehouse_id=$1 AND company_id=$2 AND active
-    AND (sku=ANY($3::text[]) OR barcode=ANY($4::text[]))`,
-  [warehouseId, b.companyId, b.items.map(r => r.sku), b.items.map(r => r.barcode).filter(Boolean)])).rows;
-  const bySku = new Map(products.map(p => [p.sku,p])), byBarcode = new Map();
-  products.forEach(p => { if (p.barcode) byBarcode.set(p.barcode, [...(byBarcode.get(p.barcode) || []),p]); });
+  // Те же ключи, что у прихода из Excel (проверка 05.10): артикул без учёта
+  // регистра, артикул продавца и штрихкод WB. Угадывания нет — ключ должен
+  // указывать ровно на один товар.
+  const cat = await require('../sellers/inbound').catalogIndex(client, b.companyId);
+  const products = new Map(cat.products.map(p => [p.sku,p]));
+  const exact = new Map(cat.products.map(p => [p.sku.toUpperCase(),p.sku]));
+  const bySku = { get: (code) => {
+    const up = String(code).toUpperCase(), own = exact.get(up), set = cat.byArticle.get(up);
+    return products.get(own || (set && set.size === 1 ? [...set][0] : null)) || null;
+  } };
+  const byBarcode = { get: (code) => [...(cat.byBarcode.get(code) || [])].map(s => products.get(s)) };
   const errors = [], seen = new Set(), resolved = [];
   const add = (r, code, message, extra = {}) => errors.push({ row:r.row, code, message, ...extra });
   for (const r of b.items) {
@@ -143,7 +149,7 @@ async function preview(client, warehouseId, body) {
       else if (!matches.length) add(r,'unknown_barcode','Штрихкод не найден в каталоге этого клиента');
       else if (matches.length > 1) add(r,'ambiguous_barcode','Этот штрихкод принадлежит нескольким товарам — укажите артикул Аргуса');
       else p = matches[0];
-    } else if (p && r.barcode && p.barcode !== r.barcode) add(r,'identifier_mismatch','Артикул и штрихкод указывают на разные товары');
+    } else if (p && r.barcode && !byBarcode.get(r.barcode).some(x => x.sku === p.sku)) add(r,'identifier_mismatch','Артикул и штрихкод указывают на разные товары');
     if (r.qty === null) add(r,'invalid_qty',`Количество — положительное целое число до ${MAX_QTY}`);
     if (r.fromVw === b.toVw) add(r,'same_warehouse','Исходный и целевой склад совпадают');
     if (p) {

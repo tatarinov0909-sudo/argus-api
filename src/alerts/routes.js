@@ -73,12 +73,15 @@ router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) =
         `SELECT
            (SELECT count(*)::int FROM journal_entries je
              WHERE je.warehouse_id = $1 AND je.status = 'pending'
+               -- Заявка клиента на перенос считается ниже (seller_requests) —
+               -- здесь её не повторяем (проверка 05.10).
+               AND je.entity_type IS DISTINCT FROM 'vw_transfer'
                AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS discrepancies,
            (SELECT count(*)::int FROM vw_transfers WHERE warehouse_id = $1 AND status = 'requested') AS seller_requests,
            (SELECT count(*)::int FROM inventory_tasks WHERE warehouse_id = $1 AND status = 'waiting_owner') AS recounts,
            (SELECT count(DISTINCT i.id)::int FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
               JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
-             WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.supply_id IS NULL
+             WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.source = 'wb' AND i.supply_id IS NULL
                AND i.status <> 'shipped' AND i.mp_closed_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM products p WHERE p.warehouse_id = ii.warehouse_id
                                  AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped`,
