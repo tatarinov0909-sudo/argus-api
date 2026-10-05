@@ -262,6 +262,12 @@ async function deliver({
   warehouseId, companyId, supply, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
 }) {
   if (!supply.mp_supply_id) return { skipped: 'no_mp_supply' };
+  // Передать можно до отъезда («Передать в доставку WB», владелец 05.10.2026)
+  // и при «Уехала» — второй раз в WB не идём.
+  const fresh = (await withTx((client) => client.query(
+    `SELECT status, mp_delivered_at, to_char(ship_date, 'YYYY-MM-DD') AS ship_date FROM supplies
+      WHERE warehouse_id = $1 AND id = $2`, [warehouseId, supply.id]))).rows[0];
+  if (fresh?.mp_delivered_at) return { skipped: 'already_delivered', alreadyDelivered: true };
 
   // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
   // что на площадке поставка осталась несданной, и оставляем след.
@@ -299,7 +305,11 @@ async function deliver({
   // а не мы — молча.
   if (supply.mp_shipping_point_id) {
     try {
-      await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: await withTx((client) => warehouseToday(client, warehouseId)) });
+      // Передают до отъезда — дата плановая, если она ещё впереди; машина
+      // уже ушла («Уехала») — сегодняшняя.
+      const today = await withTx((client) => warehouseToday(client, warehouseId));
+      const day = fresh?.status === 'ready' && fresh.ship_date && fresh.ship_date > today ? fresh.ship_date : today;
+      await api.setShipping(token, supply.mp_supply_id, { pointId: supply.mp_shipping_point_id, date: day });
     } catch (err) {
       if (!supply.mp_shipping_set_at) return complain(err.message);
       // Параметры на площадке остались прежними: дата там будет плановая, а

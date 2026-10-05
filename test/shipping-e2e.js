@@ -282,6 +282,16 @@ async function api(method, path, { token, body } = {}) {
       assert.equal(afterShip.body.status, 'shipped', afterShip.body.status);
     });
 
+    // Список «Отгрузки вручную и из 1С» (владелец 05.10.2026): без заказов WB.
+    const onec = await api('GET', '/api/invoices?direction=out&source=1c', { token: ownerToken });
+    const badSource = await api('GET', '/api/invoices?source=x', { token: ownerToken });
+    check('отгрузка вручную видна в списке ?source=1c, источник проверяется', () => {
+      assert.equal(onec.status, 200, JSON.stringify(onec.body));
+      assert.ok(onec.body.some((i) => i.id === out.body.id && i.status === 'shipped'));
+      assert.ok(onec.body.every((i) => i.source === '1c' && i.direction === 'out'));
+      assert.equal(badSource.status, 400);
+    });
+
     const doubleShip = await api('POST', `/api/shipping/${out.body.id}/ship`, { token: ownerToken });
     check('already-shipped order cannot be shipped again', () => {
       assert.equal(doubleShip.status, 409, JSON.stringify(doubleShip.body));

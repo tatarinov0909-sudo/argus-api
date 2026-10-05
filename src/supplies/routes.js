@@ -213,8 +213,10 @@ router.post('/:id/marketplace/deliver', requireAuth, requireRole('owner', 'manag
     if (!supply) throw new HttpError(404, 'Поставка не найдена');
     if (!supply.mp_supply_id) throw new HttpError(409, 'Этой поставки нет на площадке');
     if (supply.mp_delivered_at) return res.json({ alreadyDelivered: true });
-    if (supply.status !== 'shipped') {
-      throw new HttpError(409, 'Поставка ещё не уехала — передавать её в доставку рано');
+    // До отъезда — как только собрана: WB выдаёт QR поставки только после
+    // передачи в доставку, а он нужен, чтобы грузить машину (владелец 05.10.2026).
+    if (!['ready', 'shipped'].includes(supply.status)) {
+      throw new HttpError(409, 'Поставка ещё собирается — передать в доставку можно, когда она собрана');
     }
     const result = await wbHandoff.deliver({
       warehouseId,

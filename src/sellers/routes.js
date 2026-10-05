@@ -75,6 +75,17 @@ async function requireActiveCompany(client, companyId) {
 // его заказы уезжают, и знать, когда и куда, — его законный интерес. Приходы
 // на склад — другое слово и другой раздел («Приходы и документы»).
 const SUPPLY_STATUS = { collecting: 'Собирается', ready: 'Собрана, ждёт машину', shipped: 'Уехала' };
+// Шаги WB (владелец 05.10.2026): передана в доставку (QR готов) → уехала →
+// принята WB, когда WB принял все посылки.
+function supplyStatusName(x) {
+  if (x.status === 'shipped' && x.mp_supply_id && x.orders > 0) {
+    if (x.orders_accepted >= x.orders) return 'Принята WB';
+    if (x.orders_accepted > 0) return `Уехала · принято WB ${x.orders_accepted} из ${x.orders}`;
+    return 'Уехала, в пути';
+  }
+  if (x.status === 'ready' && x.mp_delivered_at) return 'Передана в доставку · QR готов';
+  return SUPPLY_STATUS[x.status] || x.status;
+}
 
 router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), async (req, res, next) => {
   try {
@@ -84,8 +95,10 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
       await requireActiveCompany(c, companyId);
       const supplies = (await c.query(
         `SELECT s.id, s.number, s.status, s.created_at, s.ready_at, s.shipped_at, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_date,
-                s.destination, s.mp_supply_id, s.mp_barcode, s.mp_barcode_file,
+                s.destination, s.mp_supply_id, s.mp_barcode, s.mp_barcode_file, s.mp_delivered_at,
                 count(DISTINCT i.id)::int AS orders,
+                count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NOT NULL
+                                               AND i.mp_close_reason = 'fulfilled')::int AS orders_accepted,
                 COALESCE(sum(ii.declared_qty), 0)::int AS units,
                 count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready
            FROM supplies s
@@ -111,7 +124,7 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
         id: x.id,
         number: x.number,
         status: x.status,
-        statusName: SUPPLY_STATUS[x.status] || x.status,
+        statusName: supplyStatusName(x),
         createdAt: x.created_at,
         readyAt: x.ready_at,
         shippedAt: x.shipped_at,

@@ -19,9 +19,13 @@ router.get('/', requireAuth, async (req, res, next) => {
     // screens are separate views over the same table. Omitted means
     // "everything", so the owner's existing all-invoices list keeps working
     // untouched.
-    const { direction } = req.query;
+    const { direction, source } = req.query;
     if (direction && !['in', 'out', 'return'].includes(direction)) {
       throw new HttpError(400, 'direction может быть только in, out или return');
+    }
+    // ?source=1c — отгрузки вручную и из 1С без тысяч заказов WB (владелец 05.10.2026).
+    if (source && !['1c', 'wb', 'ozon'].includes(source)) {
+      throw new HttpError(400, 'source может быть только 1c, wb или ozon');
     }
     const rows = await withTenantContext(ctx, async (client) => {
       const result = await client.query(
@@ -54,6 +58,7 @@ router.get('/', requireAuth, async (req, res, next) => {
          FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
          LEFT JOIN supplies s ON s.id = i.supply_id
          WHERE ($1::invoice_direction IS NULL OR i.direction = $1::invoice_direction)
+           AND ($3::text IS NULL OR i.source = $3)
            -- Работнику: закрытые на площадке не нужны, а заказы площадки —
            -- только отправленные на сборку, то есть в поставке.
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
@@ -78,7 +83,7 @@ router.get('/', requireAuth, async (req, res, next) => {
                 OR EXISTS (SELECT 1 FROM invoice_items x JOIN shipping_records sr ON sr.invoice_item_id = x.id
                            WHERE x.invoice_id = i.id))
          ORDER BY i.created_at DESC`,
-        [direction || null, req.auth.role === 'worker'],
+        [direction || null, req.auth.role === 'worker', source || null],
       );
       // Кто принимает приход и сколько принято: «На паузе · Дима · принято 3
       // из 8 позиций» видят все грузчики и склад (владелец 27.09.2026).

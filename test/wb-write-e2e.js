@@ -242,6 +242,9 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
     });
 
     const beforeFull = calls.length;
+    // Переданную поставку второй раз не передают (05.10.2026); здесь
+    // проверяется дата при «Уехала» — как у ещё не переданной.
+    await run((c) => c.query('UPDATE supplies SET mp_delivered_at = NULL WHERE id = $1', [supply.id]));
     const delivered = await wbHandoff.deliver({
       warehouseId, companyId: company.id, api: fakeWb, supply: shippedRow,
       withTx: (fn) => withTenantContext({ warehouseId }, fn),
@@ -290,6 +293,8 @@ const check = (name, fn) => { fn(); count += 1; console.log('PASS ' + name); };
 
     // ---------- Площадка не ответила ----------
     const broken = { ...fakeWb, deliverSupply: async () => { throw new Error('WB ответил с ошибкой 500'); } };
+    // Сбой проверяется на ещё не переданной поставке: переданную второй раз не передают.
+    await run((c) => c.query('UPDATE supplies SET mp_delivered_at = NULL WHERE id = $1', [supply.id]));
     const failed = await wbHandoff.deliver({
       warehouseId, companyId: company.id, api: broken, supply: shippedRow,
       withTx: (fn) => withTenantContext({ warehouseId }, fn),

@@ -691,6 +691,10 @@ async function list(client, warehouseId, { status = null, showShortages = false,
             cb.actor_type AS created_by_role, cb.actor_name AS created_by,
             count(i.id)::int AS orders,
             count(i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS picked,
+            -- Сколько посылок уехавшей поставки WB уже принял (отсортировал и
+            -- дальше): «принята WB 19 из 19».
+            count(i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NOT NULL
+                                  AND i.mp_close_reason = 'fulfilled')::int AS accepted,
             -- Сколько по поставке отмечено «нет товара» и ещё не решено.
             CASE WHEN $3::boolean THEN (
               SELECT count(*)::int FROM journal_entries je JOIN invoices i3 ON i3.id = je.invoice_id
