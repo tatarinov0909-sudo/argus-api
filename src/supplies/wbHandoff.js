@@ -72,7 +72,12 @@ async function handOver(args) {
 }
 
 async function handOverMarked({ warehouseId, companyId, supply, orders, withTx, api = wbWrite, token }) {
-  const mpSupplyId = await api.createSupply(token, supply.number);
+  // Имя поставки в кабинете WB — подпись фулфилмента и наш номер (владелец
+  // 05.10.2026): «Восход ПС-051026-02». Подпись меняется в настройках склада.
+  const label = (await withTx((c) => c.query(
+    `SELECT COALESCE(NULLIF(btrim(wb_supply_label), ''), name) AS label FROM warehouses WHERE id = $1`,
+    [warehouseId]))).rows[0]?.label || '';
+  const mpSupplyId = await api.createSupply(token, [label, supply.number].filter(Boolean).join(' '));
   let confirmed = [];
   let rejected = [];
   // WB пускает не чаще раза в 200 мс, всплеском до 20 запросов, а каждая

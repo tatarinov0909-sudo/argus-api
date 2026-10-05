@@ -40,7 +40,10 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
   const selected = await client.query(
     `SELECT i.id, i.external_id FROM invoices i
      WHERE i.warehouse_id=$1 AND i.company_id=$2 AND i.source='wb' AND i.direction='out'
-       AND i.status <> 'shipped' AND i.mp_stock_returned_at IS NULL
+       -- Уехавший поставкой заказ — «в пути», пока WB не принял посылку:
+       -- его тоже спрашиваем (проверка 01.10, включено с записью в WB 05.10).
+       AND (i.status <> 'shipped' OR (i.supply_id IS NOT NULL AND i.mp_closed_at IS NULL))
+       AND i.mp_stock_returned_at IS NULL
        AND (i.mp_closed_at IS NULL OR (i.mp_close_reason='fulfilled' AND EXISTS (
          SELECT 1 FROM invoice_items ii JOIN shipping_records sr ON sr.invoice_item_id=ii.id
          WHERE ii.invoice_id=i.id AND sr.picked_qty>0)))
@@ -94,6 +97,27 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       WHERE i.warehouse_id=$1 AND i.company_id=$2 AND i.id=$3 FOR UPDATE OF i`,
     [warehouseId, companyId, candidate.id]);
     const inv = locked.rows[0];
+    if (inv && inv.status === 'shipped' && inv.supply_id && !inv.mp_closed_at && !inv.mp_stock_returned_at) {
+      // В пути. «Передан в доставку» — посылка ещё едет; закрываем, только
+      // когда она у WB (отсортирована и дальше) или заказ отменён.
+      const reason = closeReason(row);
+      const ends = Boolean(reason) && endsLocalWork(row, reason);
+      await client.query(`UPDATE invoices SET mp_supplier_status=$4, mp_status=$5,
+          mp_status_checked_at=now(), mp_status_attempted_at=now(),
+          mp_closed_at=CASE WHEN $6 THEN COALESCE(mp_closed_at,now()) ELSE mp_closed_at END,
+          mp_close_reason=CASE WHEN $6 THEN COALESCE(mp_close_reason,$7) ELSE mp_close_reason END
+        WHERE warehouse_id=$1 AND company_id=$2 AND id=$3`,
+      [warehouseId, companyId, candidate.id, row.supplierStatus, row.wbStatus, ends, reason]);
+      checked++;
+      if (ends && reason === 'canceled') {
+        // Посылка уже уехала — вернётся складу возвратом; сказать сейчас.
+        await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
+          entityType: 'invoice', entityId: inv.id, invoiceId: inv.id, status: 'auto',
+          actionText: `Заказ «${inv.number}» отменён на WB уже после отгрузки (поставка «${inv.supply_number}»). `
+            + 'Посылка вернётся складу возвратом.' });
+      }
+      continue;
+    }
     if (!inv || inv.status === 'shipped' || inv.mp_stock_returned_at || inv.mp_close_reason === 'canceled') continue;
     if ((inv.supply_id || null) !== supplyBefore) continue; // moved between supplies meanwhile; next tick
     const reason = closeReason(row);
