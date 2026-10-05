@@ -300,6 +300,9 @@ async function create(client, warehouseId, {
 async function contents(client, warehouseId, supplyId, { showShortages = false, showNotes = false } = {}) {
   const head = await client.query(
     `SELECT s.*, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_day, c.name AS company_name,
+            -- Юрлицо продавца, каким его знает WB, — для этикетки товара.
+            (SELECT mc.wb_seller_name FROM marketplace_credentials mc
+              WHERE mc.company_id = s.company_id AND mc.marketplace = 'wb' LIMIT 1) AS wb_seller_name,
             COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
               WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
@@ -509,6 +512,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
       shipDate: head.rows[0].ship_day,
       companyId: head.rows[0].company_id,
       companyName: head.rows[0].company_name,
+      sellerLegalName: head.rows[0].wb_seller_name || null,
       // Склад продавца, с которого собирают (виртуальные склады, 02.10.2026):
       // null — «Основной»; у продавца без складов не показывается.
       virtualWarehouseId: head.rows[0].virtual_warehouse_id,
