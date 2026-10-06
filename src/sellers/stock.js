@@ -1,3 +1,5 @@
+const wbListing = require('./wbListing');
+
 // Одно правило для четырёх чисел продавца и для списка заказов за ними
 // (задание 27.09.2026: список под числом обязан совпадать с числом).
 // $1 — продавец. «В сборке» — заказ в поставке или по нему уже отбирали.
@@ -175,8 +177,11 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // как у 1С, где товар списывается только при отгрузке. Товар, которого
       // склад ещё ни разу не видел, — «не знаем», а не ноль.
       const byCells = source === 'argus';
+      // «Всего» — весь товар, пока WB его не принял, вместе с «В пути»
+      // (владелец 06.10.2026): в ячейках уехавшего уже нет — прибавляем.
+      const inTransit = Number(r.transit_qty || 0);
       const total = byCells
-        ? (stockKnown ? Math.max(0, onHand) : null)
+        ? (stockKnown ? Math.max(0, onHand) + inTransit : null)
         : (accountingTotal === null ? null : Math.max(0, accountingTotal));
       // Четыре числа продавца (решение владельца 17.09.2026):
       // «в сборке» — заказы, переданные складу поставкой (или уже
@@ -191,12 +196,21 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // только «доступно»: обещать больше, чем лежит, нельзя.
       const inAssembly = assemblyDemand;
       const orderedNotInSupply = queuedDemand;
+      // Едущее на сортировку продать нельзя — оно не свободно (владелец
+      // 06.10.2026). Вычитаем его, пока учёт его ещё числит: 1С одного склада
+      // списывает уехавшее при отъезде машины, другого — когда WB принял.
+      // Что 1С числит сверх лежащего на складе, — это и есть ещё не
+      // списанное едущее; без ячеек — вычитаем всё едущее.
+      // ponytail: по расхождению 1С с ячейками; ячейки больше 1С — едущее
+      // сочтётся списанным. Точнее — вопрос анкеты, когда доделаем обмен с 1С.
+      const transitCounted = total === null ? 0
+        : byCells || !stockKnown ? inTransit : Math.min(inTransit, Math.max(0, total - onHand));
       const sellerAvailable = total === null
-        ? null : Math.max(0, total - inAssembly - orderedNotInSupply);
+        ? null : Math.max(0, total - inAssembly - orderedNotInSupply - transitCounted);
       // Заказов больше, чем товара по учёту: об этом продавец должен знать,
       // а не гадать, почему «доступно» ноль.
       const shortage = total === null
-        ? false : inAssembly + orderedNotInSupply > total;
+        ? false : inAssembly + orderedNotInSupply + transitCounted > total;
       return {
       sku: r.sku,
       shortage,
@@ -226,7 +240,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       totalUpdatedAt: byCells ? (r.counted_at || null) : (accountingTotal === null ? null : (r.stock_at || null)),
       inAssembly,
       orderedNotInSupply,
-      inTransit: Number(r.transit_qty || 0),
+      inTransit,
       sellerAvailable,
       // Сколько заказов стоит за каждым числом — для подписей в кабинете.
       queuedOrders: Number(r.queued_orders || 0),
@@ -241,7 +255,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
       available: stockKnown ? Math.max(0, onHand - ordered) : null,
       short: stockKnown ? Math.max(0, ordered - onHand) : null,
-      ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source }) } : {}),
+      ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source, inTransit: transitCounted }) } : {}),
       };
     });
 }
@@ -282,7 +296,7 @@ async function loadSplit(client, companyId) {
 // из 1С минус остальные склады (1С о складах Аргуса не знает), при учёте в
 // Аргусе — его ячейки. «Заказано» (заказы вне поставки) склада не имеет —
 // оно только в общем итоге.
-function splitOf(split, sku, vws, { total, source }) {
+function splitOf(split, sku, vws, { total, source, inTransit = 0 }) {
   const bySku = split.get(sku) || new Map();
   const at = (id) => bySku.get(id || '') || { good: 0, bad: 0, staged: 0, assembly: 0 };
   const others = vws.map((w) => {
@@ -293,7 +307,7 @@ function splitOf(split, sku, vws, { total, source }) {
   const main = at(null);
   const mainOnHand = source === 'argus'
     ? main.good + main.staged
-    : (total === null ? null : Math.max(0, total - others.reduce((n, w) => n + w.onHand, 0)));
+    : (total === null ? null : Math.max(0, total - inTransit - others.reduce((n, w) => n + w.onHand, 0)));
   // «Остальной товар» — последним: сначала склады продавца.
   return others.concat([{
     id: null, name: 'Остальной товар', onHand: mainOnHand, inAssembly: main.assembly,
@@ -354,10 +368,29 @@ async function stockBySeller(client, warehouseId) {
       companyId: c.id,
       name: c.name,
       ...summarize(rows),
+      // Товаров, которых на WB выставлено больше, чем свободно.
+      wbOver: await wbListing.annotate(client, warehouseId, c.id, rows),
       inCells: rows.reduce((s, r) => s + Number(r.qty || 0) + Number(r.notForSale || 0), 0),
     });
   }
   return { source, sellers: out };
 }
 
-module.exports = { loadStock, BUCKET_SQL, summarize, stockBySeller };
+// «Главная» склада: у каких продавцов на WB выставлено больше, чем свободно
+// (владелец 06.10.2026). Только продавцы с отмеченными складами WB.
+async function wbOverBySeller(client, warehouseId) {
+  const source = (await client.query('SELECT stock_source FROM warehouses WHERE id = $1', [warehouseId]))
+    .rows[0]?.stock_source === 'argus' ? 'argus' : '1c';
+  const companies = (await client.query(
+    `SELECT DISTINCT c.id, c.name FROM companies c
+       JOIN seller_wb_warehouses w ON w.company_id = c.id AND w.warehouse_id = c.warehouse_id AND w.ours
+      WHERE c.warehouse_id = $1 AND c.archived_at IS NULL ORDER BY c.name`, [warehouseId])).rows;
+  const out = [];
+  for (const c of companies) {
+    const count = await wbListing.annotate(client, warehouseId, c.id, await loadStock(client, c.id, { source }));
+    if (count) out.push({ companyId: c.id, name: c.name, count });
+  }
+  return out;
+}
+
+module.exports = { loadStock, BUCKET_SQL, summarize, stockBySeller, wbOverBySeller };

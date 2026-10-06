@@ -182,6 +182,14 @@ function check(name, fn) {
 
     // ---------- Уехало: числа сходятся после следующего обмена с 1С ----------
     await must('POST', `/api/supplies/${supply.id}/ship`, { token: ownerToken, body: { destination: 'СЦ' } });
+    // 1С ещё не списала уехавшее (владелец 06.10.2026): едущее на WB не свободно.
+    const beforeOneC = await sellerStock();
+    check('уехало, 1С ещё не списала — едущее не считается доступным', () => {
+      const a = rowOf(beforeOneC, 'PB-A');
+      assert.equal(a.total, 100, JSON.stringify(a));
+      assert.equal(a.inTransit, 30);
+      assert.equal(a.available, 70);
+    });
     await pushStock([{ sku: 'PB-A', qty: 70 }]);
     const afterShip = await sellerStock();
     check('после отгрузки и обмена с 1С остаток уменьшился, обещаний больше нет', () => {

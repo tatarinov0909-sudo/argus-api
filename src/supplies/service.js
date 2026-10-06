@@ -12,6 +12,13 @@ const journal = require('../journal/repository');
 // это в базе значит соврать. Ошиблись — заводится новая поставка, а старая
 // остаётся в истории как есть.
 
+// Поставку WB, созданную Аргусом, сначала передают в доставку: WB выдаёт
+// QR поставки, его кладут в машину, — и только потом «Уехала» (владелец
+// 06.10.2026). Запись на WB выключена — передают в кабинете WB, не ждём.
+const WB_WRITE_SQL = `EXISTS (SELECT 1 FROM marketplace_credentials mc
+  WHERE mc.warehouse_id = s.warehouse_id AND mc.company_id = s.company_id
+    AND mc.marketplace = 'wb' AND mc.write_enabled)`;
+
 const STATUS_NAMES = {
   collecting: 'собирается',
   ready: 'собрана, ждёт отгрузки',
@@ -552,8 +559,8 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
   const destination = cleanDestination(rawDestination);
   const cur = await client.query(
     `SELECT id, number, status, company_id, mp_supply_id, to_char(ship_date, 'YYYY-MM-DD') AS ship_date,
-            mp_shipping_point_id, mp_shipping_set_at
-       FROM supplies WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
+            mp_shipping_point_id, mp_shipping_set_at, mp_delivered_at, ${WB_WRITE_SQL} AS mp_write
+       FROM supplies s WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`,
     [warehouseId, supplyId],
   );
   if (!cur.rows[0]) throw new HttpError(404, 'Поставка не найдена');
@@ -572,6 +579,10 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
   if (from !== 'ready' || notPicked.length > 0) {
     const names = notPicked.slice(0, 3).map(o => `«${o.number}»`).join(', ');
     throw new HttpError(409, `Ещё не собрано: ${names}. Уехать может только поставка, в которой собран каждый заказ.`);
+  }
+  if (cur.rows[0].mp_supply_id && !cur.rows[0].mp_delivered_at && cur.rows[0].mp_write) {
+    throw new HttpError(409, 'Сначала «Передать в доставку WB»: WB выдаст QR поставки — его кладут в машину. '
+      + '«Уехала» — после этого.');
   }
 
   const updated = await client.query(
@@ -682,7 +693,7 @@ async function list(client, warehouseId, { status = null, showShortages = false,
   const r = await client.query(
     `SELECT s.id, s.number, s.status, s.destination, to_char(s.ship_date, 'YYYY-MM-DD') AS ship_date,
             s.marketplace, s.mp_supply_id,
-            s.mp_handed_at, s.mp_delivered_at, s.mp_barcode,
+            s.mp_handed_at, s.mp_delivered_at, s.mp_barcode, ${WB_WRITE_SQL} AS mp_write,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
             s.virtual_warehouse_id, COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
               WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name,

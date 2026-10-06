@@ -87,6 +87,7 @@ router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) =
                                  AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped`,
         [warehouseId],
       )).rows[0];
+      const wbOver = await require('../sellers/stock').wbOverBySeller(client, warehouseId);
       const sync = (await client.query(
         `SELECT text FROM alerts WHERE warehouse_id = $1 AND resolved_at IS NULL AND alert_key LIKE 'sync\\_%'
           ORDER BY created_at`, [warehouseId])).rows.map((r) => r.text);
@@ -94,7 +95,7 @@ router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) =
         ship: { supplies: work.suppliesToPick, orders: work.ordersToPick, ready: work.suppliesReady, onec: work.onecToPick },
         receive: { arrivals: work.toReceive, arrived: work.arrived, returns: work.returnsToSort },
         decide: { discrepancies: d.discrepancies, sellerRequests: d.seller_requests, recounts: d.recounts },
-        exchange: { sync, wbUnmapped: d.wb_unmapped },
+        exchange: { sync, wbUnmapped: d.wb_unmapped, wbOver },
       };
     });
     res.json(data);

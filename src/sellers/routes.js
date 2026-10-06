@@ -14,6 +14,7 @@ const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
 const sellerWarehouses = require('../marketplaces/sellerWarehouses');
+const wbListing = require('./wbListing');
 const sync = require('../marketplaces/sync');
 const router = express.Router();
 
@@ -76,13 +77,11 @@ async function requireActiveCompany(client, companyId) {
 // на склад — другое слово и другой раздел («Приходы и документы»).
 const SUPPLY_STATUS = { collecting: 'Собирается', ready: 'Собрана, ждёт машину', shipped: 'Уехала' };
 // Шаги WB (владелец 05.10.2026): передана в доставку (QR готов) → уехала →
-// принята WB, когда WB принял все посылки.
+// принята WB, когда WB принял все посылки. Сколько принято — отдельный
+// столбец «Приёмка WB» (владелец 06.10.2026).
 function supplyStatusName(x) {
-  if (x.status === 'shipped' && x.mp_supply_id && x.orders > 0) {
-    if (x.orders_accepted >= x.orders) return 'Принята WB';
-    if (x.orders_accepted > 0) return `Уехала · принято WB ${x.orders_accepted} из ${x.orders}`;
-    return 'Уехала, в пути';
-  }
+  if (x.status === 'shipped' && x.mp_supply_id && x.orders > 0
+      && x.orders_accepted + x.orders_canceled >= x.orders && x.orders_accepted > 0) return 'Принята WB';
   if (x.status === 'ready' && x.mp_delivered_at) return 'Передана в доставку · QR готов';
   return SUPPLY_STATUS[x.status] || x.status;
 }
@@ -99,6 +98,8 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
                 count(DISTINCT i.id)::int AS orders,
                 count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NOT NULL
                                                AND i.mp_close_reason = 'fulfilled')::int AS orders_accepted,
+                count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_close_reason = 'canceled')::int AS orders_canceled,
+                count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NULL)::int AS orders_in_transit,
                 COALESCE(sum(ii.declared_qty), 0)::int AS units,
                 count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready
            FROM supplies s
@@ -132,6 +133,11 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
         destination: x.destination,
         orders: x.orders,
         ordersReady: x.orders_ready,
+        // Приёмка на WB уехавшей поставки: принято сортировочным центром,
+        // ещё в пути, отменено покупателем после отгрузки.
+        ordersAccepted: x.orders_accepted,
+        ordersInTransit: x.orders_in_transit,
+        ordersCanceled: x.orders_canceled,
         units: x.units,
         // Номер и QR поставки на WB — их показывают на воротах
         // сортировочного центра. Появляются, когда поставка передана на WB.
@@ -233,20 +239,7 @@ router.get('/wb-warehouses', requireAuth, requireRole('seller', 'owner', 'manage
       // потом самый частый. Заказы, пришедшие до сопоставления с WB и
       // закрытые на WB, так и записаны артикулом WB; раньше они перевешивали,
       // и у товара «На WB» было пусто (проверка 02.10, находка 7).
-      const levels = (await c.query(
-        `WITH sizes AS (
-           SELECT DISTINCT ON (ii.mp_chrt_id) ii.mp_chrt_id AS chrt_id, ii.sku
-             FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
-            WHERE ii.warehouse_id = $1 AND ii.company_id = $2 AND i.source = 'wb' AND ii.mp_chrt_id IS NOT NULL
-            GROUP BY ii.mp_chrt_id, ii.sku
-            ORDER BY ii.mp_chrt_id,
-                     EXISTS (SELECT 1 FROM products p
-                              WHERE p.warehouse_id = $1 AND p.company_id = $2 AND p.sku = ii.sku) DESC,
-                     count(*) DESC)
-         SELECT s.sku, l.mp_warehouse_id, sum(l.amount)::int AS amount, max(l.fetched_at) AS fetched_at
-           FROM wb_stock_levels l JOIN sizes s ON s.chrt_id = l.chrt_id
-          WHERE l.warehouse_id = $1 AND l.company_id = $2
-          GROUP BY s.sku, l.mp_warehouse_id`, [company.warehouse_id, company.id])).rows;
+      const levels = await wbListing.levels(c, company.warehouse_id, company.id);
       const stock = {};
       for (const l of levels) (stock[l.sku] ||= {})[l.mp_warehouse_id] = l.amount;
       return { ...info, stock };
@@ -615,7 +608,10 @@ router.get('/stock', requireAuth, requireRole('seller', 'owner', 'manager'), asy
     const source = await stockSourceOf(req, companyId);
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
-      return loadStock(client, companyId, { source });
+      const stock = await loadStock(client, companyId, { source });
+      // Складу — «На WB» и расхождение с «Доступно» (владелец 06.10.2026).
+      if (req.auth.role !== 'seller') await wbListing.annotate(client, req.auth.warehouseId, companyId, stock);
+      return stock;
     });
     // Keep real warehouse-only products visible, but do not create inventory
     // rows from unresolved order lines that have neither a product nor stock.
