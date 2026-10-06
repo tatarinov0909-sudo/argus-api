@@ -172,7 +172,8 @@ const kladovshchik = require('../src/agents/kladovshchik');
     // ---- Возврат: склад выбирает склад; продавец запретил — нельзя ----
     const ret = await api('POST', '/api/returns/manual', worker, { companyId: company, items: [{ sku: 'R-1', qty: 2 }], vw: ozon.id }, 201);
     assert.equal((await db('SELECT virtual_warehouse_id FROM invoice_items WHERE invoice_id = $1', [ret.id])).rows[0].virtual_warehouse_id, ozon.id);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided' && n.text.includes(ret.number)));
+    // Продавцу о возврате не пишем (владелец 06.10.2026).
+    assert.ok(!(await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.text.includes(ret.number)));
     await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } });
     const denied = await call('POST', '/api/returns/manual', worker, { companyId: company, items: [{ sku: 'R-1', qty: 1 }], vw: ozon.id });
     assert.equal(denied.status, 409); assert.match(denied.body.error, /ляжет на «Остальной товар»/);

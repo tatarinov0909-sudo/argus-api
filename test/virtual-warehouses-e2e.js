@@ -62,9 +62,10 @@ const { pool, withTenantContext } = require('../src/db/pool');
     assert.deepEqual(seen.warehouses.map((w) => [w.name, w.marketplaceName]), [['Озон', 'Озон'], ['ООО БББ', 'WB'], ['Опт', 'иное']]);
     assert.deepEqual(seen.wbChoices.map((w) => w.name), ['Остальной товар', 'ООО БББ']);
     assert.deepEqual(seen.rights, { decide: true });
+    // Уведомления продавцу — только при удалении склада и переносе (владелец 06.10.2026).
     const notes = await api('GET', '/api/vwarehouses/notifications', seller);
-    assert.equal(notes.filter((n) => n.kind === 'vw_created').length, 3);
-    check('склады заводят руководитель и менеджер; продавец видит свои склады, права и уведомления');
+    assert.equal(notes.filter((n) => n.kind === 'vw_created').length, 0);
+    check('склады заводят руководитель и менеджер; продавец видит свои склады и права, о заведении склада не уведомляют');
 
     // ---- Привоз продавца по строкам на свои склады ----
     const grid = [['Артикул', 'Количество', 'Склад'], ['R-1', 100, 'Озон'], ['R-1', 50, ''], ['R-1', 30, 'ооо ббб'], ['R-1', 5, 'Луна']];
@@ -137,9 +138,8 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await db("UPDATE invoices SET source = 'wb', external_id = 'WB-VW2' WHERE id = $1", [order2.id]);
     await db("UPDATE invoice_items SET mp_rid = 'rid-' || id WHERE invoice_id = $1", [order2.id]);
     const restSupply = await api('POST', '/api/supplies', owner, { invoiceIds: [order2.id], marketplace: 'wb', virtualWarehouseId: null }, 201);
-    // С «Остального товара», хотя у продавца есть склад WB, — продавцу «обратите внимание».
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
-      && n.text.includes(restSupply.number) && /«Остальной товар»/.test(n.text)));
+    // С «Остального товара» — продавцу больше не пишем (владелец 06.10.2026).
+    assert.ok(!(await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.text.includes(restSupply.number)));
     await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: 6, fromVw: null, toVw: ozon.id }, 409);
     check('перенос складом — сразу, продавцу уведомление; нельзя больше, чем свободно на складе');
 
@@ -214,9 +214,10 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const largest = now.filter((r) => r.name !== 'Остальной товар').sort((a, b) => b.n - a.n)[0];
     assert.equal(after['Остальной товар'], undefined);
     assert.equal(after[largest.name], largest.n - 3);
-    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
-      && n.text.includes(`«Остальной товар» — ${main} шт.`) && n.text.includes(`«${largest.name}» — 3 шт.`) && /Обратите внимание/.test(n.text)));
-    check('пересчёт: недостача сначала с «Остального товара», потом с самого большого склада; продавцу «обратите внимание»');
+    // Продавцу о пересчёте не пишем (владелец 06.10.2026) — след в журнале склада.
+    assert.ok(!(await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'ff_decided'
+      && n.text.includes(`«${largest.name}» — 3 шт.`)));
+    check('пересчёт: недостача сначала с «Остального товара», потом с самого большого склада; продавцу не пишем');
 
     // ---- Галочка «запретить складу решать без меня» (владелец 02.10.2026) ----
     assert.deepEqual((await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: false } })).rights, { decide: false });
@@ -287,13 +288,24 @@ const { pool, withTenantContext } = require('../src/db/pool');
     await api('PATCH', '/api/vwarehouses/rights', seller, { rights: { decide: true } });
     check('галочка «запретить решать без меня»: расхождение приёмки, недостача пересчёта и брак ждут продавца; его решение переносит разницу; склад строки привоза не меняет');
 
-    // ---- Убрать склад можно только пустой ----
-    await api('DELETE', `/api/vwarehouses/${ozon.id}?companyId=${company}`, owner, undefined, 409);
+    // ---- Убрать склад с товаром (владелец 06.10.2026): товар остаётся на полках ----
     const t3 = await api('POST', '/api/vwarehouses/transfers', owner, { companyId: company, sku: 'R-1', qty: (await vwQty())['Опт'], fromVw: opt.id, toVw: null }, 201);
     assert.equal(t3.status, 'done');
     await api('DELETE', `/api/vwarehouses/${opt.id}?companyId=${company}`, owner);
     assert.ok(!(await api('GET', '/api/vwarehouses', seller)).warehouses.some((w) => w.id === opt.id));
-    check('убрать склад можно только пустой');
+    const vwBefore = await vwQty();
+    const cellsBefore = (await db(`SELECT cell_block_id, SUM(qty)::int AS n FROM cell_stock WHERE company_id = $1 AND sku = 'R-1'
+      GROUP BY 1 ORDER BY 1`, [company])).rows;
+    const gone = await api('DELETE', `/api/vwarehouses/${ozon.id}?companyId=${company}`, owner);
+    const afterVw = await vwQty();
+    const cellsAfter = (await db(`SELECT cell_block_id, SUM(qty)::int AS n FROM cell_stock WHERE company_id = $1 AND sku = 'R-1'
+      GROUP BY 1 ORDER BY 1`, [company])).rows;
+    assert.ok(gone.units >= vwBefore['Озон'], JSON.stringify(gone));   // с браком склада
+    assert.equal(afterVw['Озон'], undefined);
+    assert.equal(afterVw['Остальной товар'], (vwBefore['Остальной товар'] || 0) + vwBefore['Озон']);
+    assert.deepEqual(cellsAfter, cellsBefore);
+    assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_archived' && /Озон/.test(n.text) && /остался на тех же полках/.test(n.text)));
+    check('убрать склад с товаром: товар на тех же полках, числится в «Остальном товаре»; продавцу одно уведомление');
 
     // ---- Продавец уведомления прочитал ----
     await api('POST', '/api/vwarehouses/notifications/seen', seller);

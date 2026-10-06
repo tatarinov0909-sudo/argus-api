@@ -15,6 +15,7 @@ const { kitSkusAmong, kitInfo } = require('../kits/kits');
 // наши координаты «3.12.2» там, где на стеллаже висит табличка «01-10-015»:
 // лист грузчика и лист комплектации называли одно место по-разному.
 const { formatBlockLabel } = require('../cells/label');
+const addressing = require('../cells/addressing');
 
 const cellLabel = (r) => formatBlockLabel(r.row_num, r);
 
@@ -72,7 +73,10 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   // Что осталось добрать по каждой строке: заявлено минус уже отобранное.
   // Закрытые строки (is_final) в лист не попадают — по ним ходить незачем.
   const items = await client.query(
-    `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty, ii.virtual_warehouse_id AS vw,
+    `SELECT ii.id, ii.invoice_id, ii.sku, ii.name, ii.company_id, ii.declared_qty,
+            -- Поставка «из всего товара продавца» (06.10.2026): склад строки — любой ('*').
+            CASE WHEN COALESCE((SELECT s.vw_any FROM invoices i JOIN supplies s ON s.id = i.supply_id WHERE i.id = ii.invoice_id), false)
+                 THEN '*' ELSE ii.virtual_warehouse_id::text END AS vw,
             ii.mp_article, COALESCE(NULLIF(BTRIM(ii.mp_barcode), ''), p.barcode) AS barcode,
             m.photo_url,
             COALESCE((SELECT SUM(sr.picked_qty) FROM shipping_records sr
@@ -155,10 +159,11 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   );
 
   const stockByKey = new Map();
+  const push = (key, r) => { if (!stockByKey.has(key)) stockByKey.set(key, []); stockByKey.get(key).push(r); };
   for (const r of stock.rows) {
-    const key = `${r.company_id}|${r.sku}|${r.vw || ''}`;
-    if (!stockByKey.has(key)) stockByKey.set(key, []);
-    stockByKey.get(key).push(r);
+    push(`${r.company_id}|${r.sku}|${r.vw || ''}`, r);
+    // «Весь товар продавца»: эта ячейка годится и строкам с любым складом.
+    push(`${r.company_id}|${r.sku}|*`, r);
   }
 
   // Откуда уже взято — для листа всей поставки: отметка стоит у той ячейки,
@@ -179,24 +184,30 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       [ids],
     );
     for (const r of taken.rows) {
-      const key = `${r.company_id}|${r.sku}|${r.vw || ''}`;
-      if (!takenByKey.has(key)) takenByKey.set(key, []);
-      takenByKey.get(key).push({
+      const mark = {
         cellBlockId: r.cell_block_id,
         label: r.row_num == null ? '—' : cellLabel(r),
         route: r.row_num == null ? [Infinity, 0, 0] : [Number(r.row_num), Number(r.rack_start), Number(r.tier_start)],
         qty: Number(r.qty),
-      });
+      };
+      // И для строки «весь товар продавца» (склад '*', 06.10.2026).
+      for (const key of [`${r.company_id}|${r.sku}|${r.vw || ''}`, `${r.company_id}|${r.sku}|*`]) {
+        if (!takenByKey.has(key)) takenByKey.set(key, []);
+        takenByKey.get(key).push(mark);
+      }
     }
   }
 
   // Название склада продавца у строки — грузчик видит, почему один товар
   // стоит в листе двумя строками (виртуальные склады, 02.10.2026).
-  const vwIds = [...new Set([...lines.values()].map((l) => l.vw).filter(Boolean))];
+  const vwIds = [...new Set([...lines.values()].map((l) => l.vw).filter((v) => v && v !== '*'))];
   const vwNames = new Map(vwIds.length ? (await client.query(
     'SELECT id, name FROM virtual_warehouses WHERE id = ANY($1::uuid[])', [vwIds])).rows.map((r) => [r.id, r.name]) : []);
   const result = [];
   const visited = new Set();
+  // Адресное хранение выключено (06.10.2026): всё берут из «Склада», сколько
+  // нужно — сверх учёта он уйдёт в минус, нехватки в листе нет.
+  const general = await addressing.isOff(client, warehouseId) ? await addressing.ensureGeneral(client, warehouseId) : null;
   for (const [key, line] of lines) {
     // Раскладываем нужное количество по ячейкам в порядке обхода: сколько
     // есть в первой, потом остаток во второй. Работнику остаётся идти и брать,
@@ -204,7 +215,13 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
     // не взято.
     let left = whole ? line.leftQty : line.needQty;
     const cells = [];
-    for (const r of stockByKey.get(key) || []) {
+    if (general && left > 0) {
+      const actual = (stockByKey.get(key) || []).reduce((n, r) => n + Number(r.available), 0);
+      cells.push({ cellBlockId: general, label: addressing.GENERAL_LABEL, route: [0, 1, 1], available: actual, take: left });
+      visited.add(general);
+      left = 0;
+    }
+    for (const r of general ? [] : stockByKey.get(key) || []) {
       if (left <= 0) break;
       const take = Math.min(left, Number(r.available));
       cells.push({
@@ -221,8 +238,8 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
       sku: line.sku,
       name: line.name,
       companyId: line.companyId,
-      vw: line.vw,
-      vwName: line.vw ? vwNames.get(line.vw) || null : null,
+      vw: line.vw === '*' ? null : line.vw,
+      vwName: line.vw === '*' ? 'Весь товар продавца' : line.vw ? vwNames.get(line.vw) || null : null,
       article: line.article,
       barcode: line.barcode,
       photo: line.photo || null,
@@ -252,7 +269,7 @@ async function buildPickList(client, warehouseId, invoiceIds = [], supplyId = nu
   const takenComponents = new Map();
   for (const line of result) {
     if (line.shortfall <= 0 || !kitSkus.has(line.sku)) continue;
-    const info = await kitInfo(client, warehouseId, line.companyId, line.sku, line.vw);
+    const info = await kitInfo(client, warehouseId, line.companyId, line.sku, line.vw === '*' ? null : line.vw);
     if (!info) continue;
     const key = (sku) => `${line.companyId}|${sku}|${line.vw || ''}`;
     // Сколько наборов реально соберём с учётом уже занятых компонентов.

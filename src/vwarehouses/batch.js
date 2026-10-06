@@ -47,7 +47,9 @@ async function context(client, warehouseId, companyId, toVw, sources, lock = fal
     WHERE warehouse_id=$1 AND company_id=$2 AND id=ANY($3::uuid[]) AND archived_at IS NULL
     ORDER BY id${lock ? ' FOR SHARE' : ''}`, [warehouseId, companyId, ids])).rows;
   if (warehouses.length !== ids.length) throw new HttpError(404, 'Виртуальный склад не найден у выбранного клиента');
-  return { company, warehouses: new Map(warehouses.map(w => [w.id, w])) };
+  // Адресное хранение выключено (06.10.2026): переносы без перекладки.
+  const addressOff = await require('../cells/addressing').isOff(client, warehouseId);
+  return { company, warehouses: new Map(warehouses.map(w => [w.id, w])), addressOff };
 }
 
 // Все выбранные SKU/источники одним SQL, то же правило, что service.transferable.
@@ -96,6 +98,7 @@ async function availability(client, warehouseId, companyId, items, toVw = undefi
 const key = (sku, source) => JSON.stringify([sku, source || null]);
 function predicted(ctx, source, target) {
   if (!vw.rightsOf(ctx.company).decide) return 'waiting_seller';
+  if (ctx.addressOff) return 'done';
   return ctx.warehouses.get(source)?.keep_separate || ctx.warehouses.get(target)?.keep_separate ? 'to_move' : 'done';
 }
 async function candidates(client, warehouseId, query) {

@@ -582,13 +582,9 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
     const title = `Пересчёт ячейки ${where}: «${name}»${bad} — ${what}`;
     // Продавцу — без адреса ячейки (владелец 03.10.2026).
     const sellerTitle = `Пересчёт на складе: «${name}»${bad} — ${what}`;
-    if (candidates.length < 2) {
-      await vwarehouses.notifySeller(client, {
-        warehouseId, companyId: c.line.companyId, kind: c.cut.length ? 'inventory_shortage' : 'inventory_surplus',
-        text: `${sellerTitle} ${c.cut.length ? 'Списано с' : 'Записаны на'} склад «${vwarehouses.nameOf(vws, candidates[0] || null)}».`,
-      });
-      continue;
-    }
+    // Продавцу о пересчёте не пишем (владелец 06.10.2026): уведомления —
+    // только при удалении склада и переносе товара.
+    if (candidates.length < 2) continue;
     await vwarehouses.splitSituation(client, {
       warehouseId, companyId: c.line.companyId, kind: 'inventory', sku: c.line.sku, name, quality, title, sellerTitle,
       parts: candidates.map((vw) => ({

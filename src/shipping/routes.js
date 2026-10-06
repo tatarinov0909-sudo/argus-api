@@ -10,6 +10,7 @@ const { refreshSupplyStatus, lockSupplyOfInvoice } = require('../supplies/state'
 const { buildPickList, parseInvoiceIds } = require('./pickList');
 const { kitSkusAmong } = require('../kits/kits');
 const assembly = require('./assembly');
+const addressing = require('../cells/addressing');
 
 const router = express.Router();
 
@@ -31,7 +32,8 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
       // (hand-entered invoice, or 1C nomenclature not synced through).
       const itemResult = await client.query(
         `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.virtual_warehouse_id,
-                p.category, p.length_mm, p.width_mm, p.height_mm, p.weight_g
+                p.category, p.length_mm, p.width_mm, p.height_mm, p.weight_g,
+                COALESCE((SELECT s.vw_any FROM invoices i JOIN supplies s ON s.id = i.supply_id WHERE i.id = ii.invoice_id), false) AS vw_any
          FROM invoice_items ii
          LEFT JOIN products p
            ON p.warehouse_id = ii.warehouse_id
@@ -51,13 +53,14 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
          JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
          WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3 AND cs.qty > 0
            AND cs.quality = 'good'
-           -- Только товар склада этой строки (виртуальный склад, 02.10.2026).
-           AND cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid
+           -- Только товар склада этой строки (виртуальный склад, 02.10.2026);
+           -- поставка «из всего товара продавца» — с любого его склада.
+           AND ($5::boolean OR cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid)
          GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.rack_end,
                   cb.tier_start, cb.tier_end
          HAVING SUM(cs.qty) > 0
          ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-        [warehouseId, item.company_id, item.sku, item.virtual_warehouse_id],
+        [warehouseId, item.company_id, item.sku, item.virtual_warehouse_id, item.vw_any],
       );
 
       const alreadyPicked = await client.query(
@@ -69,6 +72,15 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
       const totalAvailable = cellsResult.rows
         .reduce((sum, r) => sum + Number(r.available), 0);
       const picked = Number(alreadyPicked.rows[0].picked);
+      // Адресное хранение выключено (06.10.2026): брать из «Склада» можно
+      // сколько нужно — сверх учёта он уйдёт в минус, владелец поправит.
+      const generalPlace = await addressing.isOff(client, warehouseId)
+        ? await addressing.ensureGeneral(client, warehouseId) : null;
+      if (generalPlace) {
+        const need = Number(item.declared_qty) - picked;
+        cellsResult.rows = [{ cell_block_id: generalPlace, available: Math.max(need, totalAvailable),
+          row_num: 0, rack_start: 1, rack_end: 1, tier_start: 1, tier_end: 1 }];
+      }
 
       return {
         item: {
@@ -103,7 +115,10 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
           rackEnd: r.rack_end,
           tierStart: r.tier_start,
           tierEnd: r.tier_end,
+          ...(generalPlace ? { label: addressing.GENERAL_LABEL, general: true } : {}),
         })),
+        // Сколько числится в учёте — чтобы грузчик знал, что берёт сверх.
+        ...(generalPlace ? { addressOff: true } : {}),
       };
     });
     res.json(suggestion);
@@ -247,6 +262,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   const itemResult = await client.query(
     `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.company_id, ii.invoice_id,
             ii.external_id, ii.virtual_warehouse_id,
+            COALESCE((SELECT s.vw_any FROM supplies s WHERE s.id = i.supply_id), false) AS vw_any,
             i.direction, i.status, i.mp_closed_at, i.number AS invoice_number,
             i.external_id AS invoice_external_id, i.source, i.supply_id,
             c.external_id AS company_external_id
@@ -293,6 +309,11 @@ async function recordPick(client, warehouseId, staffKeyId, {
     throw new HttpError(409, `По заказу осталось собрать ${remainingQty} шт., нельзя записать ${qty}`);
   }
 
+  // Адресное хранение выключено (06.10.2026): берём из «Склада», что бы ни
+  // прислал экран; сверх учёта — в минус.
+  const addressOff = await addressing.isOff(client, warehouseId);
+  if (addressOff) cellBlockId = await addressing.ensureGeneral(client, warehouseId);
+
   // Lock the stock rows for this cell/sku so two workers picking the same
   // cell at once can't both pass the availability check and drive qty
   // negative — the second one waits here and then sees the real remainder.
@@ -303,11 +324,12 @@ async function recordPick(client, warehouseId, staffKeyId, {
      WHERE cell_block_id = $1 AND warehouse_id = $2 AND company_id = $3 AND sku = $4
        AND qty > 0 AND quality = 'good'
        -- Только товар склада строки: поставка со склада «WB» не берёт
-       -- товар склада «Озон», даже из той же ячейки (02.10.2026).
-       AND virtual_warehouse_id IS NOT DISTINCT FROM $5::uuid
+       -- товар склада «Озон», даже из той же ячейки (02.10.2026). Поставка
+       -- «из всего товара продавца» — с любого его склада (06.10.2026).
+       AND ($6::boolean OR virtual_warehouse_id IS NOT DISTINCT FROM $5::uuid)
      ORDER BY updated_at
      FOR UPDATE`,
-    [cellBlockId, warehouseId, item.company_id, item.sku, item.virtual_warehouse_id],
+    [cellBlockId, warehouseId, item.company_id, item.sku, item.virtual_warehouse_id, item.vw_any],
   );
   const availableInCell = stockResult.rows
     .reduce((sum, r) => sum + Number(r.qty), 0);
@@ -315,7 +337,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   const vwName = async () => (item.virtual_warehouse_id
     ? ((await client.query('SELECT name FROM virtual_warehouses WHERE id = $1', [item.virtual_warehouse_id])).rows[0] || {}).name || 'склад'
     : 'Остальной товар');
-  if (availableInCell <= 0) {
+  if (availableInCell <= 0 && !addressOff) {
     const other = Number((await client.query(
       `SELECT COALESCE(SUM(qty), 0) AS n FROM cell_stock WHERE cell_block_id = $1 AND company_id = $2 AND sku = $3
           AND quality = 'good' AND qty > 0`, [cellBlockId, item.company_id, item.sku])).rows[0].n);
@@ -323,7 +345,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
       ? `Этот товар в ячейке числится за другим складом продавца — для склада «${await vwName()}» его брать нельзя`
       : 'В этой ячейке нет такого товара');
   }
-  if (qty > availableInCell) {
+  if (qty > availableInCell && !addressOff) {
     // Склад называем, только если у продавца склады заведены: у остальных
     // фулфилментов всё как раньше.
     const hasVw = (await client.query(
@@ -351,6 +373,14 @@ async function recordPick(client, warehouseId, staffKeyId, {
       );
     }
     toTake -= take;
+  }
+  // Сверх учёта (адресное хранение выключено): минус в «Складе».
+  const overPicked = toTake > 0 ? toTake : 0;
+  if (overPicked) {
+    await client.query(
+      `INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty, quality, virtual_warehouse_id)
+       VALUES ($1, $2, $3, $4, $5, 'good', $6)`,
+      [cellBlockId, warehouseId, item.company_id, item.sku, -overPicked, item.virtual_warehouse_id]);
   }
 
   // A block with nothing left in it goes back to being free space, so the
@@ -385,10 +415,11 @@ async function recordPick(client, warehouseId, staffKeyId, {
   const actionText = hasDiscrepancy
     ? `Расхождение при отгрузке «${item.name}» (${item.sku}): нужно ${declared}, собрано ${totalPicked}.`
     : `Собрал «${item.name}» (${item.sku}) — ${qty} шт.${isFinal ? ` Позиция закрыта, итого ${totalPicked}.` : ''}`;
+  const overText = overPicked ? ` Собрано сверх учёта: ${overPicked} шт. — на «Складе» по учёту стал минус, владелец поправит.` : '';
   await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
-    actionText,
+    actionText: actionText + overText,
     entityType: 'invoice_item',
     entityId: invoiceItemId,
     invoiceId: item.invoice_id,
@@ -431,7 +462,7 @@ async function recordPick(client, warehouseId, staffKeyId, {
   // Последний собранный заказ делает поставку «собранной» — сам.
   if (item.supply_id) await refreshSupplyStatus(client, warehouseId, item.supply_id);
 
-  return { ...recordResult.rows[0], totalPicked, declaredQty: declared };
+  return { ...recordResult.rows[0], totalPicked, declaredQty: declared, ...(overPicked ? { overPicked } : {}) };
 }
 
 // Worker records one pick: how much was taken out of which cell. Called once
@@ -737,15 +768,18 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
         // ponytail: если между печатью и отметкой товар переложили, запись
         // уйдёт по нынешним ячейкам, а не по напечатанным; QR с номерами ячеек
         // на строках снимет это, когда появится сканирование ячеек.
-        const cells = (await client.query(
+        const off = await addressing.isOff(client, warehouseId);
+        const cells = off ? [{ cell_block_id: await addressing.ensureGeneral(client, warehouseId), qty: want }] : (await client.query(
           `SELECT cs.cell_block_id, SUM(cs.qty) AS qty
              FROM cell_stock cs
              JOIN cell_blocks cb ON cb.id = cs.cell_block_id
              JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
             WHERE cs.warehouse_id = $1 AND cs.company_id = $2 AND cs.sku = $3
               AND cs.qty > 0 AND cs.quality = 'good'
-              -- Только склад поставки (виртуальный склад, 02.10.2026).
-              AND cs.virtual_warehouse_id IS NOT DISTINCT FROM (SELECT virtual_warehouse_id FROM supplies WHERE id = $4)
+              -- Только склад поставки (виртуальный склад, 02.10.2026); «из всего
+              -- товара продавца» — любой его склад (06.10.2026).
+              AND ((SELECT vw_any FROM supplies WHERE id = $4)
+                   OR cs.virtual_warehouse_id IS NOT DISTINCT FROM (SELECT virtual_warehouse_id FROM supplies WHERE id = $4))
             GROUP BY cs.cell_block_id, wr.row_num, cb.rack_start, cb.tier_start
             ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
           [warehouseId, s.company_id, it.sku, s.id],

@@ -166,6 +166,11 @@ async function markFromShelf(client, {
 // Куда класть брак: сначала ячейки, где уже лежит брак этого продавца, потом
 // отмеченные руководителем ячейки брака, потом пустые.
 async function suggestCells(client, warehouseId, companyId, limit = 6, opts = {}) {
+  // Адресное хранение выключено (06.10.2026): брак тоже лежит в «Складе».
+  const addressing = require('../cells/addressing');
+  if (await addressing.isOff(client, warehouseId)) {
+    return [{ cellBlockId: await addressing.ensureGeneral(client, warehouseId), label: addressing.GENERAL_LABEL, reason: 'общее место — без ячеек' }];
+  }
   const rows = (await client.query(
     `WITH own AS (
        SELECT cs.cell_block_id AS id, 1 AS rank, 'здесь уже брак этого продавца' AS reason

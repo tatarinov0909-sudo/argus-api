@@ -12,7 +12,10 @@
 //
 // Имя ячейки из 1С («01-01-001») не показываем: оно не совпадает с картой, и
 // человек его не понимает. Оно остаётся в базе только для сверки с файлами 1С.
+// Ряд 0 — общее место «Склад» при выключенном адресном хранении
+// (src/cells/addressing.js, владелец 06.10.2026).
 function formatBlockLabel(rowNum, block) {
+  if (Number(rowNum) === 0) return 'Склад';
   const rackPart = block.rack_start === block.rack_end
     ? block.rack_start : `${block.rack_start}–${block.rack_end}`;
   const tierPart = block.tier_start === block.tier_end
@@ -24,11 +27,11 @@ function formatBlockLabel(rowNum, block) {
 // история ячейки): собирать его в JS ради подписи значило бы тянуть карту.
 // cb — cell_blocks, wr — warehouse_rows.
 function blockLabelSql(cb = 'cb', wr = 'wr') {
-  return `(${wr}.row_num
+  return `(CASE WHEN ${wr}.row_num = 0 THEN 'Склад' ELSE ${wr}.row_num
       || '.' || CASE WHEN ${cb}.rack_start = ${cb}.rack_end THEN ${cb}.rack_start::text
                      ELSE ${cb}.rack_start || '–' || ${cb}.rack_end END
       || '.' || CASE WHEN ${cb}.tier_start = ${cb}.tier_end THEN ${cb}.tier_start::text
-                     ELSE ${cb}.tier_start || '–' || ${cb}.tier_end END)`;
+                     ELSE ${cb}.tier_start || '–' || ${cb}.tier_end END END)`;
 }
 
 module.exports = { formatBlockLabel, blockLabelSql };

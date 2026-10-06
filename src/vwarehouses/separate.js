@@ -94,6 +94,8 @@ async function emptyZoneCell(client, zoneIds) {
 // пустой ячейки, и руководителю уведомление, куда положили.
 async function checkPut(client, warehouseId, { cellBlockId, companyId, vw = null, quality = 'good' }) {
   if (!cellBlockId) return;
+  // Адресное хранение выключено (06.10.2026): всё лежит в «Складе», отдельных мест нет.
+  if (await require('../cells/addressing').isOff(client, warehouseId)) return;
   // Ячейка — на запись до проверки: два одновременных «положить» товар разных
   // складов в пустую ячейку иначе проходили оба (проверка 03.10.2026).
   await client.query('SELECT id FROM cell_blocks WHERE id = $1 FOR UPDATE', [cellBlockId]);
@@ -243,6 +245,9 @@ async function createTransferTasks(client, warehouseId, t) {
 
 // Нужен ли перенос руками: один из складов хранится отдельно.
 async function needsMove(client, companyId, fromVw, toVw, quality = 'good') {
+  // Адресное хранение выключено (06.10.2026): перекладывать некуда — перенос сразу.
+  const wh = (await client.query('SELECT warehouse_id FROM companies WHERE id = $1', [companyId])).rows[0];
+  if (wh && await require('../cells/addressing').isOff(client, wh.warehouse_id)) return false;
   const lay = await layout(client, companyId);
   return lay.separate(fromVw, quality) || lay.separate(toVw, quality);
 }

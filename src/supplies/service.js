@@ -229,7 +229,11 @@ async function create(client, warehouseId, {
   // подходящий один — ставим сам, несколько — выбирает менеджер.
   const toWb = marketplace === 'wb' || orders.rows.some((o) => o.source === 'wb');
   let vw = null;
-  if (virtualWarehouseId === undefined) {
+  // «Весь товар продавца» (владелец 06.10.2026): собирать с любого его склада.
+  const anyVw = virtualWarehouseId === 'all';
+  if (anyVw) {
+    // склад не закрепляем — ниже vw остаётся null
+  } else if (virtualWarehouseId === undefined) {
     const choices = toWb ? await vwarehouses.wbChoices(client, companies[0])
       : [{ id: null, name: vwarehouses.MAIN_NAME }].concat(await vwarehouses.list(client, companies[0]));
     if (choices.length > 1) {
@@ -238,9 +242,6 @@ async function create(client, warehouseId, {
   } else {
     vw = await vwarehouses.requireVw(client, companies[0], virtualWarehouseId, { forWb: toWb });
   }
-  // С «Остального товара», а у продавца есть свой склад WB (владелец
-  // 03.10.2026): для продавца это товар с другого склада — уведомление.
-  const fromRest = toWb && !vw && (await vwarehouses.wbChoices(client, companies[0])).length > 1;
 
   await client.query('SAVEPOINT supply_number');
   const supply = await insertWithNumber(client, warehouseId, {
@@ -252,7 +253,7 @@ async function create(client, warehouseId, {
     `UPDATE invoices SET supply_id = $1 WHERE warehouse_id = $2 AND id = ANY($3::uuid[])`,
     [supply.id, warehouseId, invoiceIds],
   );
-  await client.query('UPDATE supplies SET virtual_warehouse_id = $2 WHERE id = $1', [supply.id, vw ? vw.id : null]);
+  await client.query('UPDATE supplies SET virtual_warehouse_id = $2, vw_any = $3 WHERE id = $1', [supply.id, vw ? vw.id : null, anyVw]);
   await vwarehouses.assignOrders(client, warehouseId, invoiceIds, vw ? vw.id : null);
   // Заказ мог быть собран ДО того, как его включили в поставку (накладную из
   // 1С собирают и без поставки). Тогда новых отборов не будет, пересчитать
@@ -273,20 +274,15 @@ async function create(client, warehouseId, {
     actorType: actor?.type || 'owner',
     actorId: actor?.id || null,
   });
-  if (fromRest) {
-    const units = (await client.query(
-      'SELECT COALESCE(SUM(declared_qty), 0)::int AS n FROM invoice_items WHERE invoice_id = ANY($1::uuid[])',
-      [orders.rows.map((o) => o.id)])).rows[0].n;
-    await vwarehouses.notifySeller(client, { warehouseId, companyId: companies[0], kind: 'ff_decided', entityId: supply.id,
-      text: `Поставку ${number} на WB (${units} шт.) склад собирает из «Остального товара», а не с вашего склада WB — `
-        + `остаток «${vwarehouses.MAIN_NAME}» уменьшится. Обратите внимание.` });
-  }
+  // Продавцу о том, с какого склада собирают, не пишем (владелец 06.10.2026):
+  // уведомления — только при удалении его склада и переносе товара.
 
   return {
     ...supply,
     companyId: companies[0],
     virtualWarehouseId: vw ? vw.id : null,
-    virtualWarehouseName: vw ? vw.name : vwarehouses.MAIN_NAME,
+    virtualWarehouseName: anyVw ? 'Весь товар продавца' : vw ? vw.name : vwarehouses.MAIN_NAME,
+    vwAny: anyVw,
     orders: orders.rows.length,
     companyName: orders.rows[0].company_name,
     // Что именно подтверждать на площадке: её номер заказа и наш документ.
@@ -695,7 +691,7 @@ async function list(client, warehouseId, { status = null, showShortages = false,
             s.marketplace, s.mp_supply_id,
             s.mp_handed_at, s.mp_delivered_at, s.mp_barcode, ${WB_WRITE_SQL} AS mp_write,
             s.created_at, s.ready_at, s.shipped_at, c.name AS company_name,
-            s.virtual_warehouse_id, COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
+            s.virtual_warehouse_id, s.vw_any, COALESCE(CASE WHEN s.vw_any THEN 'Весь товар продавца' END, vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
               WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name,
             -- Кто составил: первая запись журнала о поставке. «Когда пришла»
             -- на склад — created_at.

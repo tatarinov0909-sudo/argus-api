@@ -36,8 +36,12 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
     const { warehouseId } = req.auth;
     const rows = await withTenantContext({ warehouseId }, async (client) => {
       const rowsResult = await client.query(
+        // general — ряд 0, общее место «Склад» без адресного хранения
+        // (06.10.2026): на карте его не рисуют, товар в нём видно.
         `SELECT id, row_num, rack_count, tier_count, label, aisle_after,
-                cell_width_cm, cell_depth_cm, cell_height_cm FROM warehouse_rows
+                cell_width_cm, cell_depth_cm, cell_height_cm,
+                EXISTS (SELECT 1 FROM cell_blocks g WHERE g.warehouse_row_id = warehouse_rows.id AND g.general) AS general
+           FROM warehouse_rows
          WHERE warehouse_id = $1 ORDER BY row_num ASC`,
         [warehouseId],
       );
@@ -51,7 +55,7 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
         // выражению с ним несовместима, и остаток в карточке стал выводиться
         // в произвольном порядке.
         `SELECT cb.id, cb.warehouse_row_id, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end,
-                cb.state, cb.fill_pct, cb.label, cb.defect_zone,
+                cb.state, cb.fill_pct, cb.label, cb.defect_zone, cb.general,
                 COALESCE((
                   SELECT json_agg(json_build_object(
                     'id', cs.id, 'companyId', cs.company_id, 'sku', cs.sku, 'qty', cs.qty,
@@ -174,8 +178,10 @@ router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, ne
       // не видит незафиксированную приёмку или загрузку и каскадом её стирает.
       await client.query('SELECT id FROM cell_blocks WHERE warehouse_id = $1 FOR UPDATE', [warehouseId]);
       const existing = await client.query(
+        // Товар в общем месте «Склад» схеме не мешает: его потом раскладывают.
         `SELECT
-           (SELECT count(*)::int FROM cell_stock WHERE warehouse_id=$1) AS stock_positions,
+           (SELECT count(*)::int FROM cell_stock cs WHERE cs.warehouse_id=$1
+               AND NOT EXISTS (SELECT 1 FROM cell_blocks g WHERE g.id = cs.cell_block_id AND g.general)) AS stock_positions,
            (SELECT count(*)::int FROM product_cells_1c WHERE warehouse_id=$1) AS linked_positions`,
         [warehouseId],
       );
@@ -185,7 +191,8 @@ router.post('/rows', requireAuth, requireGrant('warehouse'), async (req, res, ne
           `Схема уже используется: физический товар — ${stockPositions} ${plural(stockPositions, 'позиция', 'позиции', 'позиций')}, адреса из 1С — ${linkedPositions}. Изменяйте ряды и ячейки без полной перестройки.`);
       }
       await client.query(
-        `DELETE FROM warehouse_rows WHERE warehouse_id = $1`, // cascades to cell_blocks/cell_stock
+        // cascades to cell_blocks/cell_stock; ряд 0 — общее место «Склад».
+        `DELETE FROM warehouse_rows WHERE warehouse_id = $1 AND row_num <> 0`,
         [warehouseId],
       );
 
@@ -350,10 +357,13 @@ router.delete('/rows', requireAuth, requireGrant('warehouse'), async (req, res, 
       // Зоны сортировки — такая же часть схемы, и в них тоже числится товар,
       // поэтому считаем и сносим их вместе с ячейками.
       const stock = await client.query(
+        // Общее место «Склад» удаление схемы не сносит: товар в «Складе» остаётся.
         `SELECT
-           (SELECT count(*)::int FROM cell_stock WHERE warehouse_id = $1)
+           (SELECT count(*)::int FROM cell_stock cs WHERE cs.warehouse_id = $1
+               AND NOT EXISTS (SELECT 1 FROM cell_blocks g WHERE g.id = cs.cell_block_id AND g.general))
            + (SELECT count(*)::int FROM dropzone_items WHERE warehouse_id = $1) AS positions,
-           (SELECT coalesce(sum(qty), 0)::int FROM cell_stock WHERE warehouse_id = $1)
+           (SELECT coalesce(sum(qty), 0)::int FROM cell_stock cs WHERE cs.warehouse_id = $1
+               AND NOT EXISTS (SELECT 1 FROM cell_blocks g WHERE g.id = cs.cell_block_id AND g.general))
            + (SELECT coalesce(sum(qty), 0)::int FROM dropzone_items WHERE warehouse_id = $1) AS units`,
         [warehouseId],
       );
@@ -364,7 +374,7 @@ router.delete('/rows', requireAuth, requireGrant('warehouse'), async (req, res, 
       }
 
       const deleted = await client.query(
-        `DELETE FROM warehouse_rows WHERE warehouse_id = $1`, [warehouseId],
+        `DELETE FROM warehouse_rows WHERE warehouse_id = $1 AND row_num <> 0`, [warehouseId],
       );
       await client.query(`DELETE FROM dropzones WHERE warehouse_id = $1`, [warehouseId]);
       return { deletedRows: deleted.rowCount, clearedPositions: positions, clearedUnits: units };

@@ -255,12 +255,6 @@ router.post('/manual', requireAuth, requireRole('worker', 'owner', 'manager'), a
          SELECT $1, $2, $3, x.name, x.sku, x.qty, $5 FROM jsonb_to_recordset($4::jsonb) AS x(name text, sku text, qty int)`,
         [inv.id, warehouseId, company.id, JSON.stringify(items), vw ? vw.id : null]);
       const units = items.reduce((sum, i) => sum + i.qty, 0);
-      if (vw) {
-        await vwarehouses.notifySeller(client, { warehouseId, companyId: company.id, kind: 'ff_decided', entityId: inv.id,
-          text: `Возврат ${number} (${units} шт.: ${items.slice(0, 3).map((i) => `«${i.name}»`).join(', ')}${items.length > 3 ? ' и другие' : ''}) `
-            + `склад отнёс к вашему складу «${vw.name}». Обратите внимание: склад решил это сам. `
-            + 'Запретить складу решать такое без вас можно в «Правах склада».' });
-      }
       const comment = typeof b.comment === 'string' && b.comment.trim() ? b.comment.trim().slice(0, 300) : null;
       await journal.createEntry(client, {
         warehouseId, agent: 'Кладовщик', status: 'auto',

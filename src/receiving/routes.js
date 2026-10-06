@@ -12,6 +12,7 @@ const kladovshchik = require('../agents/kladovshchik');
 const outbox = require('../sync/outbox');
 const work = require('./session');
 const vwarehouses = require('../vwarehouses/service');
+const addressing = require('../cells/addressing');
 
 const router = express.Router();
 
@@ -100,10 +101,20 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     const defectPlan = readDefect(defect);
     const plan = planPlacements({ accepted, cellBlockId, placements, defectQty: defectPlan ? defectPlan.qty : 0 });
 
-    const record = await withTenantContext({ warehouseId }, (client) => receiveItem(client, {
-      warehouseId, staffKeyId, invoiceItemId, accepted, placements: plan, pausedMs, pauseReasons, suggestionId,
-      requireWork: true, defect: defectPlan,
-    }));
+    const record = await withTenantContext({ warehouseId }, async (client) => {
+      // Адресное хранение выключено (06.10.2026): всё — в «Склад», одной строкой.
+      let places = plan;
+      if (await addressing.isOff(client, warehouseId)) {
+        const general = await addressing.ensureGeneral(client, warehouseId);
+        const qty = plan.reduce((n, x) => n + x.qty, 0);
+        places = qty ? [{ cellBlockId: general, qty }] : [];
+        if (defectPlan) defectPlan.cellBlockId = general;
+      }
+      return receiveItem(client, {
+        warehouseId, staffKeyId, invoiceItemId, accepted, placements: places, pausedMs, pauseReasons, suggestionId,
+        requireWork: true, defect: defectPlan,
+      });
+    });
     res.status(201).json(record);
   } catch (err) {
     next(err);
@@ -681,13 +692,15 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
       const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'place' });
       if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено');
       if (qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — больше положить нельзя`);
-      const label = await cellLabelOf(client, warehouseId, body.cellBlockId);
+      // Адресное хранение выключено (06.10.2026): кладут в «Склад».
+      const cellBlockId = await addressing.place(client, warehouseId, body.cellBlockId);
+      const label = await cellLabelOf(client, warehouseId, cellBlockId);
       const step = await putStep(client, {
-        warehouseId, staffKeyId, recordId: item.record_id, item, cellBlockId: body.cellBlockId, qty,
+        warehouseId, staffKeyId, recordId: item.record_id, item, cellBlockId, qty,
       });
       const left = unplaced - qty;
       return placingDone(client, {
-        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId: body.cellBlockId, legacy,
+        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId, legacy,
         journalText: `Положил ${qty} шт. ${what(item)} в ячейку ${label}. `
           + (left ? `Осталось разложить ${left} шт.` : `Разложено всё принятое — ${Number(item.accepted_qty)} шт.`),
       });
@@ -708,6 +721,7 @@ router.post('/items/:invoiceItemId/defect', requireAuth, requireRole('worker'), 
       const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'defect' });
       if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено — брак отметьте через «Перепаковка и перестановка»');
       if (plan.qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — брака больше быть не может`);
+      plan.cellBlockId = await addressing.place(client, warehouseId, plan.cellBlockId);
       await cellLabelOf(client, warehouseId, plan.cellBlockId);
       const step = await putStep(client, {
         warehouseId, staffKeyId, recordId: item.record_id, item, cellBlockId: plan.cellBlockId, qty: plan.qty, quality: plan.bucket,

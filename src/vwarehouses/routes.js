@@ -129,10 +129,10 @@ router.post('/move-tasks/:id/cancel', requireAuth, requireRole('owner', 'manager
 
 router.delete('/:id([0-9a-fA-F-]{36})', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
-    await inWarehouse(req, async (c) => vw.archive(c, {
+    const out = await inWarehouse(req, async (c) => vw.archive(c, {
       warehouseId: req.auth.warehouseId, companyId: companyOf(req), id: req.params.id, actor: await actorOf(c, req.auth),
     }));
-    res.json({ ok: true });
+    res.json({ ok: true, ...(out || {}) });
   } catch (err) { next(err); }
 });
 

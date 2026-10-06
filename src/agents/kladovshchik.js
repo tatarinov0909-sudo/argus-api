@@ -243,6 +243,11 @@ async function findProducts(client, warehouseId, query, { withId = false } = {})
 // нет — у товаров почти всегда пустые размеры (см. argus_1c_sync_status),
 // добавится само, когда данные появятся.
 async function suggestCells(client, warehouseId, sku, companyId = null, limit = 3, opts = {}) {
+  // Адресное хранение выключено (06.10.2026): место одно — «Склад».
+  const addressing = require('../cells/addressing');
+  if (await addressing.isOff(client, warehouseId)) {
+    return [{ blockId: await addressing.ensureGeneral(client, warehouseId), label: addressing.GENERAL_LABEL, reason: 'general' }];
+  }
   const options = [];
   // Склад продавца (02.10.2026): известен — подсказка не смешивает товар со
   // складом «хранить отдельно» и ведёт в зону склада, пока в ней есть пустая

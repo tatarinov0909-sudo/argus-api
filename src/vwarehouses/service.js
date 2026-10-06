@@ -127,8 +127,6 @@ async function create(client, { warehouseId, companyId, name, marketplace, keepS
     warehouseId, agent: 'Кладовщик', status: 'auto', actionText: text,
     entityType: 'virtual_warehouse', entityId: row.id, actorType: actorType(actor.role), actorId: actor.id || null,
   });
-  await notifySeller(client, { warehouseId, companyId, kind: 'vw_created', entityId: row.id,
-    text: `Склад завёл для вас склад «${clean}» (${MARKETPLACES[mp]}). Товар на него можно выбирать в привозе.` });
   return view(row);
 }
 
@@ -209,31 +207,16 @@ async function update(client, {
   return { ...view(row), tasks, ...(zoneOut ? { zone: zoneOut } : {}) };
 }
 
-// Убрать можно только пустой склад: ни товара (и брака) в ячейках, ни
-// поставки, ни привоза, ни переноса, который ещё не закончен.
+// Убрать склад (владелец 06.10.2026): товар физически никуда не переезжает —
+// остаётся на тех же полках и просто числится в «Остальном товаре». Открытые
+// документы и поставки этого склада — тоже; незаконченные переносы и задания
+// «переложить» по нему отменяются. Продавцу — одно уведомление.
 async function archive(client, { warehouseId, companyId, id, actor }) {
   const company = await companyRow(client, warehouseId, companyId);
   const cur = (await client.query(
     'SELECT * FROM virtual_warehouses WHERE id = $1 AND company_id = $2 AND archived_at IS NULL FOR UPDATE',
     [id, companyId])).rows[0];
   if (!cur) throw new HttpError(404, 'Склад не найден — возможно, его уже убрали');
-  const stock = Number((await client.query(
-    'SELECT COALESCE(SUM(qty), 0) AS n FROM cell_stock WHERE virtual_warehouse_id = $1 AND qty > 0', [id])).rows[0].n);
-  if (stock > 0) throw new HttpError(409, `На складе «${cur.name}» лежит ${stock} шт. — сначала перенесите товар на другой склад`);
-  const supply = (await client.query(
-    `SELECT number FROM supplies WHERE virtual_warehouse_id = $1 AND status <> 'shipped' LIMIT 1`, [id])).rows[0];
-  if (supply) throw new HttpError(409, `С этого склада собирается поставка ${supply.number}`);
-  const doc = (await client.query(
-    `SELECT i.number FROM invoice_items ii JOIN invoices i ON i.id = ii.invoice_id
-      WHERE ii.virtual_warehouse_id = $1 AND i.status IN ('open', 'in_progress') LIMIT 1`, [id])).rows[0];
-  if (doc) throw new HttpError(409, `На этот склад ещё не закрыт документ ${doc.number}`);
-  const open = (await client.query(
-    `SELECT number FROM vw_transfers WHERE (from_vw = $1 OR to_vw = $1) AND status IN ('requested', 'waiting_seller', 'to_move') LIMIT 1`,
-    [id])).rows[0];
-  if (open) throw new HttpError(409, `По этому складу не закончен перенос ${open.number}`);
-  const task = (await client.query(
-    `SELECT 1 FROM vw_move_tasks WHERE (from_vw = $1 OR to_vw = $1) AND status = 'open' LIMIT 1`, [id])).rows[0];
-  if (task) throw new HttpError(409, 'По этому складу не закончено задание грузчику «переложить»');
   // Ждёт решение продавца, где этот склад — одна из частей (проверка 03.10.2026:
   // иначе решение записывало товар на убранный склад).
   const waiting = (await client.query(
@@ -241,15 +224,44 @@ async function archive(client, { warehouseId, companyId, id, actor }) {
         AND EXISTS (SELECT 1 FROM jsonb_array_elements(d.parts) p WHERE p->>'vw' = $2::text) LIMIT 1`,
     [companyId, id])).rows[0];
   if (waiting) throw new HttpError(409, `По складу «${cur.name}» ждёт решение продавца — убрать склад можно после его решения`);
+  // Незаконченные переносы и задания «переложить» — отменить: склада больше нет.
+  const canceled = (await client.query(
+    `UPDATE vw_transfers SET status = 'rejected', reject_reason = 'склад убран', decided_role = COALESCE(decided_role, $2),
+            decided_name = COALESCE(decided_name, $3), decided_at = COALESCE(decided_at, now())
+      WHERE (from_vw = $1 OR to_vw = $1) AND status IN ('requested', 'waiting_seller', 'to_move') RETURNING number`,
+    [id, actor.role, actor.name || ACTOR_NAME[actor.role] || null])).rows.map((r) => r.number);
+  await client.query(
+    `UPDATE vw_move_tasks SET status = 'canceled', done_at = now(), cancel_note = 'склад убран'
+      WHERE (from_vw = $1 OR to_vw = $1) AND status = 'open'`, [id]);
+  // Товар — на тех же полках, теперь в «Остальном товаре».
+  const moved = (await client.query(
+    `UPDATE cell_stock SET virtual_warehouse_id = NULL, updated_at = now() WHERE virtual_warehouse_id = $1
+     RETURNING sku, qty`, [id])).rows;
+  const units = moved.reduce((n, r) => n + Math.max(0, Number(r.qty)), 0);
+  const bySku = new Map();
+  for (const r of moved) if (Number(r.qty) > 0) bySku.set(r.sku, (bySku.get(r.sku) || 0) + Number(r.qty));
+  for (const [sku, qty] of bySku) {
+    await client.query(
+      `INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, details)
+       VALUES ($1, $2, 'vw_archive', $3, $4, $5::jsonb)`,
+      [warehouseId, companyId, sku, qty, JSON.stringify({ fromVw: id, fromName: cur.name, toVw: null })]);
+  }
+  await client.query(
+    `UPDATE invoice_items ii SET virtual_warehouse_id = NULL FROM invoices i
+      WHERE i.id = ii.invoice_id AND ii.virtual_warehouse_id = $1 AND i.status NOT IN ('shipped', 'completed')`, [id]);
+  await client.query(`UPDATE supplies SET virtual_warehouse_id = NULL WHERE virtual_warehouse_id = $1 AND status <> 'shipped'`, [id]);
   await client.query('UPDATE cell_blocks SET reserved_vw_id = NULL WHERE reserved_vw_id = $1', [id]);
   await client.query('UPDATE virtual_warehouses SET archived_at = now() WHERE id = $1', [id]);
+  const tail = units ? ` Товар (${units.toLocaleString('ru-RU')} шт.) остался на тех же полках и теперь в «${MAIN_NAME}».` : ' Он был пустой.';
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик', status: 'auto',
-    actionText: `Убран склад «${cur.name}» продавца «${company.name}» (пустой).`,
+    actionText: `Убран склад «${cur.name}» продавца «${company.name}».${tail}`
+      + (canceled.length ? ` Отменены незаконченные переносы: ${canceled.join(', ')}.` : ''),
     entityType: 'virtual_warehouse', entityId: id, actorType: actorType(actor.role), actorId: actor.id || null,
   });
   await notifySeller(client, { warehouseId, companyId, kind: 'vw_archived', entityId: id,
-    text: `Склад убрал ваш склад «${cur.name}» — он был пустой.` });
+    text: `Склад убрал ваш склад «${cur.name}».${tail}` });
+  return { units, canceled };
 }
 
 // Сколько товара склада можно перенести: годное в ячейках этого склада минус
@@ -627,9 +639,6 @@ async function setItemsVw(client, { warehouseId, itemIds, vwId, actor }) {
     warehouseId, agent: 'Кладовщик', status: 'auto', actionText: text,
     entityType: 'virtual_warehouse', entityId: vw ? vw.id : null, actorType: actorType(actor.role), actorId: actor.id || null,
   });
-  const what = rows.slice(0, 5).map((r) => `«${r.name || r.sku}»`).join(', ') + (rows.length > 5 ? ' и другие' : '');
-  await notifySeller(client, { warehouseId, companyId: company.id, kind: 'vw_items',
-    text: `${actor.name || 'Склад'} отнёс к складу «${vw ? vw.name : MAIN_NAME}» ${what} в документе ${docs.join(', ')}.${DECIDED_SELF}` });
   return { updated: rows.length, vw: vw ? vw.id : null };
 }
 
@@ -675,7 +684,12 @@ async function splitSituation(client, { warehouseId, companyId, kind, sku, name,
   }));
   const how = howText(kind, clean, rows);
   if (rightsOf(company).decide) {
-    await notifySeller(client, { warehouseId, companyId, kind: 'ff_decided', text: `${st}${end}Склад решил так — ${dot(how)}${DECIDED_SELF}` });
+    // Продавцу не пишем (владелец 06.10.2026) — след остаётся в журнале склада.
+    await journal.createEntry(client, {
+      warehouseId, agent: 'Кладовщик', status: 'auto',
+      actionText: `${title} (продавец «${company.name}»). Записано по правилу склада — ${dot(how)}`,
+      entityType: 'company', entityId: companyId, actorType: 'system',
+    });
     return null;
   }
   const d = (await client.query(

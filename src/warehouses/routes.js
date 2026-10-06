@@ -5,13 +5,14 @@ const { withTenantContext } = require('../db/pool');
 const { HttpError } = require('../middleware/errorHandler');
 const sellerWarehouses = require('../marketplaces/sellerWarehouses');
 const sync = require('../marketplaces/sync');
+const addressing = require('../cells/addressing');
 
 const router = express.Router();
 
 // Склад и его настройки — анкета фулфилмента (владелец 30.09.2026): как склад
 // работает, решает он сам ответами здесь, а не доработкой кода под него.
 const FIELDS = `id, name, city, warehouse_code, legal_name, created_at,
-  stock_source, timezone, wb_supplies_by, wb_names, setup_at, vw_reminders, wb_supply_label`;
+  stock_source, timezone, wb_supplies_by, wb_names, setup_at, vw_reminders, wb_supply_label, address_storage`;
 
 router.get('/me', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
@@ -199,8 +200,15 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
     if (body.vwReminders !== undefined && typeof body.vwReminders !== 'boolean') {
       throw new HttpError(400, 'Напоминания о складах продавцов — да или нет');
     }
+    // Адресное хранение (06.10.2026): выключение переносит весь товар в «Склад».
+    if (body.addressStorage !== undefined && typeof body.addressStorage !== 'boolean') {
+      throw new HttpError(400, 'Адресное хранение — да или нет');
+    }
     const warehouse = await withTenantContext({ warehouseId }, async (client) => {
       const before = (await client.query('SELECT name, wb_names FROM warehouses WHERE id = $1', [warehouseId])).rows[0];
+      if (body.addressStorage !== undefined) {
+        await addressing.setAddressStorage(client, warehouseId, body.addressStorage, { type: 'owner', id: req.auth.ownerId || null });
+      }
       const result = await client.query(
         `UPDATE warehouses SET name = COALESCE($2, name), city = COALESCE($3, city),
                 legal_name = CASE WHEN $4::boolean THEN NULLIF($5, '') ELSE legal_name END,
