@@ -35,7 +35,7 @@ function sellerStockView(row) {
     // Уехало на WB, WB ещё не принял — в «доступно» уже не входит.
     inTransit: row.inTransit,
     transitDeducted: row.transitCounted,
-    // Принято сортировочным центром WB из поставок за 14 дней.
+    // Принято сортировочным центром WB за последние 3 дня.
     acceptedByWb: row.acceptedByWb,
     available: row.sellerAvailable,
     // Брак на складе — его товар, решение по нему за продавцом.

@@ -142,6 +142,10 @@ const check = (name, fn) => {
       assert.equal(after.total, 8);
       assert.equal(after.sellerAvailable, 7);
     });
+    // «Принято WB» — за 3 дня от приёмки: давнее уходит из числа.
+    await run((q) => q.query(`UPDATE invoices SET mp_closed_at=now()-interval '4 days' WHERE id=$1`, [a.id]));
+    const later = await stockRow();
+    check('«Принято WB» — только принятое за последние 3 дня', () => assert.equal(later.acceptedByWb, 1));
     // 1С списала принятое и прислала новое число — двойного вычета нет.
     await run((q) => q.query(`UPDATE products SET stock_qty_1c=8, stock_at=now() WHERE company_id=$1 AND sku='TR-1'`, [company.id]));
     const synced = await stockRow();

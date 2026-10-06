@@ -141,15 +141,15 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
              AND s.shipped_at > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), accepted_wb AS (
-           -- «Принято WB» (владелец 06.10.2026): сколько штук из поставок,
-           -- уехавших за 14 дней, сортировочный центр WB уже принял.
+           -- «Принято WB» (владелец 06.10.2026): сколько штук из поставок
+           -- сортировочный центр WB принял за последние 3 дня — по времени
+           -- приёмки; дольше висеть не нужно, поставки остаются в истории.
            SELECT ii.sku, SUM(ii.declared_qty) AS qty
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
-           JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND i.mp_close_reason = 'fulfilled'
-             AND s.shipped_at > now() - interval '14 days'
+             AND i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.mp_close_reason = 'fulfilled'
+             AND i.mp_closed_at > now() - interval '3 days'
            GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
