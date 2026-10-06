@@ -13,6 +13,7 @@
 
 const assert = require('node:assert');
 const { createApp } = require('../src/app');
+const { withTenantContext } = require('../src/db/pool');
 
 let passed = 0;
 const failures = [];
@@ -144,6 +145,12 @@ function check(name, fn) {
         companyId: alpha.id, number: `WB-${stamp}`, direction: 'out',
         items: [{ name: 'Печенье овсяное', sku: 'PB-A', declaredQty: 30 }],
       },
+    });
+    // Заказ с WB: «В пути» — только у заказов площадки, физлицу уехавшее
+    // WB не примет никогда (06.10.2026).
+    await withTenantContext({ warehouseId: JSON.parse(Buffer.from(ownerToken.split('.')[1], 'base64url')).warehouseId }, async (c) => {
+      await c.query(`UPDATE invoices SET source = 'wb', external_id = $2 WHERE id = $1`, [order.id, `wb-${stamp}`]);
+      await c.query(`UPDATE invoice_items SET mp_rid = $2 WHERE invoice_id = $1`, [order.id, `rid-${stamp}`]);
     });
     const queued = await sellerStock();
     check('новый заказ становится «заказано» и уменьшает доступное', () => {

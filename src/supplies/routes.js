@@ -53,6 +53,19 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
   } catch (err) { next(err); }
 });
 
+// Поставка физлицу из товаров продавца (владелец 06.10.2026): без заказов
+// площадки, на WB не передаётся.
+router.post('/direct', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    const { companyId, items, destination, shipDate } = req.body || {};
+    const supply = await withTenantContext({ warehouseId }, (client) => service.createDirect(client, warehouseId, {
+      companyId, items, destination, shipDate, actor: actorOf(req.auth),
+    }));
+    res.status(201).json(supply);
+  } catch (err) { next(err); }
+});
+
 // Пункты приёма WB, куда можно везти поставку этого продавца, — все, что WB
 // показывает продавцу в его кабинете (решение владельца 25.09.2026), а не
 // только Москва: без города WB отдаёт весь список, 80 с лишним тысяч пунктов

@@ -46,6 +46,50 @@ router.get('/', requireAuth, async (req, res, next) => {
   }
 });
 
+// Строки Excel → товары каталога продавца для панели выбора товаров
+// (владелец 06.10.2026: панель везде, где выбирают товар). Ключи те же, что
+// у переноса в виртуальный склад: артикул Аргуса, иначе артикул продавца,
+// или штрихкод — и каждый должен указывать ровно на один товар. Только чтение.
+router.post('/match', requireAuth, requireRole('owner', 'manager', 'seller'), async (req, res, next) => {
+  try {
+    const companyId = req.auth.role === 'seller' ? req.auth.companyId : req.body?.companyId;
+    const lines = req.body?.lines;
+    if (!companyId) throw new HttpError(400, 'Укажите продавца');
+    if (!Array.isArray(lines) || lines.length === 0 || lines.length > 1000) {
+      throw new HttpError(400, 'Проверить можно от 1 до 1000 строк за раз');
+    }
+    const items = await withTenantContext(tenantContextFromAuth(req.auth), async (client) => {
+      const company = (await client.query('SELECT id FROM companies WHERE id = $1 AND archived_at IS NULL', [companyId])).rows[0];
+      if (!company) throw new HttpError(404, 'Компания не найдена');
+      const cat = await require('../sellers/inbound').catalogIndex(client, companyId);
+      const products = new Map(cat.products.map((p) => [p.sku, p]));
+      const own = new Map(cat.products.map((p) => [p.sku.toUpperCase(), p.sku]));
+      const bySku = (code) => {
+        const up = code.toUpperCase(), set = cat.byArticle.get(up);
+        return products.get(own.get(up) || (set && set.size === 1 ? [...set][0] : null)) || null;
+      };
+      return lines.map((line, i) => {
+        const sku = String(line?.sku ?? '').trim().slice(0, 200), barcode = String(line?.barcode ?? '').trim().slice(0, 200);
+        const byCode = barcode ? [...(cat.byBarcode.get(barcode) || [])] : [];
+        const fail = (error) => ({ row: i + 1, error });
+        let p = null;
+        if (sku) {
+          p = bySku(sku);
+          if (!p) return fail('Артикул не найден в каталоге продавца');
+          if (barcode && !byCode.includes(p.sku)) return fail('Артикул и штрихкод указывают на разные товары');
+        } else if (!barcode) return fail('Укажите артикул или штрихкод');
+        else if (byCode.length === 0) return fail('Штрихкод не найден в каталоге продавца');
+        else if (byCode.length > 1) return fail('Этот штрихкод у нескольких товаров — укажите артикул');
+        else p = products.get(byCode[0]);
+        return { row: i + 1, sku: p.sku, name: p.name };
+      });
+    });
+    res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Новый товар — заводится в Аргусе, не дожидаясь 1С (решение владельца 22.09).
 // Карточка без external_id; когда такой же артикул того же продавца придёт из
 // 1С, обмен сам свяжет их (sync/service.js, «adoption»). Заводит владелец или

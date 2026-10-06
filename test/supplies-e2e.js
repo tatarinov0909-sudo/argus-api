@@ -327,6 +327,18 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.ok(ready.ready_at);
       assert.equal(ready.picked, 3);
     });
+    // Собранная поставка: лист комплектации печатается целиком — что и из
+    // какой ячейки взяли (владелец 06.10.2026), а не «идти больше некуда».
+    const doneSheet = (await api('GET', `/api/supplies/${supplyId}`, { token: ownerToken })).body;
+    check('лист собранной поставки — целиком, с ячейками, откуда взяли', () => {
+      assert.deepEqual(doneSheet.picking.map((r) => r.sku).sort(), ['PB-A', 'PB-B'], JSON.stringify(doneSheet.picking));
+      for (const r of doneSheet.picking) {
+        assert.ok(r.collected, r.sku);
+        assert.equal(r.qty, r.total, r.sku);
+        assert.equal(r.cells.reduce((n, c) => n + c.take, 0), r.qty, JSON.stringify(r.cells));
+      }
+      assert.deepEqual(doneSheet.picking.find((r) => r.sku === 'PB-A').cells.map((c) => c.cellBlockId), [far.id]);
+    });
     const single = await api('POST', `/api/shipping/${o1}/ship`, { token: workerToken });
     check('заказ из поставки отдельно не отгрузить — он уезжает вместе с ней', () => {
       assert.equal(single.status, 409, JSON.stringify(single.body));

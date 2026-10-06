@@ -1,7 +1,9 @@
 const vwarehouses = require('../vwarehouses/service');
 const { HttpError } = require('../middleware/errorHandler');
+const { requireQty } = require('../middleware/qty');
 const { plural } = require('../journal/plural');
 const { formatBlockLabel } = require('../cells/label');
+const { productCodesJoin } = require('../products/codes');
 const { refreshSupplyStatus, lockSupplyOfInvoice } = require('./state');
 const journal = require('../journal/repository');
 
@@ -294,6 +296,52 @@ async function create(client, warehouseId, {
   };
 }
 
+// Поставка физлицу — или любая отгрузка не на маркетплейс (владелец
+// 06.10.2026): «Поставки» → «Новая поставка» → товары продавца → «Куда /
+// кому». Одним шагом: заказ на отгрузку с выбранными товарами и поставка из
+// него. Дальше обычная сборка, «Уехала» — без QR WB: поставка не на WB.
+// Собирают из всего товара продавца, как и выбирают.
+async function createDirect(client, warehouseId, {
+  companyId, items, destination: rawDestination = null, shipDate = null, actor,
+}) {
+  const destination = cleanDestination(rawDestination);
+  if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
+  if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'Выберите хотя бы один товар');
+  if (items.length > 500) throw new HttpError(400, 'В одной поставке — не больше 500 товаров');
+  const skus = items.map((it) => String(it?.sku ?? ''));
+  if (new Set(skus).size !== skus.length) throw new HttpError(400, 'Товар указан дважды — оставьте одну строку');
+  for (const it of items) requireQty(it.qty, `Количество «${it.sku}»`, { min: 1 });
+  const company = (await client.query(
+    'SELECT id FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL', [companyId, warehouseId],
+  )).rows[0];
+  if (!company) throw new HttpError(404, 'Продавец не найден');
+  const names = new Map((await client.query(
+    'SELECT sku, name FROM products WHERE warehouse_id = $1 AND company_id = $2 AND active AND sku = ANY($3::text[])',
+    [warehouseId, companyId, skus],
+  )).rows.map((p) => [p.sku, p.name]));
+  const missing = skus.find((sku) => !names.has(sku));
+  if (missing !== undefined) throw new HttpError(400, `Товара «${missing}» нет в каталоге продавца`);
+
+  // Номер заказа — номер поставки; до его выдачи — временный.
+  const order = (await client.query(
+    `INSERT INTO invoices (warehouse_id, company_id, number, direction) VALUES ($1, $2, $3, 'out') RETURNING id`,
+    [warehouseId, companyId, `tmp-${require('crypto').randomUUID()}`],
+  )).rows[0];
+  for (const it of items) {
+    await client.query(
+      `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [order.id, warehouseId, companyId, names.get(it.sku), it.sku, Number(it.qty)],
+    );
+  }
+  const hasVw = (await vwarehouses.list(client, companyId)).length > 0;
+  const supply = await create(client, warehouseId, {
+    invoiceIds: [order.id], destination, shipDate, actor, virtualWarehouseId: hasVw ? 'all' : null,
+  });
+  await client.query('UPDATE invoices SET number = $2 WHERE id = $1', [order.id, supply.number]);
+  return supply;
+}
+
 // Состав поставки в том виде, в котором из него печатаются документы.
 //
 // Возвращаем и построчно, и сводно — это ДВА разных документа, и объединять
@@ -306,7 +354,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
             -- Юрлицо продавца, каким его знает WB, — для этикетки товара.
             (SELECT mc.wb_seller_name FROM marketplace_credentials mc
               WHERE mc.company_id = s.company_id AND mc.marketplace = 'wb' LIMIT 1) AS wb_seller_name,
-            COALESCE(vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
+            COALESCE(CASE WHEN s.vw_any THEN 'Весь товар продавца' END, vw.name, CASE WHEN EXISTS (SELECT 1 FROM virtual_warehouses v2
               WHERE v2.company_id = s.company_id AND v2.archived_at IS NULL) THEN 'Остальной товар' END) AS vw_name FROM supplies s
        JOIN companies c ON c.id = s.company_id AND c.archived_at IS NULL
        LEFT JOIN virtual_warehouses vw ON vw.id = s.virtual_warehouse_id
@@ -320,7 +368,9 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
 
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.id AS item_id, ii.sku, ii.name, ii.declared_qty,
-            ii.mp_rid, ii.mp_article, ii.mp_barcode, ii.mp_nm_id,
+            -- Штрихкод — из заказа WB, а у поставки физлицу (заказа WB нет) —
+            -- из карточки товара (06.10.2026): грузчик узнаёт товар по нему.
+            ii.mp_rid, ii.mp_article, COALESCE(ii.mp_barcode, codes.barcode) AS mp_barcode, ii.mp_nm_id,
             m.photo_url, st.part_a AS sticker_head, st.part_b AS sticker_tail,
             -- Сколько по строке уже снято с полки и закрыта ли она. Лист
             -- печатают не один раз: после перерыва в работе бумага, где
@@ -337,6 +387,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
                        AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
                        AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS missing_marked
        FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+       ${productCodesJoin('ii.warehouse_id', 'ii.company_id', 'ii.sku')}
        -- Фото товара с площадки: по нему кладовщик узнаёт товар на полке
        -- быстрее, чем по названию. Нет фото — колонки на листе просто нет.
        LEFT JOIN LATERAL (SELECT pm.photo_url FROM marketplace_product_media pm
@@ -375,7 +426,11 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
   }
   // Полностью собранные позиции на листе комплектации не нужны: за ними
   // больше не идут. В упаковочном листе они остаются — там считают коробки.
-  for (const [key, item] of bySku) if (item.qty <= 0) bySku.delete(key);
+  // Поставка собрана целиком — лист печатают целиком (владелец 06.10.2026):
+  // что и откуда взяли, а не «идти больше некуда».
+  const allPicked = bySku.size > 0 && [...bySku.values()].every((item) => item.qty <= 0);
+  if (allPicked) for (const item of bySku.values()) { item.qty = item.total; item.collected = true; }
+  else for (const [key, item] of bySku) if (item.qty <= 0) bySku.delete(key);
 
   const packing = lines.rows.map((l) => ({
     orderNumber: l.order_number,
@@ -405,7 +460,20 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
   // продавца: одинаковый артикул у двух продавцов — два разных товара,
   // и лист не должен посылать к полке с чужим.
   const skus = [...bySku.keys()];
-  const places = skus.length === 0 ? { rows: [] } : await client.query(
+  const places = skus.length === 0 ? { rows: [] } : allPicked ? await client.query(
+    // Собранная поставка: ячейки — откуда товар действительно взяли.
+    `SELECT ii.sku, SUM(sr.picked_qty) AS qty, wr.row_num, cb.label, cb.id AS cell_block_id,
+            cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+       FROM shipping_records sr
+       JOIN invoice_items ii ON ii.id = sr.invoice_item_id
+       JOIN invoices i ON i.id = ii.invoice_id
+       JOIN cell_blocks cb ON cb.id = sr.cell_block_id
+       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
+      WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND sr.picked_qty > 0
+      GROUP BY ii.sku, cb.id, wr.row_num, cb.label, cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
+      ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
+    [warehouseId, head.rows[0].id],
+  ) : await client.query(
     `SELECT cs.sku, SUM(cs.qty) AS qty, wr.row_num, cb.label, cb.id AS cell_block_id,
             cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
        FROM cell_stock cs
@@ -413,12 +481,22 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
       WHERE cs.warehouse_id = $1 AND cs.company_id = $3 AND cs.sku = ANY($2::text[])
         AND cs.qty > 0 AND cs.quality = 'good'
-        AND cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid
+        -- «Весь товар продавца» — с любого его склада (06.10.2026).
+        AND ($5::boolean OR cs.virtual_warehouse_id IS NOT DISTINCT FROM $4::uuid)
       GROUP BY cs.sku, cb.id, wr.row_num, cb.label,
                cb.rack_start, cb.rack_end, cb.tier_start, cb.tier_end
       ORDER BY wr.row_num, cb.rack_start, cb.tier_start`,
-    [warehouseId, skus, head.rows[0].company_id, head.rows[0].virtual_warehouse_id],
+    [warehouseId, skus, head.rows[0].company_id, head.rows[0].virtual_warehouse_id, head.rows[0].vw_any === true],
   );
+  // Адресное хранение выключено (06.10.2026): всё — из «Склада», сколько нужно.
+  const general = !allPicked && await require('../cells/addressing').isOff(client, warehouseId)
+    ? await require('../cells/addressing').ensureGeneral(client, warehouseId) : null;
+  if (general) {
+    const had = new Map();
+    for (const row of places.rows) had.set(row.sku, (had.get(row.sku) || 0) + Number(row.qty));
+    places.rows = [...bySku.keys()].map((sku) => ({ sku, qty: Math.max(had.get(sku) || 0, bySku.get(sku).qty),
+      row_num: 0, label: null, cell_block_id: general, rack_start: 1, rack_end: 1, tier_start: 1, tier_end: 1 }));
+  }
   for (const row of places.rows) {
     const item = bySku.get(row.sku);
     if (!item) continue;
@@ -1090,5 +1168,5 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
 }
 
 module.exports = {
-  create, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, stockCover, STATUS_NAMES,
+  create, createDirect, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, stockCover, STATUS_NAMES,
 };

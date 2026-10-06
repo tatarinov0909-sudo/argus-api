@@ -12,7 +12,9 @@ const IN_ASSEMBLY_SQL = `(i.supply_id IS NOT NULL OR EXISTS (
 const DEMAND_SQL = `(i.status <> 'shipped'
              AND (i.mp_closed_at IS NULL OR (i.mp_stock_returned_at IS NULL AND ${IN_ASSEMBLY_SQL})))`;
 // «В пути» (владелец 26.09.2026): уехало поставкой на WB, WB ещё не принял.
-const TRANSIT_SQL = `(i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.mp_closed_at IS NULL)`;
+// Заказ не с площадки (физлицу, из 1С) WB не примет никогда — уехал, и всё
+// (владелец 06.10.2026), иначе висел бы «В пути» вечно.
+const TRANSIT_SQL = `(i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.source <> '1c' AND i.mp_closed_at IS NULL)`;
 // Под каким числом у продавца стоит строка заказа: ordered | assembly | transit | null.
 const BUCKET_SQL = `CASE WHEN ${TRANSIT_SQL} THEN 'transit'
                          WHEN ${DEMAND_SQL} THEN CASE WHEN ${IN_ASSEMBLY_SQL} THEN 'assembly' ELSE 'ordered' END
@@ -138,7 +140,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            JOIN invoice_items ii ON ii.invoice_id = i.id
            LEFT JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.mp_close_reason = 'fulfilled')
+             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.source = '1c' OR i.mp_close_reason = 'fulfilled')
              AND COALESCE(s.shipped_at, i.shipped_at) > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), accepted_wb AS (
