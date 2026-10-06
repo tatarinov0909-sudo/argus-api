@@ -84,7 +84,13 @@ const check = (name, fn) => {
     await run((q) => q.query(`INSERT INTO wb_stock_levels(warehouse_id,company_id,mp_warehouse_id,chrt_id,amount)
       VALUES($1,$2,'501','777',6),($1,$2,'502','777',3),($1,$2,'503','777',50)`, [warehouseId, company.id]));
 
-    const row = (await must('GET', `/api/sellers/stock?companyId=${company.id}`, owner.token)).find((r) => r.sku === 'TR-1');
+    // На полке 8: две штуки уехали, 1С (списывает по приёмке WB) ещё числит 10.
+    await must('POST', '/api/cells/rows', owner.token, { configs: [{ rackCount: 1, tierCount: 1 }] }, 201);
+    const block = (await must('GET', '/api/cells/rows', owner.token)).flatMap((r) => r.blocks)[0];
+    await run((q) => q.query(`INSERT INTO cell_stock (cell_block_id, warehouse_id, company_id, sku, qty) VALUES ($1,$2,$3,'TR-1',8)`,
+      [block.id, warehouseId, company.id]));
+    const stockRow = async () => (await must('GET', `/api/sellers/stock?companyId=${company.id}`, owner.token)).find((r) => r.sku === 'TR-1');
+    const row = await stockRow();
     check('«Доступно» = Всего − Заказано − В сборке − В пути', () => {
       assert.equal(row.total, 10);
       assert.equal(row.inTransit, 2);
@@ -109,6 +115,12 @@ const check = (name, fn) => {
 
     await run((q) => q.query(`UPDATE invoices SET mp_closed_at=now(), mp_close_reason='fulfilled' WHERE id=$1`, [a.id]));
     const half = (await must('GET', `/api/sellers/supplies?companyId=${company.id}`, owner.token)).rows.find((s) => s.id === supply.id);
+    const halfStock = await stockRow();
+    check('принятое WB до нового числа из 1С не становится свободным и уходит из «Всего»', () => {
+      assert.equal(halfStock.inTransit, 1);
+      assert.equal(halfStock.total, 9);
+      assert.equal(halfStock.sellerAvailable, 7);
+    });
     await run((q) => q.query(`UPDATE invoices SET mp_closed_at=now(), mp_close_reason='fulfilled' WHERE id=$1`, [b.id]));
     const all = (await must('GET', `/api/sellers/supplies?companyId=${company.id}`, owner.token)).rows.find((s) => s.id === supply.id);
     check('продавцу — приёмка WB по поставке: 1 принято, 1 в пути, потом все', () => {
@@ -119,8 +131,19 @@ const check = (name, fn) => {
       assert.equal(all.ordersInTransit, 0);
       assert.equal(all.statusName, 'Принята WB');
     });
-    const after = (await must('GET', `/api/sellers/stock?companyId=${company.id}`, owner.token)).find((r) => r.sku === 'TR-1');
-    check('принятое WB больше не «В пути»', () => assert.equal(after.inTransit, 0));
+    const after = await stockRow();
+    check('всё принято WB: не «В пути», «Всего» — что на полке, «Доступно» прежнее', () => {
+      assert.equal(after.inTransit, 0);
+      assert.equal(after.total, 8);
+      assert.equal(after.sellerAvailable, 7);
+    });
+    // 1С списала принятое и прислала новое число — двойного вычета нет.
+    await run((q) => q.query(`UPDATE products SET stock_qty_1c=8, stock_at=now() WHERE company_id=$1 AND sku='TR-1'`, [company.id]));
+    const synced = await stockRow();
+    check('после обмена с 1С числа те же', () => {
+      assert.equal(synced.total, 8);
+      assert.equal(synced.sellerAvailable, 7);
+    });
     void c;
   } catch (e) {
     failed += 1; console.log('FAIL тест упал: ' + e.stack);

@@ -124,6 +124,18 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
              AND ${TRANSIT_SQL}
            GROUP BY ii.sku
+         ), taken_by_wb AS (
+           -- Принято WB после последнего числа из 1С (владелец 06.10.2026):
+           -- у склада товара уже нет, а 1С, что списывает по приёмке WB,
+           -- его ещё числит — до следующего обмена.
+           SELECT ii.sku, SUM(ii.declared_qty) AS qty
+           FROM invoices i
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+           JOIN prod p ON p.sku = ii.sku
+           WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
+             AND i.status = 'shipped' AND i.supply_id IS NOT NULL
+             AND i.mp_close_reason = 'fulfilled' AND i.mp_closed_at > p.stock_at
+           GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
            UNION SELECT sku FROM cells
@@ -142,7 +154,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
                 a.quantity AS accepted_qty,a.snapshot_id,a.snapshot_at,
                 o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders,
                 o.assembly_qty, o.queued_qty, o.queued_orders, o.assembly_orders,
-                tr.qty AS transit_qty
+                tr.qty AS transit_qty, tw.qty AS taken_qty
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
@@ -151,6 +163,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
          LEFT JOIN observed obs ON obs.sku = s.sku
          LEFT JOIN accepted a ON a.sku = s.sku
          LEFT JOIN in_transit tr ON tr.sku = s.sku
+         LEFT JOIN taken_by_wb tw ON tw.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
@@ -180,9 +193,21 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // «Всего» — весь товар, пока WB его не принял, вместе с «В пути»
       // (владелец 06.10.2026): в ячейках уехавшего уже нет — прибавляем.
       const inTransit = Number(r.transit_qty || 0);
+      // Едущее и принятое WB продать нельзя (владелец 06.10.2026). 1С одного
+      // склада списывает уехавшее при отъезде машины, другого — по приёмке
+      // WB: что 1С числит сверх лежащего на складе, — это и есть ещё не
+      // списанное уехавшее (едущее и принятое после её последнего числа).
+      // Без ячеек — считаем, что 1С числит всё едущее.
+      // ponytail: по расхождению 1С с ячейками; ячейки больше 1С — уехавшее
+      // сочтётся списанным. Точнее — вопрос анкеты, когда доделаем обмен с 1С.
+      const left = byCells || !stockKnown || accountingTotal === null ? inTransit
+        : Math.min(inTransit + Number(r.taken_qty || 0), Math.max(0, accountingTotal - onHand));
+      const transitCounted = Math.min(inTransit, left);
+      // Принятое WB, которое 1С ещё числит, — уже не «Всего».
+      const takenCounted = left - transitCounted;
       const total = byCells
         ? (stockKnown ? Math.max(0, onHand) + inTransit : null)
-        : (accountingTotal === null ? null : Math.max(0, accountingTotal));
+        : (accountingTotal === null ? null : Math.max(0, accountingTotal - takenCounted));
       // Четыре числа продавца (решение владельца 17.09.2026):
       // «в сборке» — заказы, переданные складу поставкой (или уже
       // отобранные), «заказано» — купленное на площадке, чего в поставке
@@ -196,15 +221,6 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // только «доступно»: обещать больше, чем лежит, нельзя.
       const inAssembly = assemblyDemand;
       const orderedNotInSupply = queuedDemand;
-      // Едущее на сортировку продать нельзя — оно не свободно (владелец
-      // 06.10.2026). Вычитаем его, пока учёт его ещё числит: 1С одного склада
-      // списывает уехавшее при отъезде машины, другого — когда WB принял.
-      // Что 1С числит сверх лежащего на складе, — это и есть ещё не
-      // списанное едущее; без ячеек — вычитаем всё едущее.
-      // ponytail: по расхождению 1С с ячейками; ячейки больше 1С — едущее
-      // сочтётся списанным. Точнее — вопрос анкеты, когда доделаем обмен с 1С.
-      const transitCounted = total === null ? 0
-        : byCells || !stockKnown ? inTransit : Math.min(inTransit, Math.max(0, total - onHand));
       const sellerAvailable = total === null
         ? null : Math.max(0, total - inAssembly - orderedNotInSupply - transitCounted);
       // Заказов больше, чем товара по учёту: об этом продавец должен знать,
