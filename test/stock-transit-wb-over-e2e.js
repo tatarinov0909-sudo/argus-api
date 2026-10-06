@@ -49,6 +49,9 @@ const check = (name, fn) => {
     // «Всего» — 10 (учёт из 1С).
     await run((q) => q.query(`INSERT INTO products(warehouse_id,company_id,sku,name,stock_qty_1c,stock_at)
       VALUES($1,$2,'TR-1','Гантели',10,now())`, [warehouseId, company.id]));
+    // Сверка с файлом остатков — до отгрузки.
+    await run((q) => q.query(`INSERT INTO stock_operations (warehouse_id, company_id, kind, sku, qty, details)
+      VALUES($1,$2,'document_align','TR-1',1,'{}')`, [warehouseId, company.id]));
     const order = async (externalId) => {
       const inv = await must('POST', '/api/invoices', owner.token, { companyId: company.id, number: 'WB-' + externalId, direction: 'out',
         items: [{ sku: 'TR-1', name: 'Гантели', declaredQty: 1 }] }, 201);
@@ -116,7 +119,7 @@ const check = (name, fn) => {
     await run((q) => q.query(`UPDATE invoices SET mp_closed_at=now(), mp_close_reason='fulfilled' WHERE id=$1`, [a.id]));
     const half = (await must('GET', `/api/sellers/supplies?companyId=${company.id}`, owner.token)).rows.find((s) => s.id === supply.id);
     const halfStock = await stockRow();
-    check('принятое WB до нового числа из 1С не становится свободным и уходит из «Всего»', () => {
+    check('принятое WB, пока 1С его числит, не становится свободным и уходит из «Всего»', () => {
       assert.equal(halfStock.inTransit, 1);
       assert.equal(halfStock.total, 9);
       assert.equal(halfStock.sellerAvailable, 7);

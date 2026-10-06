@@ -124,17 +124,21 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
              AND ${TRANSIT_SQL}
            GROUP BY ii.sku
+         ), aligned AS (
+           -- Последняя сверка склада с файлом остатков: тогда ячейки и учёт
+           -- совпали. Что уехало поставкой позже, 1С может ещё числить —
+           -- пока отгрузку в ней не провели (владелец 06.10.2026).
+           SELECT max(created_at) AS at FROM stock_operations
+            WHERE company_id = $1 AND kind IN ('document_align', 'initial_load')
          ), taken_by_wb AS (
-           -- Принято WB после последнего числа из 1С (владелец 06.10.2026):
-           -- у склада товара уже нет, а 1С, что списывает по приёмке WB,
-           -- его ещё числит — до следующего обмена.
+           -- Уехало после сверки и уже принято WB: у склада товара нет.
            SELECT ii.sku, SUM(ii.declared_qty) AS qty
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
-           JOIN prod p ON p.sku = ii.sku
+           JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND i.supply_id IS NOT NULL
-             AND i.mp_close_reason = 'fulfilled' AND i.mp_closed_at > p.stock_at
+             AND i.status = 'shipped' AND i.mp_close_reason = 'fulfilled'
+             AND s.shipped_at > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
@@ -193,10 +197,10 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // «Всего» — весь товар, пока WB его не принял, вместе с «В пути»
       // (владелец 06.10.2026): в ячейках уехавшего уже нет — прибавляем.
       const inTransit = Number(r.transit_qty || 0);
-      // Едущее и принятое WB продать нельзя (владелец 06.10.2026). 1С одного
-      // склада списывает уехавшее при отъезде машины, другого — по приёмке
-      // WB: что 1С числит сверх лежащего на складе, — это и есть ещё не
-      // списанное уехавшее (едущее и принятое после её последнего числа).
+      // Едущее и принятое WB продать нельзя (владелец 06.10.2026). 1С
+      // списывает уехавшее, когда отгрузку в ней проведут, — сразу или через
+      // дни: что 1С числит сверх лежащего на складе, — это и есть ещё не
+      // списанное уехавшее (едущее и принятое WB после сверки с файлом).
       // Без ячеек — считаем, что 1С числит всё едущее.
       // ponytail: по расхождению 1С с ячейками; ячейки больше 1С — уехавшее
       // сочтётся списанным. Точнее — вопрос анкеты, когда доделаем обмен с 1С.
