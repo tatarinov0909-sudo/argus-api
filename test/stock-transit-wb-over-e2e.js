@@ -153,6 +153,20 @@ const check = (name, fn) => {
       assert.equal(synced.total, 8);
       assert.equal(synced.sellerAvailable, 7);
     });
+    // Отгрузка вручную (физлицу): собрали из ячейки и отгрузили, 1С ещё не провела.
+    const manual = await must('POST', '/api/invoices', owner.token, { companyId: company.id, number: 'ОТГ-1', direction: 'out',
+      items: [{ sku: 'TR-1', name: 'Гантели', declaredQty: 1 }] }, 201);
+    const queued = await stockRow();
+    await run((q) => q.query(`UPDATE invoices SET status='shipped', shipped_at=now() WHERE id=$1`, [manual.id]));
+    await run((q) => q.query(`UPDATE cell_stock SET qty=7 WHERE company_id=$1 AND sku='TR-1'`, [company.id]));
+    const shippedManual = await stockRow();
+    check('отгрузка вручную: сначала «Заказано», после отгрузки уходит и из «Всего», «Доступно» не растёт', () => {
+      assert.equal(queued.orderedNotInSupply, 2);
+      assert.equal(queued.sellerAvailable, 6);
+      assert.equal(shippedManual.orderedNotInSupply, 1);
+      assert.equal(shippedManual.total, 7);
+      assert.equal(shippedManual.sellerAvailable, 6);
+    });
     void c;
   } catch (e) {
     failed += 1; console.log('FAIL тест упал: ' + e.stack);

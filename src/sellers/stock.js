@@ -131,14 +131,15 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            SELECT max(created_at) AS at FROM stock_operations
             WHERE company_id = $1 AND kind IN ('document_align', 'initial_load')
          ), taken_by_wb AS (
-           -- Уехало после сверки и уже принято WB: у склада товара нет.
+           -- Ушло после сверки и уже не наше: принято WB из поставки или
+           -- отгружено без поставки — вручную, физлицу (владелец 06.10.2026).
            SELECT ii.sku, SUM(ii.declared_qty) AS qty
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
-           JOIN supplies s ON s.id = i.supply_id
+           LEFT JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND i.mp_close_reason = 'fulfilled'
-             AND s.shipped_at > (SELECT at FROM aligned)
+             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.mp_close_reason = 'fulfilled')
+             AND COALESCE(s.shipped_at, i.shipped_at) > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), accepted_wb AS (
            -- «Принято WB» (владелец 06.10.2026): сколько штук из поставок
