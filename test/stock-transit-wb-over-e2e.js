@@ -137,6 +137,8 @@ const check = (name, fn) => {
     const after = await stockRow();
     check('всё принято WB: не «В пути», «Всего» — что на полке, «Доступно» прежнее', () => {
       assert.equal(after.inTransit, 0);
+      assert.equal(after.acceptedByWb, 2);
+      assert.equal(halfStock.acceptedByWb, 1);
       assert.equal(after.total, 8);
       assert.equal(after.sellerAvailable, 7);
     });

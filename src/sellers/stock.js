@@ -140,6 +140,17 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
              AND i.status = 'shipped' AND i.mp_close_reason = 'fulfilled'
              AND s.shipped_at > (SELECT at FROM aligned)
            GROUP BY ii.sku
+         ), accepted_wb AS (
+           -- «Принято WB» (владелец 06.10.2026): сколько штук из поставок,
+           -- уехавших за 14 дней, сортировочный центр WB уже принял.
+           SELECT ii.sku, SUM(ii.declared_qty) AS qty
+           FROM invoices i
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+           JOIN supplies s ON s.id = i.supply_id
+           WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
+             AND i.status = 'shipped' AND i.mp_close_reason = 'fulfilled'
+             AND s.shipped_at > now() - interval '14 days'
+           GROUP BY ii.sku
          ), skus AS (
            SELECT sku FROM prod
            UNION SELECT sku FROM cells
@@ -158,7 +169,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
                 a.quantity AS accepted_qty,a.snapshot_id,a.snapshot_at,
                 o.qty AS ordered_qty, o.blocked_qty, o.orders, o.picked_orders,
                 o.assembly_qty, o.queued_qty, o.queued_orders, o.assembly_orders,
-                tr.qty AS transit_qty, tw.qty AS taken_qty
+                tr.qty AS transit_qty, tw.qty AS taken_qty, aw.qty AS accepted_wb_qty
          FROM skus s
          LEFT JOIN prod p ON p.sku = s.sku
          LEFT JOIN cells c ON c.sku = s.sku
@@ -168,6 +179,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
          LEFT JOIN accepted a ON a.sku = s.sku
          LEFT JOIN in_transit tr ON tr.sku = s.sku
          LEFT JOIN taken_by_wb tw ON tw.sku = s.sku
+         LEFT JOIN accepted_wb aw ON aw.sku = s.sku
          ORDER BY name`,
         [companyId],
       );
@@ -261,6 +273,9 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       inAssembly,
       orderedNotInSupply,
       inTransit,
+      // Сколько «В пути» вычтено из «Доступно» (часть 1С могла уже списать).
+      transitCounted,
+      acceptedByWb: Number(r.accepted_wb_qty || 0),
       sellerAvailable,
       // Сколько заказов стоит за каждым числом — для подписей в кабинете.
       queuedOrders: Number(r.queued_orders || 0),
@@ -360,6 +375,7 @@ function summarize(rows) {
     ordered: sum(inventoryRows, 'orderedNotInSupply'),
     inAssembly: sum(inventoryRows, 'inAssembly'),
     inTransit: sum(inventoryRows, 'inTransit'),
+    acceptedByWb: sum(inventoryRows, 'acceptedByWb'),
     available: knownRows.length ? sum(knownRows, 'sellerAvailable') : null,
     defect: sum(inventoryRows, 'defective') + sum(inventoryRows, 'packagingDefect'),
     // Заказов больше, чем товара по учёту.

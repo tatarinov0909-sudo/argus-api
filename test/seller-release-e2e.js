@@ -82,7 +82,7 @@ const { pool, withTenantContext } = require('../src/db/pool');
     const sellerSame = sellerView.rows.find(r=>r.sku==='SAME-SKU');
     // Договор с кабинетом продавца: четыре количества и сколько заказов за
     // каждым из обещанных чисел. Ничего про ячейки, 1С и сверку.
-    assert.deepEqual(Object.keys(sellerSame).sort(), ['assemblyOrders','available','barcode','defective','inAssembly','inTransit','name','ordered','orderedOrders','sku','total','totalKnown','updatedAt'].sort());
+    assert.deepEqual(Object.keys(sellerSame).sort(), ['acceptedByWb','assemblyOrders','available','barcode','defective','inAssembly','inTransit','name','ordered','orderedOrders','sku','total','totalKnown','transitDeducted','updatedAt'].sort());
     assert.equal(sellerSame.total,0); assert.equal(sellerSame.ordered,0); assert.equal(sellerSame.inAssembly,0);
     assert.equal(sellerSame.available,0); assert.equal(sellerSame.totalKnown,true);
     assert.equal(JSON.stringify(sellerSame).includes('cell'),false); assert.equal(JSON.stringify(sellerSame).includes('1c'),false);

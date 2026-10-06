@@ -34,6 +34,9 @@ function sellerStockView(row) {
     inAssembly: row.inAssembly,
     // Уехало на WB, WB ещё не принял — в «доступно» уже не входит.
     inTransit: row.inTransit,
+    transitDeducted: row.transitCounted,
+    // Принято сортировочным центром WB из поставок за 14 дней.
+    acceptedByWb: row.acceptedByWb,
     available: row.sellerAvailable,
     // Брак на складе — его товар, решение по нему за продавцом.
     defective: row.defective + row.packagingDefect,
