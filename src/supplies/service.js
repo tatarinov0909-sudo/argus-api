@@ -908,6 +908,7 @@ async function pendingOrders(client, warehouseId, companyId) {
             ii.id AS item_id,
             CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
+            ${MAPPED_SQL} AS mapped,
             ${WB_CONFIRMED_SQL} AS wb_confirmed
        FROM invoices i
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -999,6 +1000,10 @@ async function pendingOrders(client, warehouseId, companyId) {
     // артикул, которого на складе нет.
     wbConfirmed: Boolean(x.wb_confirmed),
     ready: Boolean(x.pickable) && !x.wb_confirmed,
+    // Товар заказа есть в номенклатуре склада — фильтр «Не сопоставлены»
+    // в «Заказах» (владелец 05.10.2026). Отдельно от ready: заказ бывает
+    // сопоставлен, но без номера отправления.
+    mapped: Boolean(x.mapped),
     // По учёту на полках не хватит — поставку с таким заказом склад
     // полностью не соберёт. Решать лучше сейчас, а не у пустой ячейки.
     stockShort: stockShort.has(x.id),

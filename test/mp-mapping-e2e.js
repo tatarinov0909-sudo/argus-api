@@ -83,6 +83,14 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(row.companyName, 'Слим Тим');
     });
 
+    // Фильтр «Не сопоставлены» в «Заказах» (владелец 05.10.2026).
+    const before = await api('GET', `/api/supplies/pending/${companyId}`, { token });
+    check('в очереди заказов несопоставленный заказ помечен — по нему и отбирает фильтр', () => {
+      const rows = before.body.filter((o) => o.id === fresh || o.id === old);
+      assert.equal(rows.length, 2, JSON.stringify(before.body));
+      for (const r of rows) { assert.equal(r.mapped, false, JSON.stringify(r)); assert.equal(r.ready, false); }
+    });
+
     // ---------- Поиск по номенклатуре ----------
     const found = await api('GET',
       `/api/marketplaces/mapping/products?companyId=${companyId}&q=пастила`, { token });
@@ -128,6 +136,7 @@ const whIdOf = (t) => JSON.parse(Buffer.from(t.split('.')[1], 'base64').toString
       assert.equal(rows.length, 2, JSON.stringify(nowReady.body));
       for (const r of rows) {
         assert.equal(r.ready, true, JSON.stringify(r));
+        assert.equal(r.mapped, true, JSON.stringify(r));
         assert.equal(r.sku, 'PB-777', JSON.stringify(r));
       }
     });
