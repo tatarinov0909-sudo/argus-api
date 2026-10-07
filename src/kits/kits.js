@@ -195,3 +195,121 @@ async function assembleKit(client, warehouseId, {
 }
 
 module.exports = { components, kitInfo, kitSkusAmong, assembleKit };
+
+// ---------------------------------------------------------------------------
+// Составы наборов: посмотреть, поправить, загрузить файлом (владелец 08.10.2026).
+// Товар узнаём так же, как приход из Excel (sellers/inbound.js, catalogIndex):
+// артикул без учёта регистра, артикул продавца на WB, штрихкод. Угадывания нет —
+// ключ должен указывать ровно на один товар.
+const MAX_PARTS = 20;
+const MAX_PER_KIT = 1000;
+
+async function resolver(client, companyId) {
+  const cat = await require('../sellers/inbound').catalogIndex(client, companyId);
+  const exact = new Map(cat.products.map((p) => [p.sku.toUpperCase(), p.sku]));
+  return (code) => {
+    const key = String(code ?? '').trim();
+    if (!key) return { error: 'не указан' };
+    const own = exact.get(key.toUpperCase());
+    if (own) return { sku: own };
+    const sets = [cat.byArticle.get(key.toUpperCase()), cat.byBarcode.get(key)].filter(Boolean);
+    const found = new Set(sets.flatMap((s) => [...s]));
+    if (found.size === 1) return { sku: [...found][0] };
+    return { error: found.size ? `«${key}» у нескольких товаров — укажите артикул Аргуса` : `«${key}» нет в каталоге продавца` };
+  };
+}
+
+async function list(client, warehouseId, companyId) {
+  const rows = (await client.query(
+    `SELECT k.kit_sku, kp.name AS kit_name, k.component_sku, cp.name AS component_name, k.qty
+       FROM product_kits k
+       LEFT JOIN products kp ON kp.company_id = k.company_id AND kp.sku = k.kit_sku
+       LEFT JOIN products cp ON cp.company_id = k.company_id AND cp.sku = k.component_sku
+      WHERE k.warehouse_id = $1 AND k.company_id = $2
+      ORDER BY kp.name NULLS LAST, k.kit_sku, k.component_sku`, [warehouseId, companyId])).rows;
+  const kits = new Map();
+  for (const r of rows) {
+    if (!kits.has(r.kit_sku)) kits.set(r.kit_sku, { kitSku: r.kit_sku, name: r.kit_name || r.kit_sku, components: [] });
+    kits.get(r.kit_sku).components.push({ sku: r.component_sku, name: r.component_name || r.component_sku, qty: Number(r.qty) });
+  }
+  return [...kits.values()];
+}
+
+// Проверить состав одного набора: набор и части — товары продавца, часть не
+// повторяется и не сам набор, количество — целое от 1 до 1000.
+function checkParts(kitSku, parts) {
+  if (parts.length > MAX_PARTS) return `в наборе не больше ${MAX_PARTS} частей`;
+  const seen = new Set();
+  for (const p of parts) {
+    if (p.sku === kitSku) return 'набор не может состоять из самого себя';
+    if (seen.has(p.sku)) return `часть ${p.sku} указана дважды — оставьте одну строку`;
+    seen.add(p.sku);
+    if (!Number.isInteger(p.qty) || p.qty < 1 || p.qty > MAX_PER_KIT) return `сколько ${p.sku} в наборе — целое от 1 до ${MAX_PER_KIT}`;
+  }
+  return null;
+}
+
+async function replace(client, warehouseId, companyId, kitSku, parts) {
+  await client.query('DELETE FROM product_kits WHERE warehouse_id = $1 AND company_id = $2 AND kit_sku = $3',
+    [warehouseId, companyId, kitSku]);
+  for (const p of parts) {
+    await client.query(
+      `INSERT INTO product_kits (warehouse_id, company_id, kit_sku, component_sku, qty) VALUES ($1, $2, $3, $4, $5)`,
+      [warehouseId, companyId, kitSku, p.sku, p.qty]);
+  }
+}
+
+// Состав одного набора — с экрана. Пустой список — «это больше не набор».
+async function save(client, warehouseId, companyId, kitCode, components) {
+  const find = await resolver(client, companyId);
+  const kit = find(kitCode);
+  if (kit.error) throw new HttpError(400, `Набор ${kit.error}`);
+  if (!Array.isArray(components)) throw new HttpError(400, 'Состав — список частей');
+  const parts = [];
+  for (const c of components) {
+    const p = find(c?.sku);
+    if (p.error) throw new HttpError(400, `Часть ${p.error}`);
+    parts.push({ sku: p.sku, qty: Number(c.qty) });
+  }
+  const bad = checkParts(kit.sku, parts);
+  if (bad) throw new HttpError(400, bad[0].toUpperCase() + bad.slice(1));
+  await replace(client, warehouseId, companyId, kit.sku, parts);
+  return { kitSku: kit.sku, components: parts };
+}
+
+// Файл «набор — часть — сколько»: строки одного набора — его состав целиком.
+// Набор с ошибкой не трогаем, остальные загружаем (apply); без apply — только
+// проверка. Набор, которого в файле нет, остаётся как был.
+async function importRows(client, warehouseId, companyId, rows, { apply = false } = {}) {
+  if (!Array.isArray(rows) || !rows.length || rows.length > 5000) throw new HttpError(400, 'В файле от 1 до 5000 строк');
+  const find = await resolver(client, companyId);
+  const kits = new Map();
+  const errors = [];
+  rows.forEach((r, i) => {
+    const kit = find(r?.kit);
+    const part = find(r?.component);
+    const qty = Number(String(r?.qty ?? '').replace(',', '.'));
+    const row = i + 1;
+    if (kit.error) { errors.push({ row, error: `набор ${kit.error}` }); return; }
+    if (!kits.has(kit.sku)) kits.set(kit.sku, { parts: [], errors: [] });
+    const k = kits.get(kit.sku);
+    if (part.error) k.errors.push({ row, error: `часть ${part.error}` });
+    else k.parts.push({ sku: part.sku, qty, row });
+  });
+  const result = [];
+  for (const [kitSku, k] of kits) {
+    const bad = k.errors.length ? k.errors.map((e) => `строка ${e.row}: ${e.error}`).join('; ') : checkParts(kitSku, k.parts);
+    if (!bad && apply) await replace(client, warehouseId, companyId, kitSku, k.parts);
+    result.push({ kitSku, parts: k.parts.length, error: bad || null });
+  }
+  return {
+    applied: apply,
+    kits: result,
+    ok: result.filter((k) => !k.error).length,
+    errors: errors.concat(result.filter((k) => k.error).map((k) => ({ kit: k.kitSku, error: k.error }))),
+  };
+}
+
+module.exports.list = list;
+module.exports.save = save;
+module.exports.importRows = importRows;

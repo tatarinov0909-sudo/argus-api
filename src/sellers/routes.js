@@ -38,6 +38,8 @@ function sellerStockView(row) {
     // Принято сортировочным центром WB за последние 3 дня.
     acceptedByWb: row.acceptedByWb,
     available: row.sellerAvailable,
+    // Набор: сколько ещё можно собрать из свободных частей (08.10.2026).
+    ...(row.kitParts ? { kitParts: row.kitParts, kitBuildable: row.kitBuildable } : {}),
     // Брак на складе — его товар, решение по нему за продавцом.
     defective: row.defective + row.packagingDefect,
     orderedOrders: row.queuedOrders,

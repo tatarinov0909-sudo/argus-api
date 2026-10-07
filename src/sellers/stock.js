@@ -195,7 +195,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
   const vws = (await client.query(
     'SELECT id, name FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL ORDER BY created_at', [companyId])).rows;
   const split = vws.length ? await loadSplit(client, companyId) : null;
-    return rows.map((r) => {
+    const out = rows.map((r) => {
       // Warehouse stock includes picked goods still waiting for departure.
       // 1C is a separate reconciliation source, never a fallback balance.
       const staged = Number(r.staged_qty || 0);
@@ -299,6 +299,37 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source, inTransit: transitCounted }) } : {}),
       };
     });
+  await addKits(client, companyId, out);
+  return out;
+}
+
+// Наборы (владелец 08.10.2026): «Свободно» набора — готовые наборы плюс
+// сколько можно собрать из свободных частей. Части продаются и поштучно,
+// поэтому в итоги продавца это не идёт (посчиталось бы дважды) — только в
+// строку набора (kitBuildable) и в сравнение с «На WB» (wbListing.js).
+// Часть без учёта — «не знаем», а не ноль: собрать сколько — тоже неизвестно.
+async function addKits(client, companyId, rows) {
+  const parts = (await client.query(
+    'SELECT kit_sku, component_sku, qty FROM product_kits WHERE company_id = $1', [companyId])).rows;
+  if (!parts.length) return;
+  const bySku = new Map(rows.map((r) => [r.sku, r]));
+  const kits = new Map();
+  for (const p of parts) {
+    if (!kits.has(p.kit_sku)) kits.set(p.kit_sku, []);
+    kits.get(p.kit_sku).push(p);
+  }
+  for (const [kit, list] of kits) {
+    const row = bySku.get(kit);
+    if (!row) continue;
+    let buildable = Infinity;
+    for (const p of list) {
+      const free = bySku.get(p.component_sku)?.sellerAvailable;
+      if (free == null) { buildable = null; break; }
+      buildable = Math.min(buildable, Math.floor(free / Number(p.qty)));
+    }
+    row.kitParts = list.length;
+    row.kitBuildable = buildable;
+  }
 }
 
 // Сколько товара на каждом виртуальном складе: годное в ячейках и собранное,

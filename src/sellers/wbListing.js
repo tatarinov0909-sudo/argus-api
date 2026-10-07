@@ -25,11 +25,15 @@ async function levels(client, warehouseId, companyId) {
 
 // Свободно для WB: со складов, с которых собирают на WB («Остальной товар» и
 // склады WB продавца), минус заказы вне поставки. Без складов — «Доступно».
+// Набор — плюс сколько можно собрать из частей (stock.js, addKits): иначе
+// «На WB больше, чем свободно» по каждому набору было ложной тревогой.
 function freeForWb(row, wbVw) {
-  if (!row.byWarehouse) return row.sellerAvailable;
+  if (row.kitParts && row.kitBuildable == null) return null;
+  const kit = Number(row.kitBuildable || 0);
+  if (!row.byWarehouse) return row.sellerAvailable == null ? null : row.sellerAvailable + kit;
   const parts = row.byWarehouse.filter((w) => wbVw.has(w.id || ''));
   if (parts.some((w) => w.available == null)) return null;
-  return Math.max(0, parts.reduce((n, w) => n + w.available, 0) - Number(row.orderedNotInSupply || 0));
+  return Math.max(0, parts.reduce((n, w) => n + w.available, 0) - Number(row.orderedNotInSupply || 0)) + kit;
 }
 
 // sku → { listed, free, over, warehouses, top: { name, amount } } по товарам,

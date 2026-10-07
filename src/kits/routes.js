@@ -24,6 +24,63 @@ async function kitVw(client, warehouseId, companyId, supplyId, body = {}) {
   return s ? s.virtual_warehouse_id || null : null;
 }
 
+// Составы наборов продавца — экран и файл (владелец 08.10.2026). Руководитель
+// и менеджер: это каталог товара, как «Добавить товары» у прихода.
+async function activeCompany(client, warehouseId, companyId) {
+  if (!UUID.test(String(companyId || ''))) throw new HttpError(400, 'Неверный продавец');
+  const c = (await client.query('SELECT id, name FROM companies WHERE id = $1 AND warehouse_id = $2 AND archived_at IS NULL',
+    [companyId, warehouseId])).rows[0];
+  if (!c) throw new HttpError(404, 'Продавец не найден');
+  return c;
+}
+const journalOf = (req) => ({ actorType: req.auth.role, actorId: req.auth.staffKeyId || req.auth.ownerId || null });
+
+router.get('/company/:companyId', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, async (client) => {
+      await activeCompany(client, warehouseId, req.params.companyId);
+      return kits.list(client, warehouseId, req.params.companyId);
+    }));
+  } catch (err) { next(err); }
+});
+
+router.put('/company/:companyId/kit', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, async (client) => {
+      const company = await activeCompany(client, warehouseId, req.params.companyId);
+      const saved = await kits.save(client, warehouseId, company.id, req.body?.kitSku, req.body?.components);
+      await require('../journal/repository').createEntry(client, {
+        warehouseId, agent: 'Кладовщик', status: 'auto', ...journalOf(req),
+        actionText: saved.components.length
+          ? `Состав набора ${saved.kitSku} продавца «${company.name}»: `
+            + saved.components.map((p) => `${p.sku} × ${p.qty}`).join(', ') + '.'
+          : `Набор ${saved.kitSku} продавца «${company.name}» больше не набор — состав убран.`,
+      });
+      return saved;
+    }));
+  } catch (err) { next(err); }
+});
+
+router.post('/company/:companyId/import', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const { warehouseId } = req.auth;
+    res.json(await withTenantContext({ warehouseId }, async (client) => {
+      const company = await activeCompany(client, warehouseId, req.params.companyId);
+      const out = await kits.importRows(client, warehouseId, company.id, req.body?.rows, { apply: req.body?.apply === true });
+      if (out.applied && out.ok) {
+        await require('../journal/repository').createEntry(client, {
+          warehouseId, agent: 'Кладовщик', status: 'auto', ...journalOf(req),
+          actionText: `Составы наборов продавца «${company.name}» загружены файлом: ${out.ok}`
+            + (out.errors.length ? `, не загружено с ошибками: ${out.errors.length}.` : '.'),
+        });
+      }
+      return out;
+    }));
+  } catch (err) { next(err); }
+});
+
 // Состав набора и сколько его можно собрать прямо сейчас.
 // Работнику доступно: это подсказка у полки, а не чат (см. правило о том, что
 // работник в чат не ходит) — он должен видеть, что и в каком количестве брать.
