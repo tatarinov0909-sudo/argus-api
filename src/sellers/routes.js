@@ -104,7 +104,8 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
                 count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_close_reason = 'canceled')::int AS orders_canceled,
                 count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NULL)::int AS orders_in_transit,
                 COALESCE(sum(ii.declared_qty), 0)::int AS units,
-                count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready
+                count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready,
+                bool_or(i.source_document_type = 'direct_supply') AS direct
            FROM supplies s
            JOIN invoices i ON i.supply_id = s.id AND i.company_id = $1
            JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -145,6 +146,8 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
         // Номер и QR поставки на WB — их показывают на воротах
         // сортировочного центра. Появляются, когда поставка передана на WB.
         mpSupplyId: x.mp_supply_id,
+        // Куда: поставка физлицу или на WB (проверка 07.10, замечание 1).
+        marketplace: x.direct ? 'direct' : x.mp_supply_id ? 'wb' : null,
         mpBarcode: x.mp_barcode,
         mpBarcodeFile: x.mp_barcode_file,
         items: lines.filter((l) => l.supply_id === x.id).map((l) => ({
@@ -580,7 +583,9 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
       return (await client.query(
-        `SELECT i.id, i.number, i.status, i.source, i.created_at, i.shipped_at, ${BUCKET_SQL} AS bucket,
+        // Заказ поставки физлицу — «физлицу», а не «1С» (в 1С его нет; проверка 07.10, замечание 1).
+        `SELECT i.id, i.number, i.status, CASE WHEN i.source_document_type = 'direct_supply' THEN 'direct' ELSE i.source END AS source,
+                i.created_at, i.shipped_at, ${BUCKET_SQL} AS bucket,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
                 i.mp_close_reason, i.mp_stock_returned_at, (i.supply_id IS NOT NULL) AS in_supply,
                 (i.supply_id IS NOT NULL OR EXISTS (SELECT 1 FROM shipping_records sr JOIN invoice_items si ON si.id=sr.invoice_item_id

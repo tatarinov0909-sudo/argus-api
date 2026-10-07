@@ -145,7 +145,14 @@ async function preview(client, warehouseId, body) {
   const add = (r, code, message, extra = {}) => errors.push({ row:r.row, code, message, ...extra });
   for (const r of b.items) {
     let p = r.sku ? bySku.get(r.sku) : null;
-    if (r.sku && !p) add(r,'unknown_sku','Артикул не найден в активном каталоге этого клиента');
+    // Артикул WB, общий у размеров: штрихкод строки выбирает размер, иначе —
+    // «у нескольких», а не «не найден» (проверка 07.10, замечание 5).
+    const several = r.sku && !p ? cat.byArticle.get(String(r.sku).toUpperCase()) : null;
+    if (several && several.size > 1) {
+      const both = (r.barcode ? byBarcode.get(r.barcode) : []).filter(x => several.has(x.sku));
+      if (both.length === 1) p = both[0];
+      else add(r,'ambiguous_article','Этот артикул у нескольких товаров (например, размеров) — укажите штрихкод');
+    } else if (r.sku && !p) add(r,'unknown_sku','Артикул не найден в активном каталоге этого клиента');
     if (!r.sku) {
       const matches = byBarcode.get(r.barcode) || [];
       if (!r.barcode) add(r,'missing_identifier','Укажите артикул Аргуса или штрихкод');

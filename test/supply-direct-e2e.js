@@ -128,6 +128,21 @@ const check = (label, fn) => {
       assert.equal(after['DR-1'].available, 7);
       assert.equal(after['DR-2'].inTransit, 0);
     });
+
+    // Повтор того же окна «Новая поставка» (проверка 07.10, замечание 2).
+    const requestId = require('crypto').randomUUID();
+    const body = { companyId: company, destination: 'Сидоров, Тверь', items: [{ sku: 'DR-1', qty: 1 }], requestId };
+    const twin = await Promise.all([api('POST', '/api/supplies/direct', owner, body), api('POST', '/api/supplies/direct', owner, body)]);
+    const made = (await run((c) => c.query('SELECT count(*)::int AS n FROM supplies WHERE request_id = $1', [requestId]))).rows[0].n;
+    const changed = await api('POST', '/api/supplies/direct', owner, { ...body, items: [{ sku: 'DR-1', qty: 2 }] });
+    const badId = await api('POST', '/api/supplies/direct', owner, { ...body, requestId: 'не-номер' });
+    check('два одинаковых запроса одного окна — одна поставка; с другими товарами — отказ', () => {
+      assert.equal(made, 1);
+      assert.deepEqual(twin.map((r) => r.status).sort(), [200, 201]);
+      assert.equal(twin[0].body.number, twin[1].body.number);
+      assert.equal(changed.status, 409);
+      assert.equal(badId.status, 400);
+    });
   } catch (e) {
     failed += 1; console.log('FAIL тест упал: ' + e.stack);
   } finally {

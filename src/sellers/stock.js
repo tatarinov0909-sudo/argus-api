@@ -381,6 +381,9 @@ function summarize(rows) {
     ordered: sum(inventoryRows, 'orderedNotInSupply'),
     inAssembly: sum(inventoryRows, 'inAssembly'),
     inTransit: sum(inventoryRows, 'inTransit'),
+    // Сколько «В пути» вычтено из «Доступно» — часть уехавшего 1С могла уже
+    // списать, тогда её нет и во «Всего» (проверка 07.10, замечание 6).
+    transitDeducted: sum(inventoryRows, 'transitCounted'),
     acceptedByWb: sum(inventoryRows, 'acceptedByWb'),
     available: knownRows.length ? sum(knownRows, 'sellerAvailable') : null,
     defect: sum(inventoryRows, 'defective') + sum(inventoryRows, 'packagingDefect'),

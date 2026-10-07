@@ -58,11 +58,11 @@ router.post('/', requireAuth, requireRole('owner', 'manager'), async (req, res, 
 router.post('/direct', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
-    const { companyId, items, destination, shipDate } = req.body || {};
+    const { companyId, items, destination, shipDate, requestId } = req.body || {};
     const supply = await withTenantContext({ warehouseId }, (client) => service.createDirect(client, warehouseId, {
-      companyId, items, destination, shipDate, actor: actorOf(req.auth),
+      companyId, items, destination, shipDate, requestId: requestId ?? null, actor: actorOf(req.auth),
     }));
-    res.status(201).json(supply);
+    res.status(supply.replayed ? 200 : 201).json(supply);
   } catch (err) { next(err); }
 });
 

@@ -259,8 +259,11 @@ async function archive(client, { warehouseId, companyId, id, actor }) {
       + (canceled.length ? ` Отменены незаконченные переносы: ${canceled.join(', ')}.` : ''),
     entityType: 'virtual_warehouse', entityId: id, actorType: actorType(actor.role), actorId: actor.id || null,
   });
+  // Продавцу — и про отменённые заявки на перенос: иначе он ждал бы их
+  // выполнения (проверка 07.10, замечание 7).
   await notifySeller(client, { warehouseId, companyId, kind: 'vw_archived', entityId: id,
-    text: `Склад убрал ваш склад «${cur.name}».${tail}` });
+    text: `Склад убрал ваш склад «${cur.name}».${tail}`
+      + (canceled.length ? ` Незаконченные переносы отменены: ${canceled.join(', ')}.` : '') });
   return { units, canceled };
 }
 

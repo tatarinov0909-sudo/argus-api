@@ -75,6 +75,14 @@ router.post('/match', requireAuth, requireRole('owner', 'manager', 'seller'), as
         let p = null;
         if (sku) {
           p = bySku(sku);
+          // Артикул WB, общий у нескольких размеров, — не «не найден», а «у
+          // нескольких»: штрихкод в строке выбирает размер (проверка 07.10, зам. 5).
+          const several = !p && cat.byArticle.get(sku.toUpperCase());
+          if (several && several.size > 1) {
+            const both = byCode.filter((s) => several.has(s));
+            if (both.length !== 1) return fail('Этот артикул у нескольких товаров (например, размеров) — укажите штрихкод');
+            p = products.get(both[0]);
+          }
           if (!p) return fail('Артикул не найден в каталоге продавца');
           if (barcode && !byCode.includes(p.sku)) return fail('Артикул и штрихкод указывают на разные товары');
         } else if (!barcode) return fail('Укажите артикул или штрихкод');

@@ -302,8 +302,12 @@ async function create(client, warehouseId, {
 // него. Дальше обычная сборка, «Уехала» — без QR WB: поставка не на WB.
 // Собирают из всего товара продавца, как и выбирают.
 async function createDirect(client, warehouseId, {
-  companyId, items, destination: rawDestination = null, shipDate = null, actor,
+  companyId, items, destination: rawDestination = null, shipDate = null, actor, requestId = null,
 }) {
+  if (requestId !== null && requestId !== undefined
+      && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(requestId))) {
+    throw new HttpError(400, 'Неверный номер операции');
+  }
   const destination = cleanDestination(rawDestination);
   if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
   if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'Выберите хотя бы один товар');
@@ -322,6 +326,24 @@ async function createDirect(client, warehouseId, {
   )).rows.map((p) => [p.sku, p.name]));
   const missing = skus.find((sku) => !names.has(sku));
   if (missing !== undefined) throw new HttpError(400, `Товара «${missing}» нет в каталоге продавца`);
+
+  // Повтор того же окна — та же поставка, а не вторая (проверка 07.10,
+  // замечание 2). Два одновременных запроса встают в очередь на замке.
+  if (requestId) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('direct-supply:' || $1))", [requestId]);
+    const prior = (await client.query(
+      `SELECT s.id, s.number, s.company_id,
+              (SELECT string_agg(ii.sku || ':' || ii.declared_qty, ',' ORDER BY ii.sku)
+                 FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id WHERE i.supply_id = s.id) AS lines
+         FROM supplies s WHERE s.warehouse_id = $1 AND s.request_id = $2`, [warehouseId, requestId])).rows[0];
+    if (prior) {
+      const asked = items.map((it, i) => skus[i] + ':' + Number(it.qty)).sort().join(',');
+      if (prior.company_id !== companyId || prior.lines !== asked) {
+        throw new HttpError(409, `По этому окну уже создана поставка ${prior.number} с другими товарами — обновите экран.`);
+      }
+      return { id: prior.id, number: prior.number, replayed: true };
+    }
+  }
 
   // Номер заказа — номер поставки; до его выдачи — временный. Вид документа
   // «поставка физлицу»: у заказа нет жизни без своей поставки — разобрали
@@ -343,6 +365,7 @@ async function createDirect(client, warehouseId, {
     invoiceIds: [order.id], destination, shipDate, actor, virtualWarehouseId: hasVw ? 'all' : null,
   });
   await client.query('UPDATE invoices SET number = $2 WHERE id = $1', [order.id, supply.number]);
+  if (requestId) await client.query('UPDATE supplies SET request_id = $2 WHERE id = $1', [supply.id, requestId]);
   return supply;
 }
 

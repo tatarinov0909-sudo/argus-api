@@ -27,8 +27,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const {
-      invoiceItemId, qty, qualityBucket, cellBlockId, pausedMs, pauseReasons, defectNote, seenQty,
+      invoiceItemId, qty, qualityBucket, pausedMs, pauseReasons, defectNote, seenQty,
     } = req.body;
+    let { cellBlockId } = req.body;
     if (!invoiceItemId || qty == null || !qualityBucket) {
       throw new HttpError(400, 'Нужны позиция накладной, количество и категория качества');
     }
@@ -107,6 +108,9 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
           [cellBlockId, warehouseId],
         );
         if (!blockResult.rows[0]) throw new HttpError(404, 'Ячейка не найдена');
+        // Хранение выключено — возврат ложится в «Склад», и в истории тоже
+        // «Склад», а не выбранная на экране ячейка (проверка 07.10, замечание 9).
+        cellBlockId = await require('../cells/addressing').place(client, warehouseId, cellBlockId);
 
         // Склад «хранить отдельно» и зоны складов продавца (02.10.2026).
         await require('../vwarehouses/separate').checkPut(client, warehouseId, {

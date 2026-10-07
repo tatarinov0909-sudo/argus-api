@@ -52,7 +52,8 @@ async function admin(sql,params=[]){
     ]){const p=await preview(items);check('preview '+code,()=>{assert.equal(p.canCommit,false);assert(p.errors.some(e=>e.code===code));});}
     // Fixed number of catalogue/quantity queries, independent of selected SKU count.
     let n=0;const all=await s.run(c=>batch.candidates({query:(...args)=>{n++;return c.query(...args);}},s.warehouseId,{companyId:s.company,toVw:target.id,limit:'200'}));
-    check('one page uses four SQL queries for all SKUs',()=>{assert.equal(n,4);assert.equal(all.items.length,7);});
+    // Пятый — «выключено ли адресное хранение» (06.10.2026): один на страницу, от числа SKU не зависит.
+    check('one page uses five SQL queries for all SKUs',()=>{assert.equal(n,5);assert.equal(all.items.length,7);});
     const tooMany=await app.api('POST','/api/vwarehouses/transfers/batch',s.owner,data(Array.from({length:201},(_,i)=>({sku:'X'+i,qty:1}))));
     check('batch limit before writes',()=>{assert.equal(tooMany.status,400);assert.equal(tooMany.body.maxItems,200);});
     const dupe=await app.api('POST','/api/vwarehouses/transfers/batch',s.owner,data([{sku:'A',qty:1},{sku:'A',qty:2}]));
