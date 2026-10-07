@@ -72,6 +72,11 @@ const { loadStock } = require('../src/sellers/stock');
     const kept=await order(90110), keptGone=await order(90111);
     const keptSupply=await must('POST','/api/supplies',owner.token,{invoiceIds:[kept.id,keptGone.id]},201);
     const physical=()=>run(q=>q.query(`SELECT company_id,sum(qty)::numeric AS qty FROM cell_stock WHERE warehouse_id=$1 GROUP BY company_id ORDER BY company_id`,[warehouseId]));
+    // Отобранные заказы вне поставки — как те, что вынули из поставки до
+    // 07.10.2026. Заказ, который WB принял, пока он в поставке, теперь уезжает
+    // с ней и на сверку не попадает (test/wb-accepted-ships-supply-e2e.js);
+    // здесь проверяется сама сверка.
+    await run(q=>q.query(`UPDATE invoices SET supply_id=NULL WHERE id=ANY($1::uuid[])`,[[fulfilled.id,partial.id]]));
     const before=await physical();
     const response=[
       {id:90101,supplierStatus:'cancel',wbStatus:'canceled'},

@@ -644,12 +644,13 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
   // slip between checking a supply and marking its orders as shipped.
   const orderLocks = await client.query(`SELECT id, number, status, mp_closed_at FROM invoices
     WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
-  const ended = orderLocks.rows.find(o => o.mp_closed_at);
+  // Уехавший по данным WB заказ (statuses.js) уже в пути — он не мешает.
+  const ended = orderLocks.rows.find(o => o.mp_closed_at && o.status !== 'shipped');
   if (ended) throw new HttpError(409, `Заказ «${ended.number}» закрыт на WB. Руководитель должен разобрать его в сверке заказов WB.`);
 
   if (from === 'shipped') throw new HttpError(409, 'Поставка уже уехала — назад её не вернуть, заведите новую');
   if (orderLocks.rows.length === 0) throw new HttpError(409, 'В поставке нет ни одного заказа — отгружать нечего');
-  const notPicked = orderLocks.rows.filter(o => o.status !== 'ready');
+  const notPicked = orderLocks.rows.filter(o => o.status !== 'ready' && o.status !== 'shipped');
   if (from !== 'ready' || notPicked.length > 0) {
     const names = notPicked.slice(0, 3).map(o => `«${o.number}»`).join(', ');
     throw new HttpError(409, `Ещё не собрано: ${names}. Уехать может только поставка, в которой собран каждый заказ.`);
@@ -1069,7 +1070,7 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
   // Порядок блокировок тот же, что у отбора и отгрузки: поставка, потом заказ.
   const supplyId = await lockSupplyOfInvoice(client, warehouseId, invoiceId);
   const inv = await client.query(
-    `SELECT i.id, i.number, i.supply_id, s.number AS supply_number, s.status AS supply_status,
+    `SELECT i.id, i.number, i.status, i.supply_id, s.number AS supply_number, s.status AS supply_status,
             s.mp_supply_id, s.mp_handoff_at > ${HANDOFF_STALE} AS handoff_live
        FROM invoices i LEFT JOIN supplies s ON s.id = i.supply_id
       WHERE i.warehouse_id = $1 AND i.id = $2 FOR UPDATE OF i`,
@@ -1080,8 +1081,9 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
   if (!order.supply_id || order.supply_id !== supplyId) {
     throw new HttpError(409, `Заказ «${order.number}» не в поставке — убирать неоткуда`);
   }
-  if (order.supply_status === 'shipped') {
-    throw new HttpError(409, `Поставка «${order.supply_number}» уже уехала — назад её не вернуть`);
+  if (order.supply_status === 'shipped' || order.status === 'shipped') {
+    throw new HttpError(409, order.supply_status === 'shipped' ? `Поставка «${order.supply_number}» уже уехала — назад её не вернуть`
+      : `Заказ «${order.number}» уже уехал — WB принял его посылку`);
   }
   refuseDuringHandoff(order, order.supply_number);
   // Поставка уже заведена на площадке: там заказ числится в её составе, и

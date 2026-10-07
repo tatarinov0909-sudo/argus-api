@@ -8,10 +8,15 @@ const journal = require('../journal/repository');
 // после того как из неё убрали отменённый заказ.
 async function refreshSupplyStatus(client, warehouseId, supplyId) {
   await client.query(
+    // Уехавший заказ (WB уже принял его посылку, statuses.js) остаётся в
+    // поставке: «собрана» — когда остальное собрано, «уехала» — когда уехали все.
     `UPDATE supplies s
-        SET status = CASE WHEN o.n > 0 AND o.n = o.ready THEN 'ready' ELSE 'collecting' END::supply_status,
-            ready_at = CASE WHEN o.n > 0 AND o.n = o.ready THEN COALESCE(s.ready_at, now()) END
-       FROM (SELECT count(*) AS n, count(*) FILTER (WHERE status = 'ready') AS ready
+        SET status = CASE WHEN o.n > 0 AND o.n = o.shipped THEN 'shipped'
+                          WHEN o.n > 0 AND o.n = o.ready + o.shipped THEN 'ready' ELSE 'collecting' END::supply_status,
+            ready_at = CASE WHEN o.n > 0 AND o.n = o.ready + o.shipped THEN COALESCE(s.ready_at, now()) END,
+            shipped_at = CASE WHEN o.n > 0 AND o.n = o.shipped THEN COALESCE(s.shipped_at, s.mp_delivered_at, now()) ELSE s.shipped_at END
+       FROM (SELECT count(*) AS n, count(*) FILTER (WHERE status = 'ready') AS ready,
+                    count(*) FILTER (WHERE status = 'shipped') AS shipped
                FROM invoices WHERE warehouse_id = $1 AND supply_id = $2) o
       WHERE s.warehouse_id = $1 AND s.id = $2 AND s.status <> 'shipped'`,
     [warehouseId, supplyId],

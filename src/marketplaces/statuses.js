@@ -28,36 +28,60 @@ function statusText(row) {
   return row.mp_close_reason === 'canceled' ? 'Отменён на WB' : 'Передан в доставку на WB';
 }
 
-// Поставка уехала по данным WB: то же, что кнопка «Уехала» (supplies/service
-// ship), только время отъезда — момент передачи в доставку WB, а не «сейчас»:
-// WB принял посылку часы спустя, а машина ушла сразу после передачи.
-// Только собранная поставка (все заказы собраны), которую Аргус сам передал
-// в доставку WB. Иначе — false, и заказ идёт прежней дорогой (на сверку).
-async function shipHandedOverSupply(client, warehouseId, supplyId) {
+// WB уже держит посылку заказа из поставки Аргуса — значит, заказ уехал с этой
+// поставкой, кто бы ни собирал её и ни передавал в доставку: Аргус или
+// кабинет WB (владелец 07.10.2026: «поставку создали через Аргус, а всё
+// остальное — не через нас, и внутри стало ноль»). Заказ из поставки больше
+// не вынимается. Собранная целиком поставка уезжает вся: машина ушла с ней.
+// Иначе уезжает этот заказ, а поставка — когда уедут все её заказы
+// (supplies/state.js). Время отъезда — передача в доставку WB, если её
+// делал Аргус, иначе — когда Аргус узнал об этом от WB.
+async function leftWithSupply(client, warehouseId, inv, touched) {
   const s = (await client.query(
-    `SELECT id, number, status, mp_supply_id, mp_delivered_at FROM supplies
-      WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`, [warehouseId, supplyId])).rows[0];
-  if (!s || s.status !== 'ready' || !s.mp_supply_id || !s.mp_delivered_at) return false;
+    'SELECT id, number, status, mp_delivered_at FROM supplies WHERE warehouse_id = $1 AND id = $2',
+    [warehouseId, inv.supply_id])).rows[0];
   const orders = (await client.query(
-    `SELECT id, status, mp_closed_at FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 ORDER BY id FOR UPDATE`,
-    [warehouseId, supplyId])).rows;
-  if (!orders.length || orders.some((o) => o.status !== 'ready' || o.mp_closed_at)) return false;
+    `SELECT i.id, i.status, i.mp_closed_at,
+            EXISTS (SELECT 1 FROM invoice_items ii JOIN shipping_records sr ON sr.invoice_item_id = ii.id
+                     WHERE ii.invoice_id = i.id AND sr.picked_qty > 0) AS has_picks
+       FROM invoices i WHERE i.warehouse_id = $1 AND i.supply_id = $2 ORDER BY i.id FOR UPDATE OF i`,
+    [warehouseId, s.id])).rows;
+  const whole = s.status === 'ready' && orders.every((o) => o.status === 'ready' && !o.mp_closed_at);
+  const leaving = orders.filter((o) => o.status !== 'shipped' && (whole || o.id === inv.id));
   await client.query(
-    `UPDATE supplies SET status = 'shipped', shipped_at = COALESCE(shipped_at, mp_delivered_at)
-      WHERE warehouse_id = $1 AND id = $2`, [warehouseId, supplyId]);
-  await client.query(
-    `UPDATE invoices i SET status = 'shipped', shipped_at = COALESCE(i.shipped_at, s.mp_delivered_at)
-       FROM supplies s WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND s.id = i.supply_id`,
-    [warehouseId, supplyId]);
+    `UPDATE invoices SET status = 'shipped', shipped_at = COALESCE(shipped_at, $3::timestamptz, now())
+      WHERE warehouse_id = $1 AND id = ANY($2::uuid[])`,
+    [warehouseId, leaving.map((o) => o.id), s.mp_delivered_at]);
+  await refreshSupplyStatus(client, warehouseId, s.id);
+  const t = touched.get(s.id) || { number: s.number, left: 0, unpicked: 0 };
+  t.left += leaving.length;
+  t.unpicked += leaving.filter((o) => !o.has_picks).length;
+  touched.set(s.id, t);
+}
+
+// Одна строка в журнале на поставку за проход, а не строка на заказ.
+async function reportLeft(client, warehouseId, touched) {
+  if (!touched.size) return;
   const zone = await zoneOf(client, warehouseId);
-  const at = new Date(s.mp_delivered_at).toLocaleString('ru-RU', {
-    timeZone: zone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-  await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
-    entityType: 'supply', entityId: supplyId, status: 'auto',
-    actionText: `Поставка «${s.number}» уехала — отмечено по данным WB: WB принял посылку из неё, `
-      + `а «Уехала» в Аргусе не нажали. Время отъезда — передача в доставку WB, ${at}. `
-      + `${orders.length} ${plural(orders.length, 'заказ остаётся', 'заказа остаются', 'заказов остаются')} в поставке.` });
-  return true;
+  for (const [id, t] of touched) {
+    const s = (await client.query(
+      `SELECT status, mp_delivered_at, (SELECT count(*)::int FROM invoices WHERE warehouse_id = $1 AND supply_id = $2) AS n
+         FROM supplies WHERE warehouse_id = $1 AND id = $2`, [warehouseId, id])).rows[0];
+    if (!s) continue;
+    const at = s.mp_delivered_at && new Date(s.mp_delivered_at).toLocaleString('ru-RU', {
+      timeZone: zone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    const head = s.status === 'shipped'
+      ? `Поставка «${t.number}» уехала — отмечено по данным WB: WB принял посылки из неё, а «Уехала» в Аргусе не нажали. `
+        + (at ? `Время отъезда — передача в доставку WB, ${at}. ` : '')
+        + `${s.n} ${plural(s.n, 'заказ остаётся', 'заказа остаются', 'заказов остаются')} в поставке.`
+      : `Поставка «${t.number}»: WB принял ${t.left} ${plural(t.left, 'заказ', 'заказа', 'заказов')} из неё — `
+        + `${t.left === 1 ? 'он отмечен уехавшим и остаётся' : 'они отмечены уехавшими и остаются'} в поставке. Остальные заказы ещё на складе.`;
+    const tail = t.unpicked
+      ? ` По ${t.unpicked} ${plural(t.unpicked, 'заказу', 'заказам', 'заказам')} товар собирали не в Аргусе — остаток в ячейках по ${t.unpicked === 1 ? 'нему' : 'ним'} не списан.`
+      : '';
+    await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
+      entityType: 'supply', entityId: id, status: 'auto', actionText: head + tail });
+  }
 }
 
 // Only an explicit status closes marketplace work. Absence from /orders/new is never a
@@ -111,6 +135,7 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
   // 01.10.2026: 10 тысяч строк «посылку уже принял WB» — это обычная жизнь
   // заказов, собранных без Аргуса, а не события, которые надо читать).
   const quiet = { fulfilled: 0, canceled: 0 };
+  const touched = new Map(); // поставка → сколько её заказов уехало по данным WB
   for (const candidate of selected.rows) {
     const row = byId.get(candidate.external_id);
     const valid = row && !duplicates.has(candidate.external_id) && !row.errors?.length && !row.isError
@@ -131,17 +156,14 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       WHERE i.warehouse_id=$1 AND i.company_id=$2 AND i.id=$3 FOR UPDATE OF i`,
     [warehouseId, companyId, candidate.id]);
     const inv = locked.rows[0];
-    // WB уже держит посылку из поставки, которую Аргус сам передал в доставку
-    // WB (QR получен), а «Уехала» в Аргусе не нажали. Значит, машина уехала со
-    // всей поставкой — отмечаем её уехавшей по данным WB. Раньше заказы
-    // вынимались из поставки по одному со строкой «на сверку»: 06.10.2026 так
-    // опустели шесть поставок, а в журнале встали 268 строк (владелец 07.10:
-    // поставка не должна терять содержимое).
-    if (inv && inv.status !== 'shipped' && inv.supply_id && inv.has_picks && !inv.mp_closed_at
+    // WB держит посылку заказа из поставки — заказ уехал с ней и в ней
+    // остаётся (leftWithSupply). Раньше он вынимался «на сверку», и 06.10.2026
+    // так опустели шесть поставок (268 строк в журнале).
+    if (inv && inv.status !== 'shipped' && inv.supply_id && !inv.mp_closed_at
         && !inv.mp_stock_returned_at && inv.supply_id === supplyBefore) {
       const reason = closeReason(row);
-      if (reason === 'fulfilled' && endsLocalWork(row, reason)
-          && await shipHandedOverSupply(client, warehouseId, inv.supply_id)) {
+      if (reason === 'fulfilled' && endsLocalWork(row, reason)) {
+        await leftWithSupply(client, warehouseId, inv, touched);
         inv.status = 'shipped';
       }
     }
@@ -204,6 +226,7 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       });
     }
   }
+  await reportLeft(client, warehouseId, touched);
   if (quiet.fulfilled || quiet.canceled) {
     const company = (await client.query('SELECT name FROM companies WHERE id = $1', [companyId])).rows[0]?.name || 'продавца';
     const parts = [quiet.fulfilled && `приняты WB — ${quiet.fulfilled}`, quiet.canceled && `отменены — ${quiet.canceled}`].filter(Boolean);

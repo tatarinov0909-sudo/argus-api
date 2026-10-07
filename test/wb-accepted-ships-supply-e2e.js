@@ -133,7 +133,9 @@ const check = (name, fn) => {
       assert.equal(mine.statusName, 'Принята WB');
     });
 
-    // ---------- Поставку в WB передавали не через Аргус — прежняя сверка ----------
+    // ---------- Собрали в Аргусе, в доставку передавали в кабинете WB ----------
+    // Владелец 07.10: «поставку создали через Аргус, а всё остальное — не
+    // через нас». Заказ не вынимается, поставка уезжает, сверки нет.
     const c = await order(77003);
     const local = await must('POST', '/api/supplies', token, { invoiceIds: [c.id], marketplace: 'wb',
       shipDate: '2099-12-31', shippingPointId: 100, destination: 'Пункт' }, 201);
@@ -141,17 +143,52 @@ const check = (name, fn) => {
     await pickAll(local.id, [c]);
     await poll({ 77003: { supplierStatus: 'complete', wbStatus: 'sorted' } });
     const lc = (await run((q) => q.query('SELECT status, supply_id, mp_closed_at FROM invoices WHERE id=$1', [c.id]))).rows[0];
-    const ls = (await run((q) => q.query('SELECT status FROM supplies WHERE id=$1', [local.id]))).rows[0];
+    const ls = (await run((q) => q.query('SELECT status, shipped_at FROM supplies WHERE id=$1', [local.id]))).rows[0];
     const pending = (await run((q) => q.query(
       `SELECT count(*)::int AS n FROM journal_entries WHERE warehouse_id=$1 AND agent='Обмен с WB' AND status='pending' AND invoice_id=$2`,
       [warehouseId, c.id]))).rows[0].n;
-    check('поставка не передана в WB через Аргус — сама не уезжает, заказ уходит на сверку, как раньше', () => {
-      // Опустевшая поставка без номера WB разбирается сама (state.js) — её может уже не быть.
-      assert.ok(!ls || ls.status !== 'shipped');
-      assert.equal(lc.status, 'ready');
-      assert.equal(lc.supply_id, null);
-      assert.ok(lc.mp_closed_at);
-      assert.equal(pending, 1);
+    check('передали в доставку не через Аргус — поставка всё равно уехала и не опустела, сверки нет', () => {
+      assert.equal(ls.status, 'shipped'); assert.ok(ls.shipped_at);
+      assert.equal(lc.status, 'shipped'); assert.equal(lc.supply_id, local.id); assert.ok(lc.mp_closed_at);
+      assert.equal(pending, 0);
+    });
+
+    // ---------- Создали в Аргусе, собирали и отправляли через кабинет WB ----------
+    const d = await order(77004);
+    const e = await order(77005);
+    const outside = await must('POST', '/api/supplies', token, { invoiceIds: [d.id, e.id], marketplace: 'wb',
+      shipDate: '2099-12-31', shippingPointId: 100, destination: 'Пункт' }, 201);
+    await poll({ 77004: { supplierStatus: 'complete', wbStatus: 'sorted' }, 77005: { supplierStatus: 'confirm', wbStatus: 'waiting' } });
+    const half = (await run((q) => q.query(
+      `SELECT s.status, (SELECT count(*)::int FROM invoices i WHERE i.supply_id = s.id) AS n,
+              (SELECT count(*)::int FROM invoices i WHERE i.supply_id = s.id AND i.status = 'shipped') AS gone
+         FROM supplies s WHERE s.id = $1`, [outside.id]))).rows[0];
+        check('WB принял один заказ из несобранной в Аргусе поставки — он уехал и остался в ней, второй ждёт', () => {
+      assert.equal(half.n, 2); assert.equal(half.gone, 1); assert.equal(half.status, 'collecting');
+    });
+    const twice = await api('POST', '/api/shipping', worker, { invoiceItemId: d.items[0].id, pickedQty: 1, cellBlockId: cell, isFinal: true });
+    check('уехавший заказ грузчику второй раз не собрать', () => assert.equal(twice.status, 409));
+    await poll({ 77005: { supplierStatus: 'complete', wbStatus: 'sorted' } });
+    const full = (await run((q) => q.query(
+      `SELECT s.status, (SELECT count(*)::int FROM invoices i WHERE i.supply_id = s.id) AS n FROM supplies s WHERE s.id = $1`,
+      [outside.id]))).rows[0];
+    const lines = (await run((q) => q.query(
+      `SELECT action_text, status FROM journal_entries WHERE warehouse_id = $1 AND agent = 'Обмен с WB' AND entity_id = $2 ORDER BY created_at`,
+      [warehouseId, outside.id]))).rows.filter((l) => /WB принял/.test(l.action_text));
+    const stock2 = (await must('GET', `/api/sellers/stock?companyId=${company}`, token));
+    const row2 = (stock2.rows || stock2).find((r) => r.sku === 'AC-1');
+    const sellerSupplies = await must('GET', `/api/sellers/supplies?companyId=${company}`, token);
+    const theirs = sellerSupplies.rows.find((s) => s.id === outside.id);
+    check('WB принял все — поставка уехала с обоими заказами; продавец видит 2 заказа, «В сборке» 0', () => {
+      assert.equal(full.status, 'shipped'); assert.equal(full.n, 2);
+      assert.ok(theirs, 'поставка видна продавцу'); assert.equal(theirs.orders, 2);
+      assert.equal(row2.inAssembly, 0);
+    });
+    check('журнал: по строке на проход, без «на сверку»; сказано, что собирали не в Аргусе', () => {
+      assert.equal(lines.length, 2);
+      assert.ok(lines.every((l) => l.status === 'auto'));
+      assert.ok(/уехала — отмечено по данным WB/.test(lines[1].action_text), lines[1].action_text);
+      assert.ok(/собирали не в Аргусе/.test(lines[1].action_text), lines[1].action_text);
     });
   } catch (e) {
     failed += 1; console.log('FAIL тест упал: ' + e.stack);
