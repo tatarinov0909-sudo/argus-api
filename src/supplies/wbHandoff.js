@@ -258,16 +258,40 @@ async function handOverMarked({ warehouseId, companyId, supply, orders, withTx, 
 }
 
 // Передать поставку в доставку: для площадки это «уехало».
-async function deliver({
-  warehouseId, companyId, supply, withTx, api = wbWrite, tokenFor = credentials.writeTokenFor,
-}) {
+async function deliver(args) {
+  const { warehouseId, supply, withTx } = args;
   if (!supply.mp_supply_id) return { skipped: 'no_mp_supply' };
   // Передать можно до отъезда («Передать в доставку WB», владелец 05.10.2026)
-  // и при «Уехала» — второй раз в WB не идём.
-  const fresh = (await withTx((client) => client.query(
-    `SELECT status, mp_delivered_at, to_char(ship_date, 'YYYY-MM-DD') AS ship_date FROM supplies
-      WHERE warehouse_id = $1 AND id = $2`, [warehouseId, supply.id]))).rows[0];
-  if (fresh?.mp_delivered_at) return { skipped: 'already_delivered', alreadyDelivered: true };
+  // и при «Уехала» — второй раз в WB не идём. Отметка «идёт передача»
+  // (mp_handoff_at, как у создания поставки): второе нажатие — другой
+  // человек или двойной клик — не идёт в WB, а ждёт первое (проверка 07.10, Н7).
+  let fresh = null;
+  for (let attempt = 0; !fresh; attempt += 1) {
+    const claimed = await withTx((client) => client.query(
+      `UPDATE supplies SET mp_handoff_at = now()
+        WHERE warehouse_id = $1 AND id = $2 AND mp_delivered_at IS NULL
+          AND (mp_handoff_at IS NULL OR mp_handoff_at < now() - interval '15 minutes')
+        RETURNING status, to_char(ship_date, 'YYYY-MM-DD') AS ship_date`, [warehouseId, supply.id]));
+    if (claimed.rowCount) { fresh = claimed.rows[0]; break; }
+    const cur = (await withTx((client) => client.query(
+      'SELECT mp_delivered_at FROM supplies WHERE warehouse_id = $1 AND id = $2', [warehouseId, supply.id]))).rows[0];
+    if (!cur) return { skipped: 'no_supply' };
+    if (cur.mp_delivered_at) return { skipped: 'already_delivered', alreadyDelivered: true };
+    if (attempt >= 80) return { error: 'поставку сейчас передаёт в WB другое нажатие — обновите экран через минуту' };
+    await pause(250);
+  }
+  try {
+    return await deliverClaimed({ ...args, fresh });
+  } finally {
+    await withTx((client) => client.query(
+      'UPDATE supplies SET mp_handoff_at = NULL WHERE warehouse_id = $1 AND id = $2', [warehouseId, supply.id]))
+      .catch(() => { /* отметка сама устареет через 15 минут */ });
+  }
+}
+
+async function deliverClaimed({
+  warehouseId, companyId, supply, withTx, fresh, api = wbWrite, tokenFor = credentials.writeTokenFor,
+}) {
 
   // Машина уже ушла — местную отгрузку отменять нельзя. Говорим человеку,
   // что на площадке поставка осталась несданной, и оставляем след.

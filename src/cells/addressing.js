@@ -45,6 +45,7 @@ async function setAddressStorage(client, warehouseId, on, actor = {}) {
   if (cur.rows[0].address_storage === on) return { on, moved: 0, units: 0 };
   let moved = 0;
   let units = 0;
+  let canceledTasks = 0;
   if (!on) {
     const general = await ensureGeneral(client, warehouseId);
     // Строки ячеек — под блокировку: приёмка и сборка ждут переноса.
@@ -64,6 +65,13 @@ async function setAddressStorage(client, warehouseId, on, actor = {}) {
     }
     for (const cell of new Set(rows.map((r) => r.cell_block_id))) await refreshCellFill(client, cell);
     await refreshCellFill(client, general);
+    // Незаконченный пересчёт полок теряет смысл: товар уже в «Складе», а
+    // принятый пересчёт полки лёг бы туда второй раз (проверка 07.10, Н2).
+    const dropped = await client.query(
+      `UPDATE inventory_tasks SET status = 'rejected', resolved_at = now()
+        WHERE warehouse_id = $1 AND status IN ('pending', 'waiting_owner') AND cell_block_id <> $2`,
+      [warehouseId, general]);
+    canceledTasks = dropped.rowCount;
   }
   await client.query('UPDATE warehouses SET address_storage = $2 WHERE id = $1', [warehouseId, on]);
   await journal.createEntry(client, {
@@ -71,7 +79,8 @@ async function setAddressStorage(client, warehouseId, on, actor = {}) {
     actionText: on
       ? 'Адресное хранение включено: товар снова кладут в ячейки. Лежащее в «Складе» остаётся там, пока его не разложат.'
       : `Адресное хранение выключено: весь товар (${units.toLocaleString('ru-RU')} шт.) перенесён в общее место «Склад», `
-        + 'ячейки не выбирают ни при приёмке, ни при сборке.',
+        + 'ячейки не выбирают ни при приёмке, ни при сборке.'
+        + (canceledTasks ? ` Незаконченный пересчёт ячеек отменён (${canceledTasks}) — считать теперь «Склад».` : ''),
   });
   return { on, moved, units };
 }

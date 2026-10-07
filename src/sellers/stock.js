@@ -133,14 +133,17 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            SELECT max(created_at) AS at FROM stock_operations
             WHERE company_id = $1 AND kind IN ('document_align', 'initial_load')
          ), taken_by_wb AS (
-           -- Ушло после сверки и уже не наше: принято WB из поставки или
-           -- отгружено без поставки — вручную, физлицу (владелец 06.10.2026).
+           -- Ушло после сверки и на полке его нет: принято WB из поставки,
+           -- отгружено без поставки — вручную, физлицу (владелец 06.10.2026),
+           -- или отменено WB уже после отгрузки: посылка едет назад возвратом
+           -- (проверка 07.10, Н4). Вычитается не больше, чем 1С числит сверх
+           -- полки, — вернётся возврат на полку, и вычитать станет нечего.
            SELECT ii.sku, SUM(ii.declared_qty) AS qty
            FROM invoices i
            JOIN invoice_items ii ON ii.invoice_id = i.id
            LEFT JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.source = '1c' OR i.mp_close_reason = 'fulfilled')
+             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.source = '1c' OR i.mp_close_reason IN ('fulfilled', 'canceled'))
              AND COALESCE(s.shipped_at, i.shipped_at) > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), accepted_wb AS (

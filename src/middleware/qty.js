@@ -15,10 +15,18 @@ const { HttpError } = require('./errorHandler');
 //
 // Одна функция на все входы, потому что второе такое место обязательно
 // напишут иначе.
+// Больше десяти миллионов штук в одной строке не бывает: это столбец
+// штрихкода, выбранный в Excel вместо количества (проверка 07.10, Н8). Та же
+// граница, что у привоза продавца файлом.
+const MAX_QTY = 10000000;
+
 function requireQty(value, label, { min = 0 } = {}) {
   const n = Number(value);
-  if (value === null || value === undefined || value === '' || !Number.isFinite(n)) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean' || !Number.isFinite(n)) {
     throw new HttpError(400, `${label}: нужно число`);
+  }
+  if (n > MAX_QTY) {
+    throw new HttpError(400, `${label}: больше ${MAX_QTY.toLocaleString('ru-RU')} шт. — проверьте число`);
   }
   if (n < min) {
     throw new HttpError(400, `${label}: не может быть меньше ${min}`);
@@ -36,4 +44,4 @@ function requireQty(value, label, { min = 0 } = {}) {
   return n;
 }
 
-module.exports = { requireQty };
+module.exports = { requireQty, MAX_QTY };

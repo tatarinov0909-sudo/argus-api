@@ -308,7 +308,8 @@ async function createDirect(client, warehouseId, {
   if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
   if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'Выберите хотя бы один товар');
   if (items.length > 500) throw new HttpError(400, 'В одной поставке — не больше 500 товаров');
-  const skus = items.map((it) => String(it?.sku ?? ''));
+  if (items.some((it) => !it || typeof it !== 'object')) throw new HttpError(400, 'Пустая строка товара — уберите её');
+  const skus = items.map((it) => String(it.sku ?? '').trim());
   if (new Set(skus).size !== skus.length) throw new HttpError(400, 'Товар указан дважды — оставьте одну строку');
   for (const it of items) requireQty(it.qty, `Количество «${it.sku}»`, { min: 1 });
   const company = (await client.query(
@@ -322,16 +323,19 @@ async function createDirect(client, warehouseId, {
   const missing = skus.find((sku) => !names.has(sku));
   if (missing !== undefined) throw new HttpError(400, `Товара «${missing}» нет в каталоге продавца`);
 
-  // Номер заказа — номер поставки; до его выдачи — временный.
+  // Номер заказа — номер поставки; до его выдачи — временный. Вид документа
+  // «поставка физлицу»: у заказа нет жизни без своей поставки — разобрали
+  // поставку, заказа тоже нет (проверка 07.10, Н3).
   const order = (await client.query(
-    `INSERT INTO invoices (warehouse_id, company_id, number, direction) VALUES ($1, $2, $3, 'out') RETURNING id`,
+    `INSERT INTO invoices (warehouse_id, company_id, number, direction, source_document_type)
+     VALUES ($1, $2, $3, 'out', '${DIRECT}') RETURNING id`,
     [warehouseId, companyId, `tmp-${require('crypto').randomUUID()}`],
   )).rows[0];
-  for (const it of items) {
+  for (const [i, it] of items.entries()) {
     await client.query(
       `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [order.id, warehouseId, companyId, names.get(it.sku), it.sku, Number(it.qty)],
+      [order.id, warehouseId, companyId, names.get(skus[i]), skus[i], Number(it.qty)],
     );
   }
   const hasVw = (await vwarehouses.list(client, companyId)).length > 0;
@@ -429,7 +433,9 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
   // Поставка собрана целиком — лист печатают целиком (владелец 06.10.2026):
   // что и откуда взяли, а не «идти больше некуда».
   const allPicked = bySku.size > 0 && [...bySku.values()].every((item) => item.qty <= 0);
-  if (allPicked) for (const item of bySku.values()) { item.qty = item.total; item.collected = true; }
+  // «Взять» у собранной — сколько взяли на самом деле: позицию могли закрыть
+  // с нехваткой («взяли 3 из 5»), и упаковщик искал бы недостающие (07.10, Н10).
+  if (allPicked) for (const item of bySku.values()) { item.qty = item.picked; item.collected = true; }
   else for (const [key, item] of bySku) if (item.qty <= 0) bySku.delete(key);
 
   const packing = lines.rows.map((l) => ({
@@ -997,6 +1003,8 @@ function refuseDuringHandoff(row, number) {
   }
 }
 
+const DIRECT = 'direct_supply';
+
 async function disband(client, warehouseId, supplyId, { actor }) {
   const s = await client.query(
     `SELECT id, number, status, mp_supply_id, mp_handoff_at > ${HANDOFF_STALE} AS handoff_live
@@ -1034,6 +1042,12 @@ async function disband(client, warehouseId, supplyId, { actor }) {
       + ' Сначала удалите её в кабинете WB, иначе заказы останутся числиться на сборке там.');
   }
 
+  // Заказ поставки физлицу заведён самой поставкой — в очередь ему некуда:
+  // остался бы навсегда «Заказано» у продавца и «отгрузкой» у грузчика.
+  const own = await client.query(
+    `DELETE FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 AND source_document_type = '${DIRECT}' RETURNING id`,
+    [warehouseId, supplyId],
+  );
   const freed = await client.query(
     'UPDATE invoices SET supply_id = NULL WHERE warehouse_id = $1 AND supply_id = $2 RETURNING id',
     [warehouseId, supplyId],
@@ -1045,14 +1059,16 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
-    actionText: `Поставка «${supply.number}» разобрана — ${freed.rowCount} `
-      + `${plural(freed.rowCount, 'заказ', 'заказа', 'заказов')} ${freed.rowCount === 1 ? 'вернулся' : 'вернулись'} в очередь.`,
+    actionText: own.rowCount && !freed.rowCount
+      ? `Поставка «${supply.number}» физлицу разобрана — её заказ отменён, товар снова свободен.`
+      : `Поставка «${supply.number}» разобрана — ${freed.rowCount} `
+        + `${plural(freed.rowCount, 'заказ', 'заказа', 'заказов')} ${freed.rowCount === 1 ? 'вернулся' : 'вернулись'} в очередь.`,
     entityType: 'supply',
     entityId: supplyId,
     actorType: actor?.type || 'owner',
     actorId: actor?.id || null,
   });
-  return { number: supply.number, returned: freed.rowCount };
+  return { number: supply.number, returned: freed.rowCount, canceled: own.rowCount };
 }
 
 // Убрать один заказ из поставки — обычно потому, что грузчик отметил «нет
@@ -1070,7 +1086,7 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
   // Порядок блокировок тот же, что у отбора и отгрузки: поставка, потом заказ.
   const supplyId = await lockSupplyOfInvoice(client, warehouseId, invoiceId);
   const inv = await client.query(
-    `SELECT i.id, i.number, i.status, i.supply_id, s.number AS supply_number, s.status AS supply_status,
+    `SELECT i.id, i.number, i.status, i.source_document_type, i.supply_id, s.number AS supply_number, s.status AS supply_status,
             s.mp_supply_id, s.mp_handoff_at > ${HANDOFF_STALE} AS handoff_live
        FROM invoices i LEFT JOIN supplies s ON s.id = i.supply_id
       WHERE i.warehouse_id = $1 AND i.id = $2 FOR UPDATE OF i`,
@@ -1086,6 +1102,10 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
       : `Заказ «${order.number}» уже уехал — WB принял его посылку`);
   }
   refuseDuringHandoff(order, order.supply_number);
+  if (order.source_document_type === DIRECT) {
+    throw new HttpError(409, `«${order.number}» — заказ самой поставки физлицу: отдельно его не убрать. `
+      + 'Чтобы отменить, разберите поставку.');
+  }
   // Поставка уже заведена на площадке: там заказ числится в её составе, и
   // убрать его только у себя — значит разойтись с WB.
   if (order.mp_supply_id) {

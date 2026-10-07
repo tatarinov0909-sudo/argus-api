@@ -120,7 +120,9 @@ async function cellsOf(client, companyId, sku) {
        FROM cell_stock cs
        JOIN cell_blocks cb ON cb.id = cs.cell_block_id
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
-      WHERE cs.company_id = $1 AND cs.sku = $2 AND cs.quality = 'good' AND cs.qty > 0
+      -- Минус бывает только в «Складе» (хранение выключено): он тоже то, что
+      -- числится, иначе сверка «чинила» бы плюс и не видела минуса (07.10, Н5).
+      WHERE cs.company_id = $1 AND cs.sku = $2 AND cs.quality = 'good' AND (cs.qty > 0 OR (cs.qty < 0 AND cb.general))
       -- Сверка с 1С меняет «Основной» (1С о складах Аргуса не знает): его
       -- строки — первыми, списание с других складов — только если его не
       -- хватило (виртуальные склады, 02.10.2026).
@@ -293,6 +295,7 @@ async function run(client, warehouseId, {
       const from = [];
       for (const c of cells) {
         if (!left) break;
+        if (Number(c.qty) <= 0) continue; // снимаем только то, что лежит
         const take = Math.min(left, Number(c.qty));
         from.push(`${label(c)} −${take}`);
         if (apply) {

@@ -270,6 +270,9 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
      JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
      WHERE cs.warehouse_id = $1 AND cs.sku = $2 AND cs.quality = 'good'
        AND ($4::uuid IS NULL OR cs.company_id = $4)
+       -- Хранение включено — общее место «Склад» не предлагаем: лежащее там
+       -- ждёт раскладки, новый приход — в ячейки (проверка 07.10, Н9).
+       AND NOT cb.general
      ORDER BY wr.row_num, cb.rack_start, cb.tier_start
      LIMIT $3`,
     [warehouseId, sku, limit, companyId || null],
@@ -316,7 +319,7 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        JOIN company_rows crw ON crw.row_id = wr.id
        WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone AND cb.reserved_vw_id IS NULL
-         AND cb.id <> ALL($4::uuid[])
+         AND NOT cb.general AND cb.id <> ALL($4::uuid[])
        ORDER BY crw.cells DESC, wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $3`,
       [warehouseId, companyId, limit - options.length, options.map((o) => o.blockId)],
@@ -336,7 +339,7 @@ async function suggestCells(client, warehouseId, sku, companyId = null, limit = 
        FROM cell_blocks cb
        JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id
        WHERE cb.warehouse_id = $1 AND cb.state = 'empty' AND NOT cb.defect_zone AND cb.reserved_vw_id IS NULL
-         AND cb.id <> ALL($3::uuid[])
+         AND NOT cb.general AND cb.id <> ALL($3::uuid[])
        ORDER BY wr.row_num, cb.rack_start, cb.tier_start
        LIMIT $2`,
       [warehouseId, limit - options.length, options.map((o) => o.blockId)],

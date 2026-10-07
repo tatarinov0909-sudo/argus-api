@@ -71,6 +71,10 @@ async function saveSettings(client, warehouseId, patch) {
 //
 // Свежепосчитанные исключаются целиком: смысл пересчёта в том, что он редкий.
 async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
+  // Хранение выключено — весь товар числится в «Складе», полки «числятся
+  // пустыми». Посчитанное на полке легло бы в тот же «Склад» второй раз
+  // (проверка 07.10, Н2): считаем только «Склад».
+  const addressOff = await require('../cells/addressing').isOff(client, warehouseId);
   const r = await client.query(
     `WITH last_count AS (
        -- Начальная загрузка остатков — тоже подсчёт: полку посчитали руками.
@@ -128,12 +132,13 @@ async function pickCells(client, warehouseId, { recountAfterDays, limit }) {
      LEFT JOIN shortfalls s ON s.cell_block_id = cb.id
      WHERE cb.warehouse_id = $1
        AND (lc.counted_at IS NULL OR lc.counted_at < now() - ($2 || ' days')::interval)
+       AND (NOT $4::boolean OR cb.general)
      ORDER BY COALESCE(s.n, 0) DESC,
               COALESCE(m.n, 0) DESC,
               lc.counted_at ASC NULLS FIRST,
               wr.row_num, cb.rack_start, cb.tier_start
      LIMIT $3`,
-    [warehouseId, String(recountAfterDays), limit],
+    [warehouseId, String(recountAfterDays), limit, addressOff],
   );
 
   return r.rows.map((row) => ({
@@ -479,6 +484,11 @@ async function resolveTask(client, warehouseId, taskId, { decision, ownerId, sta
 
   if (task.note) {
     throw new HttpError(409, 'Остался неуказанный товар из отметки работника. Назначьте пересчёт с выбором товара и количества');
+  }
+  if (await require('../cells/addressing').isOff(client, warehouseId)
+      && !(await client.query('SELECT general FROM cell_blocks WHERE id = $1', [task.cell_block_id])).rows[0]?.general) {
+    throw new HttpError(409, 'Адресное хранение выключено: весь товар числится в «Складе». Пересчёт отдельной ячейки '
+      + 'принять нельзя — посчитанное легло бы в «Склад» второй раз. Отклоните его и назначьте пересчёт «Склада».');
   }
   requireFresh(task, await lockCell(client, warehouseId, task.cell_block_id, true));
   const counted = await identifyCountLines(client, warehouseId,
