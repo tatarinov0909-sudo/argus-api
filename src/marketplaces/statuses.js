@@ -1,6 +1,8 @@
 const wb = require('./wb');
 const journal = require('../journal/repository');
 const { refreshSupplyStatus, lockSupplyOfInvoice } = require('../supplies/state');
+const { zoneOf } = require('../warehouses/time');
+const { plural } = require('../journal/plural');
 
 const CANCELED = new Set(['canceled', 'canceled_by_client', 'declined_by_client', 'defect', 'canceled_by_carrier']);
 // The parcel is physically with WB: at a sorting centre, a carrier or a buyer.
@@ -24,6 +26,38 @@ function endsLocalWork(row, reason) {
 function statusText(row) {
   if (!row.mp_closed_at) return null;
   return row.mp_close_reason === 'canceled' ? 'Отменён на WB' : 'Передан в доставку на WB';
+}
+
+// Поставка уехала по данным WB: то же, что кнопка «Уехала» (supplies/service
+// ship), только время отъезда — момент передачи в доставку WB, а не «сейчас»:
+// WB принял посылку часы спустя, а машина ушла сразу после передачи.
+// Только собранная поставка (все заказы собраны), которую Аргус сам передал
+// в доставку WB. Иначе — false, и заказ идёт прежней дорогой (на сверку).
+async function shipHandedOverSupply(client, warehouseId, supplyId) {
+  const s = (await client.query(
+    `SELECT id, number, status, mp_supply_id, mp_delivered_at FROM supplies
+      WHERE warehouse_id = $1 AND id = $2 FOR UPDATE`, [warehouseId, supplyId])).rows[0];
+  if (!s || s.status !== 'ready' || !s.mp_supply_id || !s.mp_delivered_at) return false;
+  const orders = (await client.query(
+    `SELECT id, status, mp_closed_at FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 ORDER BY id FOR UPDATE`,
+    [warehouseId, supplyId])).rows;
+  if (!orders.length || orders.some((o) => o.status !== 'ready' || o.mp_closed_at)) return false;
+  await client.query(
+    `UPDATE supplies SET status = 'shipped', shipped_at = COALESCE(shipped_at, mp_delivered_at)
+      WHERE warehouse_id = $1 AND id = $2`, [warehouseId, supplyId]);
+  await client.query(
+    `UPDATE invoices i SET status = 'shipped', shipped_at = COALESCE(i.shipped_at, s.mp_delivered_at)
+       FROM supplies s WHERE i.warehouse_id = $1 AND i.supply_id = $2 AND s.id = i.supply_id`,
+    [warehouseId, supplyId]);
+  const zone = await zoneOf(client, warehouseId);
+  const at = new Date(s.mp_delivered_at).toLocaleString('ru-RU', {
+    timeZone: zone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  await journal.createEntry(client, { warehouseId, agent: 'Обмен с WB', actorType: 'system',
+    entityType: 'supply', entityId: supplyId, status: 'auto',
+    actionText: `Поставка «${s.number}» уехала — отмечено по данным WB: WB принял посылку из неё, `
+      + `а «Уехала» в Аргусе не нажали. Время отъезда — передача в доставку WB, ${at}. `
+      + `${orders.length} ${plural(orders.length, 'заказ остаётся', 'заказа остаются', 'заказов остаются')} в поставке.` });
+  return true;
 }
 
 // Only an explicit status closes marketplace work. Absence from /orders/new is never a
@@ -97,6 +131,20 @@ async function reconcile(client, warehouseId, companyId, token, { fetchStatuses 
       WHERE i.warehouse_id=$1 AND i.company_id=$2 AND i.id=$3 FOR UPDATE OF i`,
     [warehouseId, companyId, candidate.id]);
     const inv = locked.rows[0];
+    // WB уже держит посылку из поставки, которую Аргус сам передал в доставку
+    // WB (QR получен), а «Уехала» в Аргусе не нажали. Значит, машина уехала со
+    // всей поставкой — отмечаем её уехавшей по данным WB. Раньше заказы
+    // вынимались из поставки по одному со строкой «на сверку»: 06.10.2026 так
+    // опустели шесть поставок, а в журнале встали 268 строк (владелец 07.10:
+    // поставка не должна терять содержимое).
+    if (inv && inv.status !== 'shipped' && inv.supply_id && inv.has_picks && !inv.mp_closed_at
+        && !inv.mp_stock_returned_at && inv.supply_id === supplyBefore) {
+      const reason = closeReason(row);
+      if (reason === 'fulfilled' && endsLocalWork(row, reason)
+          && await shipHandedOverSupply(client, warehouseId, inv.supply_id)) {
+        inv.status = 'shipped';
+      }
+    }
     if (inv && inv.status === 'shipped' && inv.supply_id && !inv.mp_closed_at && !inv.mp_stock_returned_at) {
       // В пути. «Передан в доставку» — посылка ещё едет; закрываем, только
       // когда она у WB (отсортирована и дальше) или заказ отменён.
