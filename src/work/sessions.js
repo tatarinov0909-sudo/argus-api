@@ -204,6 +204,8 @@ function view(row, staffKeyId) {
     comment: row.comment,
     commentAt: row.comment_at,
     workMs: workMs(row),
+    eventSequence: Number(row.event_sequence || 0),
+    lastEventAt: row.last_event_at || row.started_at,
   };
 }
 
@@ -213,33 +215,34 @@ async function workerName(client, staffKeyId) {
 }
 
 // Закрыть заход: пауза, если шла, досчитывается в общее время паузы.
-async function closeRow(client, row, status, comment = '') {
+async function closeRow(client, row, status, comment = '', endedAt = null) {
   const r = await client.query(
     `UPDATE work_sessions
         SET status = $2,
             paused_ms = paused_ms + CASE WHEN paused_at IS NULL THEN 0
-                          ELSE GREATEST(0, (EXTRACT(EPOCH FROM (now() - paused_at)) * 1000)::bigint) END,
-            paused_at = NULL, pause_reason = NULL, ended_at = now(),
+                          ELSE GREATEST(0, (EXTRACT(EPOCH FROM (COALESCE($4::timestamptz, now()) - paused_at)) * 1000)::bigint) END,
+            paused_at = NULL, pause_reason = NULL, ended_at = COALESCE($4::timestamptz, now()), last_event_at = COALESCE($4::timestamptz, now()),
             comment = COALESCE(NULLIF($3, ''), comment),
             comment_at = CASE WHEN $3 <> '' THEN now() ELSE comment_at END,
             updated_at = now()
       WHERE id = $1 RETURNING *`,
-    [row.id, status, comment],
+    [row.id, status, comment, endedAt],
   );
   return r.rows[0];
 }
 
-async function resumeRow(client, row, comment = '') {
+async function resumeRow(client, row, comment = '', at = null) {
   const r = await client.query(
     `UPDATE work_sessions
         SET status = 'active',
-            paused_ms = paused_ms + GREATEST(0, (EXTRACT(EPOCH FROM (now() - paused_at)) * 1000)::bigint),
+            paused_ms = paused_ms + GREATEST(0, (EXTRACT(EPOCH FROM (COALESCE($3::timestamptz, now()) - paused_at)) * 1000)::bigint),
             paused_at = NULL, pause_reason = NULL,
+            last_event_at = COALESCE($3::timestamptz, now()),
             comment = COALESCE(NULLIF($2, ''), comment),
             comment_at = CASE WHEN $2 <> '' THEN now() ELSE comment_at END,
             updated_at = now()
       WHERE id = $1 RETURNING *`,
-    [row.id, comment],
+    [row.id, comment, at],
   );
   return r.rows[0];
 }
@@ -354,7 +357,7 @@ function createWork(kind) {
   // на окне «Закончить сборку» с комментарием, и чужой список не должен
   // закрывать работу у него из-под рук. force — без этой отсрочки: последняя
   // позиция прихода (та же транзакция) и выход самого грузчика.
-  async function settle(client, warehouseId, docIds = null, { force = false } = {}) {
+  async function settle(client, warehouseId, docIds = null, { force = false, completionEvent = null } = {}) {
     const ids = docIds ? [...new Set(docIds.filter(Boolean))] : null;
     if (ids && !ids.length) return [];
     const stuck = await client.query(
@@ -371,7 +374,9 @@ function createWork(kind) {
       if (!doc || !T.isFinal(doc)) continue;
       const cur = await latest(client, warehouseId, id);
       if (!isLive(cur)) continue;
-      const row = await closeRow(client, cur, 'finished');
+      const endedAt = completionEvent?.sessionId === cur.id && completionEvent.workerKeyId === cur.worker_key_id
+        ? completionEvent.occurredAt : null;
+      const row = await closeRow(client, cur, 'finished', '', endedAt);
       const minutes = Math.max(1, Math.round(workMs(row) / 60000));
       const taken = T.takenText(await progressOf(client, warehouseId, id));
       // Запись — от имени того, чей был заход: в журнале это его работа.
@@ -451,38 +456,65 @@ function createWork(kind) {
   // последнего изменения захода и позже «сейчас» оно не бывает.
   async function pauseOrResume(client, warehouseId, staffKeyId, id, {
     reason = '', resumed = false, exit = false, comment = '', at = null,
+    workSessionId = null, eventAt = null, eventSequence = null,
   } = {}) {
     const note = cleanComment(comment);
     if (!UUID.test(String(id || ''))) return null;
     const doc = await T.find(client, warehouseId, id, true);
-    if (!doc) return null;
+    if (!doc) {
+      if (workSessionId) throw new HttpError(409, 'Документ работы больше недоступен', { code: 'work_session_changed' });
+      return null;
+    }
     // Работа уже сделана — не пауза, а конец захода.
     if (T.isFinal(doc)) await settle(client, warehouseId, [doc.id], { force: true });
     const cur = await latest(client, warehouseId, doc.id);
+    // A queued final placement can finish this exact session before its queued
+    // background event arrives. Acknowledge it without pausing another session.
+    if (workSessionId && cur?.id === workSessionId && cur.worker_key_id === staffKeyId && cur.status === 'finished' && T.isFinal(doc)) {
+      return { entry: { repeated: true, ignored: 'work_finished' }, state: await stateOf(client, warehouseId, doc, staffKeyId) };
+    }
+    if (workSessionId && (!isLive(cur) || cur.id !== workSessionId || cur.worker_key_id !== staffKeyId)) {
+      throw new HttpError(409, 'Этот заход работы уже завершён или передан — сверьте сохранённую паузу', { code: 'work_session_changed' });
+    }
     if (!isLive(cur) || cur.worker_key_id !== staffKeyId) return null;
+    let occurredAt = null;
+    if (workSessionId) {
+      const timestamp = typeof eventAt === 'string' ? Date.parse(eventAt) : NaN;
+      if (!Number.isSafeInteger(eventSequence) || eventSequence !== Number(cur.event_sequence || 0) + 1) {
+        throw new HttpError(409, 'Порядок событий работы изменился — сверьте сохранённые действия', { code: 'work_event_order', eventSequence: Number(cur.event_sequence || 0) });
+      }
+      if (!Number.isFinite(timestamp) || timestamp < new Date(cur.last_event_at || cur.started_at).getTime() || timestamp > Date.now() + 60000) {
+        throw new HttpError(409, 'Время события не совпадает с текущим заходом работы', { code: 'work_event_time' });
+      }
+      if ((resumed && cur.status !== 'paused') || (!resumed && cur.status !== 'active')) {
+        throw new HttpError(409, 'Состояние работы изменилось — сверьте сохранённую паузу', { code: 'work_event_state' });
+      }
+      occurredAt = new Date(Math.min(timestamp, Date.now())).toISOString();
+    }
     const name = await workerName(client, staffKeyId);
     const taken = T.takenText(await progressOf(client, warehouseId, doc.id));
     let text = null;
 
     if (resumed) {
       if (cur.status === 'paused') {
-        const pausedFor = Date.now() - new Date(cur.paused_at).getTime();
+        const pausedFor = (occurredAt ? Date.parse(occurredAt) : Date.now()) - new Date(cur.paused_at).getTime();
         const why = cur.pause_reason || reason;
-        await resumeRow(client, cur, note);
+        await resumeRow(client, cur, note, occurredAt);
         text = T.text.resumed(name, doc, pausedFor, why, taken);
       }
     } else if (cur.status === 'active') {
       const why = exit ? T.exitReason : reason;
-      const left = exit && at && !Number.isNaN(new Date(at).getTime()) ? new Date(at) : null;
+      const left = occurredAt ? new Date(occurredAt) : exit && at && !Number.isNaN(new Date(at).getTime()) ? new Date(at) : null;
       const paused = (await client.query(
         `UPDATE work_sessions
-            SET status = 'paused', paused_at = GREATEST(updated_at, LEAST(now(), COALESCE($4::timestamptz, now()))),
+            SET status = 'paused', paused_at = GREATEST(CASE WHEN $5 THEN started_at ELSE updated_at END, LEAST(now(), COALESCE($4::timestamptz, now()))),
+                last_event_at = GREATEST(CASE WHEN $5 THEN started_at ELSE updated_at END, LEAST(now(), COALESCE($4::timestamptz, now()))),
                 pause_reason = $2,
                 comment = COALESCE(NULLIF($3, ''), comment),
                 comment_at = CASE WHEN $3 <> '' THEN now() ELSE comment_at END,
                 updated_at = now()
           WHERE id = $1 RETURNING paused_at`,
-        [cur.id, why, note, left ? left.toISOString() : null],
+        [cur.id, why, note, left ? left.toISOString() : null, Boolean(occurredAt)],
       )).rows[0];
       // Ушёл заметно раньше, чем об этом узнал сервер, — время ухода в тексте.
       const when = Date.now() - new Date(paused.paused_at).getTime() > 60000
@@ -496,6 +528,12 @@ function createWork(kind) {
         [cur.id, note],
       );
       text = T.text.commented(name, doc, taken);
+    }
+    if (occurredAt) {
+      await client.query('UPDATE work_sessions SET event_sequence = $2 WHERE id = $1', [cur.id, eventSequence]);
+      if (Date.now() - Date.parse(occurredAt) > 60000 && text) {
+        text += ` Событие получено с задержкой; время на устройстве: ${occurredAt}.`;
+      }
     }
     const made = text
       ? await entry(client, warehouseId, staffKeyId, doc, withComment(text, note), 'worker_pause')

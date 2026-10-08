@@ -34,7 +34,10 @@ function createApp() {
 
   // X-Argus-Token — продлённый вход (см. renewIfOld): без expose браузер
   // спрячет заголовок от страницы.
-  app.use(cors({ origin: process.env.CORS_ORIGIN?.split(',') ?? true, exposedHeaders: ['X-Argus-Token'] }));
+  const configuredOrigins = process.env.CORS_ORIGIN?.split(',').map((origin) => origin.trim()).filter(Boolean);
+  // Capacitor serves the packaged Android client from this exact HTTPS origin.
+  const origins = configuredOrigins ? [...new Set([...configuredOrigins, 'https://localhost'])] : true;
+  app.use(cors({ origin: origins, exposedHeaders: ['X-Argus-Token', 'X-Argus-Operation-Replayed'] }));
   // Ответы API браузер не хранит (27.09.2026). Раньше он отвечал «не
   // изменилось» (304) из своего кэша и отдавал странице вместе с телом старые
   // заголовки — в том числе продлённый вход ДРУГОГО человека, работавшего в
@@ -79,6 +82,7 @@ function createApp() {
   app.use('/api/dropzones', dropzoneRoutes);
   app.use('/api/products', productRoutes);
   app.use('/api/invoices', invoiceRoutes);
+  app.use('/api/worker', require('./worker/routes'));
   app.use('/api/receiving', receivingRoutes);
   app.use('/api/shipping', shippingRoutes);
   app.use('/api/kits', kitRoutes);
