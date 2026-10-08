@@ -108,16 +108,16 @@ const MAPPED_SQL = `EXISTS (SELECT 1 FROM products p
 
 // Заказ, который склад физически не соберёт: товара нет в номенклатуре, или
 // у заказа с площадки нет номера отправления. Номер спрашиваем только
-// у площадочных заказов — у накладной из 1С его не бывает и быть не должно,
-// и требовать его значило бы запретить поставку по обычной накладной.
+// у площадочных заказов — у накладной из 1С и заказа физлицу его не бывает
+// и быть не должно.
 const UNPICKABLE_SQL = `NOT ${MAPPED_SQL}
-   OR (i.source <> '1c' AND ii.mp_rid IS NULL)`;
+   OR (i.source NOT IN ('1c', 'direct') AND ii.mp_rid IS NULL)`;
 
 // Заказ, который уже подтвердили в кабинете WB, минуя Аргус: для площадки он
 // «на сборке», его собирают по её поставке. Взять его в поставку Аргуса —
 // значит собрать один заказ дважды. Так в ПС-1409-01 попали шесть заказов,
 // которых продавец не нашёл среди новых на WB.
-const WB_CONFIRMED_SQL = `(i.source <> '1c' AND i.mp_supplier_status IS NOT NULL
+const WB_CONFIRMED_SQL = `(i.source NOT IN ('1c', 'direct') AND i.mp_supplier_status IS NOT NULL
    AND i.mp_supplier_status <> 'new')`;
 
 // Собрать поставку из заказов.
@@ -164,13 +164,14 @@ async function create(client, warehouseId, {
   if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
     throw new HttpError(400, 'Не указано ни одного заказа');
   }
-  const destination = cleanDestination(rawDestination);
+  let destination = cleanDestination(rawDestination);
   const shipDate = cleanShipDate(rawShipDate, await warehouseToday(client, warehouseId));
   const shippingPointId = cleanShippingPoint(rawPoint);
 
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
             i.source, i.external_id, c.name AS company_name, i.mp_warehouse_id,
+            d.virtual_warehouse_id AS direct_vw, d.recipient || ', ' || d.address AS direct_to,
             (SELECT w.name FROM seller_wb_warehouses w WHERE w.company_id = i.company_id
                AND w.mp_warehouse_id = i.mp_warehouse_id) AS mp_warehouse_name,
             ${WB_CONFIRMED_SQL} AS wb_confirmed,
@@ -179,6 +180,7 @@ async function create(client, warehouseId, {
                          WHERE ii.invoice_id = i.id
                            AND (${UNPICKABLE_SQL}))) AS has_unpickable
        FROM invoices i JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+       LEFT JOIN direct_orders d ON d.invoice_id = i.id
       WHERE i.warehouse_id = $1 AND i.id = ANY($2::uuid[]) ORDER BY i.id FOR UPDATE OF i`,
     [warehouseId, invoiceIds],
   );
@@ -225,6 +227,25 @@ async function create(client, warehouseId, {
       `${unpickable.length} ${plural(unpickable.length, 'заказ', 'заказа', 'заказов')} нельзя собрать: `
       + 'товар не сопоставлен с номенклатурой склада или нет номера отправления. '
       + `Например «${unpickable[0].number}». Такие заказы остаются в очереди.`);
+  }
+
+  // Заказы физлицам (08.10.2026) — своей поставкой, не на площадку: склад
+  // продавца выбран в самом заказе, точка — его получатель.
+  const direct = orders.rows.filter((o) => o.source === 'direct');
+  if (direct.length && direct.length < orders.rows.length) {
+    throw new HttpError(400, 'Заказы физлицам и заказы площадок — в разные поставки');
+  }
+  if (direct.length) {
+    const vws = [...new Set(direct.map((o) => o.direct_vw || ''))];
+    if (vws.length > 1) {
+      throw new HttpError(400, 'Выбраны заказы физлицам с разных складов продавца — составьте поставку на каждый склад');
+    }
+    marketplace = null;
+    virtualWarehouseId = vws[0] || ((await vwarehouses.list(client, companies[0])).length ? 'all' : null);
+    if (!destination) {
+      destination = (direct.length === 1 ? direct[0].direct_to
+        : `Физлицам: ${direct.length} ${plural(direct.length, 'заказ', 'заказа', 'заказов')}`).slice(0, 120);
+    }
   }
 
   // Склад поставки. На WB — только «Основной» и склады WB (вопросы 10–11);
@@ -296,20 +317,9 @@ async function create(client, warehouseId, {
   };
 }
 
-// Поставка физлицу — или любая отгрузка не на маркетплейс (владелец
-// 06.10.2026): «Поставки» → «Новая поставка» → товары продавца → «Куда /
-// кому». Одним шагом: заказ на отгрузку с выбранными товарами и поставка из
-// него. Дальше обычная сборка, «Уехала» — без QR WB: поставка не на WB.
-// Собирают из всего товара продавца, как и выбирают.
-async function createDirect(client, warehouseId, {
-  companyId, items, destination: rawDestination = null, shipDate = null, actor, requestId = null,
-}) {
-  if (requestId !== null && requestId !== undefined
-      && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(requestId))) {
-    throw new HttpError(400, 'Неверный номер операции');
-  }
-  const destination = cleanDestination(rawDestination);
-  if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
+// Товары отгрузки не с площадки (поставка и заказ физлицу): из каталога
+// продавца, без повторов, количество — целое от 1.
+async function cleanItems(client, warehouseId, companyId, items) {
   if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'Выберите хотя бы один товар');
   if (items.length > 500) throw new HttpError(400, 'В одной поставке — не больше 500 товаров');
   if (items.some((it) => !it || typeof it !== 'object')) throw new HttpError(400, 'Пустая строка товара — уберите её');
@@ -326,6 +336,35 @@ async function createDirect(client, warehouseId, {
   )).rows.map((p) => [p.sku, p.name]));
   const missing = skus.find((sku) => !names.has(sku));
   if (missing !== undefined) throw new HttpError(400, `Товара «${missing}» нет в каталоге продавца`);
+  return items.map((it, i) => ({ sku: skus[i], name: names.get(skus[i]), qty: Number(it.qty) }));
+}
+
+async function insertLines(client, warehouseId, companyId, invoiceId, lines, vwId) {
+  for (const l of lines) {
+    await client.query(
+      `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty, virtual_warehouse_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [invoiceId, warehouseId, companyId, l.name, l.sku, l.qty, vwId],
+    );
+  }
+}
+
+// Поставка физлицу — или любая отгрузка не на маркетплейс (владелец
+// 06.10.2026): «Поставки» → «Новая поставка» → товары продавца → «Куда /
+// кому». Одним шагом: заказ на отгрузку с выбранными товарами и поставка из
+// него. Дальше обычная сборка, «Уехала» — без QR WB: поставка не на WB.
+// Собирают из всего товара продавца, как и выбирают.
+async function createDirect(client, warehouseId, {
+  companyId, items, destination: rawDestination = null, shipDate = null, actor, requestId = null,
+}) {
+  if (requestId !== null && requestId !== undefined
+      && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(requestId))) {
+    throw new HttpError(400, 'Неверный номер операции');
+  }
+  const destination = cleanDestination(rawDestination);
+  if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
+  const lines = await cleanItems(client, warehouseId, companyId, items);
+  const skus = lines.map((l) => l.sku);
 
   // Повтор того же окна — та же поставка, а не вторая (проверка 07.10,
   // замечание 2). Два одновременных запроса встают в очередь на замке.
@@ -347,19 +386,19 @@ async function createDirect(client, warehouseId, {
 
   // Номер заказа — номер поставки; до его выдачи — временный. Вид документа
   // «поставка физлицу»: у заказа нет жизни без своей поставки — разобрали
-  // поставку, заказа тоже нет (проверка 07.10, Н3).
+  // поставку, заказа тоже нет (проверка 07.10, Н3). Сам заказ — заказ
+  // физлицу (08.10.2026), получатель — «куда / кому» поставки.
   const order = (await client.query(
-    `INSERT INTO invoices (warehouse_id, company_id, number, direction, source_document_type)
-     VALUES ($1, $2, $3, 'out', '${DIRECT}') RETURNING id`,
+    `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, source_document_type)
+     VALUES ($1, $2, $3, 'out', 'direct', '${DIRECT}') RETURNING id`,
     [warehouseId, companyId, `tmp-${require('crypto').randomUUID()}`],
   )).rows[0];
-  for (const [i, it] of items.entries()) {
-    await client.query(
-      `INSERT INTO invoice_items (invoice_id, warehouse_id, company_id, name, sku, declared_qty)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [order.id, warehouseId, companyId, names.get(skus[i]), skus[i], Number(it.qty)],
-    );
-  }
+  await insertLines(client, warehouseId, companyId, order.id, lines, null);
+  await client.query(
+    `INSERT INTO direct_orders (invoice_id, warehouse_id, company_id, recipient, address, planned_date, created_role, request_id)
+     VALUES ($1, $2, $3, $4, $4, $5, $6, $7)`,
+    [order.id, warehouseId, companyId, destination, shipDate || null, actor?.type === 'manager' ? 'manager' : 'owner', requestId || null],
+  );
   const hasVw = (await vwarehouses.list(client, companyId)).length > 0;
   const supply = await create(client, warehouseId, {
     invoiceIds: [order.id], destination, shipDate, actor, virtualWarehouseId: hasVw ? 'all' : null,
@@ -412,8 +451,11 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
             EXISTS (SELECT 1 FROM journal_entries je
                      WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
                        AND je.entity_type = 'invoice_item' AND je.entity_id = ii.id
-                       AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS missing_marked
+                       AND NOT EXISTS (SELECT 1 FROM journal_entries a WHERE a.related_entry_id = je.id)) AS missing_marked,
+            -- Заказ физлицу: кому и куда — упаковщику на лист (08.10.2026).
+            d.recipient, d.address, d.phone, d.delivery_service, d.track_number, d.comment AS direct_comment
        FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+       LEFT JOIN direct_orders d ON d.invoice_id = i.id
        ${productCodesJoin('ii.warehouse_id', 'ii.company_id', 'ii.sku')}
        -- Фото товара с площадки: по нему кладовщик узнаёт товар на полке
        -- быстрее, чем по названию. Нет фото — колонки на листе просто нет.
@@ -479,6 +521,10 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
     stickerHead: l.sticker_head || null,
     stickerTail: l.sticker_tail || null,
     qty: Number(l.declared_qty),
+    ...(l.recipient ? { to: {
+      recipient: l.recipient, address: l.address, phone: l.phone, service: l.delivery_service,
+      track: l.track_number, comment: l.direct_comment,
+    } } : {}),
   }));
 
   // Где это лежит. Без ячеек лист комплектации — это список покупок без
@@ -909,8 +955,12 @@ async function pendingOrders(client, warehouseId, companyId) {
             CASE WHEN ii.id IS NULL THEN 0 ELSE ${LEFT_TO_PICK_SQL} END AS left_to_pick,
             NOT (${UNPICKABLE_SQL}) AS pickable,
             ${MAPPED_SQL} AS mapped,
-            ${WB_CONFIRMED_SQL} AS wb_confirmed
+            ${WB_CONFIRMED_SQL} AS wb_confirmed,
+            d.recipient, d.address, d.phone, d.delivery_service, to_char(d.planned_date, 'YYYY-MM-DD') AS planned_date,
+            d.comment AS direct_comment, d.created_role, d.virtual_warehouse_id AS direct_vw, dv.name AS direct_vw_name
        FROM invoices i
+       LEFT JOIN direct_orders d ON d.invoice_id = i.id
+       LEFT JOIN virtual_warehouses dv ON dv.id = d.virtual_warehouse_id
        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
        LEFT JOIN seller_wb_warehouses w ON w.warehouse_id = i.warehouse_id
              AND w.company_id = i.company_id AND w.mp_warehouse_id = i.mp_warehouse_id
@@ -930,7 +980,10 @@ async function pendingOrders(client, warehouseId, companyId) {
   // знает — считаем по складам, с которых его можно собрать на WB
   // («Основной» и склады WB); отгрузка из 1С — по своему складу.
   const wbVw = (await vwarehouses.wbChoices(client, companyId)).map((c) => c.id || '');
-  const vwsOf = (x) => (x.marketplace === '1c' ? [x.vw || ''] : wbVw);
+  // Заказ физлицу — со склада, выбранного в заказе; «весь товар» — с любого.
+  const anyVw = [''].concat((await vwarehouses.list(client, companyId)).map((w) => w.id));
+  const vwsOf = (x) => (x.marketplace === '1c' ? [x.vw || '']
+    : x.marketplace === 'direct' ? (x.direct_vw ? [x.direct_vw] : anyVw) : wbVw);
   const keys = (x) => vwsOf(x).map((v) => `${companyId}|${x.sku}|${v}`);
   const sumOf = (map, x) => keys(x).reduce((n, k) => n + (map.get(k) || 0), 0);
   const takeAny = (x, need) => {
@@ -1011,6 +1064,12 @@ async function pendingOrders(client, warehouseId, companyId) {
     // нужно этим заказам и сколько уже ждут собираемые поставки; stockLevel —
     // none (нет совсем), short (меньше нужного), ok. У несопоставленного — null.
     ...stockOf(x),
+    // Заказ физлицу (08.10.2026): кому и куда — их видят склад и продавец.
+    ...(x.marketplace === 'direct' ? { direct: {
+      recipient: x.recipient, address: x.address, phone: x.phone, deliveryService: x.delivery_service,
+      plannedDate: x.planned_date, comment: x.direct_comment, fromSeller: x.created_role === 'seller',
+      vwName: x.direct_vw ? x.direct_vw_name : null,
+    } } : {}),
   }));
 }
 
@@ -1219,4 +1278,5 @@ async function removeOrder(client, warehouseId, invoiceId, { actor, canResolveSh
 
 module.exports = {
   create, createDirect, contents, ship, list, pendingByCompany, pendingOrders, disband, removeOrder, stockCover, STATUS_NAMES,
+  cleanItems, insertLines, cleanShipDate,
 };

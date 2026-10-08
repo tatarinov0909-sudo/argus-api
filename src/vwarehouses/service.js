@@ -282,7 +282,7 @@ async function transferable(client, companyId, sku, vwId) {
           LEFT JOIN LATERAL (SELECT SUM(sr.picked_qty) AS picked FROM shipping_records sr WHERE sr.invoice_item_id = ii.id) p ON true
          WHERE ii.company_id = $1 AND ii.sku = $2 AND i.direction = 'out'
            AND i.status IN ('open', 'in_progress') AND i.mp_closed_at IS NULL
-           AND (i.supply_id IS NOT NULL OR i.source = '1c')
+           AND (i.supply_id IS NOT NULL OR i.source = '1c' OR (i.source = 'direct' AND ii.virtual_warehouse_id IS NOT NULL))
            AND NOT EXISTS (SELECT 1 FROM shipping_records f WHERE f.invoice_item_id = ii.id AND f.is_final)
            AND ii.virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid) AS to_pick,
        -- Обещано переносу, который грузчик ещё перекладывает (проверка 03.10.2026).
@@ -537,14 +537,15 @@ async function markSeen(client, companyId, ids = null) {
 // Заказ ушёл из поставки (убрали, разобрали поставку): склад его строк
 // снимается — у заказа вне поставки склада нет, он появится со следующей
 // поставкой. Строки, по которым уже отбирали, остаются со своим складом:
-// взятое с полки числится за ним. Отгрузки из 1С склад держат свой.
+// взятое с полки числится за ним. Отгрузки из 1С и заказы физлицам склад
+// держат свой — его выбрали в самом заказе.
 async function releaseOrders(client, warehouseId, invoiceIds) {
   if (!invoiceIds || !invoiceIds.length) return;
   await client.query(
     `UPDATE invoice_items ii SET virtual_warehouse_id = NULL
       WHERE ii.warehouse_id = $1 AND ii.invoice_id = ANY($2::uuid[]) AND ii.virtual_warehouse_id IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM shipping_records sr WHERE sr.invoice_item_id = ii.id)
-        AND EXISTS (SELECT 1 FROM invoices i WHERE i.id = ii.invoice_id AND i.source IS DISTINCT FROM '1c')`,
+        AND EXISTS (SELECT 1 FROM invoices i WHERE i.id = ii.invoice_id AND i.source NOT IN ('1c', 'direct'))`,
     [warehouseId, invoiceIds]);
 }
 

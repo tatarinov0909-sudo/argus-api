@@ -24,8 +24,8 @@ router.get('/', requireAuth, async (req, res, next) => {
       throw new HttpError(400, 'direction может быть только in, out или return');
     }
     // ?source=1c — отгрузки вручную и из 1С без тысяч заказов WB (владелец 05.10.2026).
-    if (source && !['1c', 'wb', 'ozon'].includes(source)) {
-      throw new HttpError(400, 'source может быть только 1c, wb или ozon');
+    if (source && !['1c', 'wb', 'ozon', 'direct'].includes(source)) {
+      throw new HttpError(400, 'source может быть только 1c, wb, ozon или direct');
     }
     const rows = await withTenantContext(ctx, async (client) => {
       const result = await client.query(

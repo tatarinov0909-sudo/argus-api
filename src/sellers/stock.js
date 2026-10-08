@@ -14,7 +14,7 @@ const DEMAND_SQL = `(i.status <> 'shipped'
 // «В пути» (владелец 26.09.2026): уехало поставкой на WB, WB ещё не принял.
 // Заказ не с площадки (физлицу, из 1С) WB не примет никогда — уехал, и всё
 // (владелец 06.10.2026), иначе висел бы «В пути» вечно.
-const TRANSIT_SQL = `(i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.source <> '1c' AND i.mp_closed_at IS NULL)`;
+const TRANSIT_SQL = `(i.status = 'shipped' AND i.supply_id IS NOT NULL AND i.source NOT IN ('1c', 'direct') AND i.mp_closed_at IS NULL)`;
 // Под каким числом у продавца стоит строка заказа: ordered | assembly | transit | null.
 const BUCKET_SQL = `CASE WHEN ${TRANSIT_SQL} THEN 'transit'
                          WHEN ${DEMAND_SQL} THEN CASE WHEN ${IN_ASSEMBLY_SQL} THEN 'assembly' ELSE 'ordered' END
@@ -143,7 +143,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
            JOIN invoice_items ii ON ii.invoice_id = i.id
            LEFT JOIN supplies s ON s.id = i.supply_id
            WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
-             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.source = '1c' OR i.mp_close_reason IN ('fulfilled', 'canceled'))
+             AND i.status = 'shipped' AND (i.supply_id IS NULL OR i.source IN ('1c', 'direct') OR i.mp_close_reason IN ('fulfilled', 'canceled'))
              AND COALESCE(s.shipped_at, i.shipped_at) > (SELECT at FROM aligned)
            GROUP BY ii.sku
          ), accepted_wb AS (
@@ -350,7 +350,9 @@ async function loadSplit(client, companyId) {
        UNION ALL
        SELECT ii.sku, ii.virtual_warehouse_id, 0, 0, 0, SUM(ii.declared_qty)
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
-        WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out' AND ${DEMAND_SQL} AND ${IN_ASSEMBLY_SQL}
+        WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out' AND ${DEMAND_SQL}
+          -- Заказ физлицу со своего склада обещан этому складу сразу, ещё до поставки.
+          AND (${IN_ASSEMBLY_SQL} OR (i.source = 'direct' AND ii.virtual_warehouse_id IS NOT NULL))
         GROUP BY ii.sku, ii.virtual_warehouse_id
      ) x GROUP BY sku, vw`, [companyId]);
   const map = new Map();

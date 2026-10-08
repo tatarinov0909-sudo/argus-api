@@ -395,7 +395,7 @@ function invoiceStatusLabel(row) {
   // Заказ WB, который менеджер ещё не положил в поставку, — не «не начатая
   // отгрузка»: склад его и не должен начинать.
   if (row.status === 'open' && row.direction === 'out' && row.source !== '1c' && !row.supply_id && !row.mp_closed_at) {
-    return 'заказан на WB, в поставку ещё не взят';
+    return row.source === 'direct' ? 'заказ физлицу, в поставку ещё не взят' : 'заказан на WB, в поставку ещё не взят';
   }
   if (row.status === 'shipped') return row.mp_close_reason === 'canceled'
     ? 'отгружен со склада; позднее отменён на WB' : STATUS_LABEL.shipped;

@@ -10,6 +10,7 @@ const defectsService = require('../defects/service');
 const billingService = require('../billing/service');
 
 const { loadStock, BUCKET_SQL, summarize, stockBySeller } = require('./stock');
+const { DIRECT_FIELDS } = require('../directOrders/service');
 const { readPage, loadHistory } = require('./history');
 const { prepareInventoryExport } = require('./export');
 const { combineCatalog } = require('./catalog');
@@ -107,7 +108,7 @@ router.get('/supplies', requireAuth, requireRole('seller', 'owner', 'manager'), 
                 count(DISTINCT i.id) FILTER (WHERE i.status = 'shipped' AND i.mp_closed_at IS NULL)::int AS orders_in_transit,
                 COALESCE(sum(ii.declared_qty), 0)::int AS units,
                 count(DISTINCT i.id) FILTER (WHERE i.status IN ('ready', 'shipped'))::int AS orders_ready,
-                bool_or(i.source_document_type = 'direct_supply') AS direct
+                bool_or(i.source = 'direct') AS direct
            FROM supplies s
            JOIN invoices i ON i.supply_id = s.id AND i.company_id = $1
            JOIN invoice_items ii ON ii.invoice_id = i.id
@@ -293,8 +294,10 @@ router.get('/profile', requireAuth, requireRole('seller', 'owner', 'manager'), a
     // Название склада — в шапке кабинета продавца («Восход · фулфилмент»).
     // Строку склада продавцу читать нельзя, поэтому берём её в контексте склада.
     const wh = await withTenantContext({ warehouseId: profile.warehouseId },
-      (c) => c.query('SELECT name, timezone FROM warehouses WHERE id = $1', [profile.warehouseId]));
+      (c) => c.query('SELECT name, timezone, sellers_direct_orders FROM warehouses WHERE id = $1', [profile.warehouseId]));
     profile.warehouseName = wh.rows[0]?.name || null;
+    // Может ли продавец сам завести заказ физлицу (настройка склада, 08.10.2026).
+    profile.directOrders = wh.rows[0]?.sellers_direct_orders !== false;
     // Пояс склада: «сегодня» и «вчера» в кабинете продавца — по дню склада.
     profile.timezone = wh.rows[0]?.timezone || 'Europe/Moscow';
     res.set('Cache-Control','no-store').json(profile);
@@ -585,8 +588,8 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
     const rows = await withTenantContext(tenantContextFromAuth(req.auth), async client => {
       await requireActiveCompany(client, companyId);
       return (await client.query(
-        // Заказ поставки физлицу — «физлицу», а не «1С» (в 1С его нет; проверка 07.10, замечание 1).
-        `SELECT i.id, i.number, i.status, CASE WHEN i.source_document_type = 'direct_supply' THEN 'direct' ELSE i.source END AS source,
+        // Заказ физлицу — свой источник 'direct' (08.10.2026), с получателем.
+        `SELECT i.id, i.number, i.status, i.source, ${DIRECT_FIELDS},
                 i.created_at, i.shipped_at, ${BUCKET_SQL} AS bucket,
                 i.mp_supplier_status, i.mp_status, i.mp_status_checked_at, i.mp_closed_at,
                 i.mp_close_reason, i.mp_stock_returned_at, (i.supply_id IS NOT NULL) AS in_supply,
@@ -601,6 +604,7 @@ router.get('/orders', requireAuth, requireRole('seller', 'owner', 'manager'), as
                 i.mp_warehouse_id, w.name AS mp_warehouse_name
          FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
          LEFT JOIN supplies s ON s.id = i.supply_id AND s.company_id = $1
+         LEFT JOIN direct_orders d ON d.invoice_id = i.id AND d.company_id = $1
          LEFT JOIN seller_wb_warehouses w ON w.company_id = $1 AND w.mp_warehouse_id = i.mp_warehouse_id
          WHERE i.company_id = $1 AND ii.company_id = $1 AND i.direction = 'out'
            AND ($2::text IS NULL OR ii.sku = $2)
@@ -695,7 +699,7 @@ router.get('/movements', requireAuth, requireRole('seller', 'owner', 'manager'),
         order: r.invoice_number,
         // Откуда пришёл заказ — продавцу это важнее, чем складу: он сверяет
         // с кабинетом площадки, а не с 1С склада.
-        source: r.source === 'wb' ? 'Wildberries' : '1С',
+        source: r.source === 'wb' ? 'Wildberries' : r.source === 'direct' ? 'Физлицу' : '1С',
       })),
       returned: out.returned.map((r) => ({
         id: r.id,

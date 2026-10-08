@@ -12,7 +12,8 @@ const router = express.Router();
 // Склад и его настройки — анкета фулфилмента (владелец 30.09.2026): как склад
 // работает, решает он сам ответами здесь, а не доработкой кода под него.
 const FIELDS = `id, name, city, warehouse_code, legal_name, created_at,
-  stock_source, timezone, wb_supplies_by, wb_names, setup_at, vw_reminders, wb_supply_label, address_storage`;
+  stock_source, timezone, wb_supplies_by, wb_names, setup_at, vw_reminders, wb_supply_label, address_storage,
+  sellers_direct_orders`;
 
 router.get('/me', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
@@ -200,6 +201,10 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
     if (body.vwReminders !== undefined && typeof body.vwReminders !== 'boolean') {
       throw new HttpError(400, 'Напоминания о складах продавцов — да или нет');
     }
+    // Продавцы сами заводят заказы физлицам (08.10.2026), по умолчанию — да.
+    if (body.sellersDirectOrders !== undefined && typeof body.sellersDirectOrders !== 'boolean') {
+      throw new HttpError(400, 'Заказы физлицам от продавцов — да или нет');
+    }
     // Адресное хранение (06.10.2026): выключение переносит весь товар в «Склад».
     if (body.addressStorage !== undefined && typeof body.addressStorage !== 'boolean') {
       throw new HttpError(400, 'Адресное хранение — да или нет');
@@ -218,11 +223,13 @@ router.patch('/me', requireAuth, requireRole('owner'), async (req, res, next) =>
                 wb_names = COALESCE($9::text[], wb_names),
                 setup_at = CASE WHEN $10::boolean THEN COALESCE(setup_at, now()) ELSE setup_at END,
                 vw_reminders = COALESCE($11, vw_reminders),
-                wb_supply_label = CASE WHEN $12::boolean THEN NULLIF($13, '') ELSE wb_supply_label END
+                wb_supply_label = CASE WHEN $12::boolean THEN NULLIF($13, '') ELSE wb_supply_label END,
+                sellers_direct_orders = COALESCE($14, sellers_direct_orders)
           WHERE id = $1 RETURNING ${FIELDS}`,
         [warehouseId, name ?? null, city ?? null, legal !== undefined, legal ?? null,
           stockSource ?? null, timezone ?? null, suppliesBy ?? null, wbNames ?? null,
-          body.setupDone === true, body.vwReminders ?? null, supplyLabel !== undefined, supplyLabel ?? null],
+          body.setupDone === true, body.vwReminders ?? null, supplyLabel !== undefined, supplyLabel ?? null,
+          body.sellersDirectOrders ?? null],
       );
       // Имя склада и «как нас называют продавцы» решают, какие склады WB
       // продавцов Аргус считает нашими: отметить новые совпадения. Экран шлёт

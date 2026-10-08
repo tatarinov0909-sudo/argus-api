@@ -94,7 +94,7 @@ const check = (label, fn) => {
       assert.equal(order.length, 1);
       assert.equal(order[0].number, supply.number);
       assert.equal(order[0].direction, 'out');
-      assert.equal(order[0].source, '1c');
+      assert.equal(order[0].source, 'direct');
       assert.equal(listed.destination, 'Иванов, Казань, СДЭК');
       assert.equal(listed.status, 'collecting');
       assert.equal(listed.marketplace, null);

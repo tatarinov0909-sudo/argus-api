@@ -70,7 +70,7 @@ async function availability(client, warehouseId, companyId, items, toVw = undefi
       JOIN invoices i ON i.id=ii.invoice_id AND i.warehouse_id=$1
       LEFT JOIN LATERAL (SELECT SUM(sr.picked_qty) AS picked FROM shipping_records sr WHERE sr.invoice_item_id=ii.id) p ON true
       WHERE i.direction='out' AND i.status IN ('open','in_progress') AND i.mp_closed_at IS NULL
-        AND (i.supply_id IS NOT NULL OR i.source='1c')
+        AND (i.supply_id IS NOT NULL OR i.source='1c' OR (i.source='direct' AND ii.virtual_warehouse_id IS NOT NULL))
         AND NOT EXISTS (SELECT 1 FROM shipping_records f WHERE f.invoice_item_id=ii.id AND f.is_final)
       GROUP BY r.sku,r.from_vw
     ), promised AS (
