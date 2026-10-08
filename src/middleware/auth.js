@@ -51,15 +51,17 @@ async function keyState(role, id) {
 
 // Продление входа. Токен, у которого прошла половина срока, меняем на
 // свежий в заголовке ответа — кабинеты подхватывают его сами. Работающего
-// человека не выкидывает никогда; выйдет только тот, кто не открывал
-// Аргус дольше срока (12 часов). Только для людей: у обмена с 1С свой срок.
+// человека не выкидывает; без активности работник входит заново через 30 дней,
+// остальные роли сохраняют настроенный срок. У обмена с 1С свой срок.
 const RENEWED_ROLES = new Set(['owner', 'manager', 'worker', 'seller']);
 function renewIfOld(res, payload) {
   if (!RENEWED_ROLES.has(payload.role) || !payload.exp || !payload.iat) return;
-  if (payload.exp - Date.now() / 1000 > (payload.exp - payload.iat) / 2) return;
+  const service = require('../auth/service');
+  const legacyWorker = payload.role === 'worker' && payload.exp - payload.iat < service.WORKER_TOKEN_TTL_SECONDS;
+  if (!legacyWorker && payload.exp - Date.now() / 1000 > (payload.exp - payload.iat) / 2) return;
   const { iat, exp, ...claims } = payload;
   // Позднее подключение: auth/service сам тянет базу и ошибки.
-  res.set('X-Argus-Token', require('../auth/service').signToken(claims));
+  res.set('X-Argus-Token', service.signToken(claims));
 }
 
 // Verifies the JWT and attaches req.auth = { role, warehouseId, ownerId, companyId, staffKeyId, sellerKeyId }.

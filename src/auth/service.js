@@ -29,12 +29,13 @@ function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
 }
 
+const WORKER_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 function signToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, {
-    // Смена, а не 45 минут: пока человек работает, requireAuth продлевает
-    // вход сам. Отзыв ключа, роль и права менеджера проверяются на каждом
-    // запросе по базе, так что длинный срок их не задерживает.
-    expiresIn: process.env.JWT_EXPIRES_IN || '12h',
+    // Работник возвращается на том же устройстве между сменами без хранения ключа.
+    // Отзыв ключа и смена роли по-прежнему проверяются requireAuth.
+    expiresIn: payload.role === 'worker' ? WORKER_TOKEN_TTL_SECONDS : process.env.JWT_EXPIRES_IN || '12h',
   });
 }
 
@@ -254,4 +255,5 @@ module.exports = {
   loginSellerKey,
   transliteratePrefix,
   signToken,
+  WORKER_TOKEN_TTL_SECONDS,
 };
