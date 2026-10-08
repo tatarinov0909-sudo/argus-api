@@ -193,7 +193,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
   // Раскладка по виртуальным складам продавца (02.10.2026) — только если
   // склады заведены: у остальных продавцов ответ прежний.
   const vws = (await client.query(
-    'SELECT id, name FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL ORDER BY created_at', [companyId])).rows;
+    'SELECT id, name, marketplace FROM virtual_warehouses WHERE company_id = $1 AND archived_at IS NULL ORDER BY created_at', [companyId])).rows;
   const split = vws.length ? await loadSplit(client, companyId) : null;
     const out = rows.map((r) => {
       // Warehouse stock includes picked goods still waiting for departure.
@@ -296,10 +296,11 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
       // расхождение, а не долг. Показываем ноль и говорим об этом отдельно.
       available: stockKnown ? Math.max(0, onHand - ordered) : null,
       short: stockKnown ? Math.max(0, ordered - onHand) : null,
-      ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source, inTransit: transitCounted }) } : {}),
+      ...(split ? { byWarehouse: splitOf(split, r.sku, vws, { total, source, inTransit: transitCounted, sellerAvailable }) } : {}),
       };
     });
-  await addKits(client, companyId, out);
+  // Склады, с которых собирают на WB: «Остальной товар» и склады WB продавца.
+  await addKits(client, companyId, out, new Set([''].concat(vws.filter((v) => v.marketplace === 'wb').map((v) => v.id))));
   return out;
 }
 
@@ -308,7 +309,7 @@ async function loadStock(client, companyId, { source = '1c' } = {}) {
 // поэтому в итоги продавца это не идёт (посчиталось бы дважды) — только в
 // строку набора (kitBuildable) и в сравнение с «На WB» (wbListing.js).
 // Часть без учёта — «не знаем», а не ноль: собрать сколько — тоже неизвестно.
-async function addKits(client, companyId, rows) {
+async function addKits(client, companyId, rows, wbVw = new Set([''])) {
   const parts = (await client.query(
     'SELECT kit_sku, component_sku, qty FROM product_kits WHERE company_id = $1', [companyId])).rows;
   if (!parts.length) return;
@@ -321,14 +322,21 @@ async function addKits(client, companyId, rows) {
   for (const [kit, list] of kits) {
     const row = bySku.get(kit);
     if (!row) continue;
-    let buildable = Infinity;
-    for (const p of list) {
-      const free = bySku.get(p.component_sku)?.sellerAvailable;
-      if (free == null) { buildable = null; break; }
-      buildable = Math.min(buildable, Math.floor(free / Number(p.qty)));
-    }
+    // Сколько собрать из всех свободных частей и только из тех, что лежат
+    // на складах для WB (части на складе «Озон» наборы для WB не дают).
+    const build = (freeOf) => {
+      let n = Infinity;
+      for (const p of list) {
+        const part = bySku.get(p.component_sku);
+        const free = part ? freeOf(part) : null;
+        if (free == null) return null;
+        n = Math.min(n, Math.floor(free / Number(p.qty)));
+      }
+      return n;
+    };
     row.kitParts = list.length;
-    row.kitBuildable = buildable;
+    row.kitBuildable = build((part) => part.sellerAvailable);
+    row.kitBuildableWb = build((part) => wbListing.baseFree(part, wbVw));
   }
 }
 
@@ -370,22 +378,29 @@ async function loadSplit(client, companyId) {
 // из 1С минус остальные склады (1С о складах Аргуса не знает), при учёте в
 // Аргусе — его ячейки. «Заказано» (заказы вне поставки) склада не имеет —
 // оно только в общем итоге.
-function splitOf(split, sku, vws, { total, source, inTransit = 0 }) {
+// «Свободно» склада — не больше общего «Доступно»: товар, обещанный заказу
+// «весь мой товар» или заказам WB вне поставки, лежит и на этом складе
+// (проверка 08.10, Н1). own — без этой поправки: из него «свободно для WB»
+// само вычитает заказы вне поставки (wbListing.baseFree), второй раз нельзя.
+function splitOf(split, sku, vws, { total, source, inTransit = 0, sellerAvailable = null }) {
   const bySku = split.get(sku) || new Map();
   const at = (id) => bySku.get(id || '') || { good: 0, bad: 0, staged: 0, assembly: 0 };
+  const cap = (own) => (own === null || sellerAvailable == null ? own : Math.min(own, sellerAvailable));
   const others = vws.map((w) => {
     const a = at(w.id);
     const onHand = a.good + a.staged;
-    return { id: w.id, name: w.name, onHand, inAssembly: a.assembly, available: Math.max(0, onHand - a.assembly), defect: a.bad };
+    const own = Math.max(0, onHand - a.assembly);
+    return { id: w.id, name: w.name, onHand, inAssembly: a.assembly, available: cap(own), own, defect: a.bad };
   });
   const main = at(null);
   const mainOnHand = source === 'argus'
     ? main.good + main.staged
     : (total === null ? null : Math.max(0, total - inTransit - others.reduce((n, w) => n + w.onHand, 0)));
+  const mainOwn = mainOnHand === null ? null : Math.max(0, mainOnHand - main.assembly);
   // «Остальной товар» — последним: сначала склады продавца.
   return others.concat([{
     id: null, name: 'Остальной товар', onHand: mainOnHand, inAssembly: main.assembly,
-    available: mainOnHand === null ? null : Math.max(0, mainOnHand - main.assembly), defect: main.bad,
+    available: cap(mainOwn), own: mainOwn, defect: main.bad,
   }]);
 }
 

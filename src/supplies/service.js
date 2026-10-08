@@ -355,7 +355,7 @@ async function insertLines(client, warehouseId, companyId, invoiceId, lines, vwI
 // него. Дальше обычная сборка, «Уехала» — без QR WB: поставка не на WB.
 // Собирают из всего товара продавца, как и выбирают.
 async function createDirect(client, warehouseId, {
-  companyId, items, destination: rawDestination = null, shipDate = null, actor, requestId = null,
+  companyId, items, destination: rawDestination = null, shipDate: rawShipDate = null, actor, requestId = null,
 }) {
   if (requestId !== null && requestId !== undefined
       && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(requestId))) {
@@ -363,6 +363,8 @@ async function createDirect(client, warehouseId, {
   }
   const destination = cleanDestination(rawDestination);
   if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
+  // Дата — до записи заказа: мусорная дата падала в базе 500-й (проверка 08.10, Н8).
+  const shipDate = cleanShipDate(rawShipDate, await warehouseToday(client, warehouseId));
   const lines = await cleanItems(client, warehouseId, companyId, items);
   const skus = lines.map((l) => l.sku);
 
@@ -371,7 +373,7 @@ async function createDirect(client, warehouseId, {
   if (requestId) {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('direct-supply:' || $1))", [requestId]);
     const prior = (await client.query(
-      `SELECT s.id, s.number, s.company_id,
+      `SELECT s.id, s.number, s.company_id, s.destination,
               (SELECT string_agg(ii.sku || ':' || ii.declared_qty, ',' ORDER BY ii.sku)
                  FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id WHERE i.supply_id = s.id) AS lines
          FROM supplies s WHERE s.warehouse_id = $1 AND s.request_id = $2`, [warehouseId, requestId])).rows[0];
@@ -379,6 +381,10 @@ async function createDirect(client, warehouseId, {
       const asked = items.map((it, i) => skus[i] + ':' + Number(it.qty)).sort().join(',');
       if (prior.company_id !== companyId || prior.lines !== asked) {
         throw new HttpError(409, `По этому окну уже создана поставка ${prior.number} с другими товарами — обновите экран.`);
+      }
+      // Исправили «куда / кому» — не «создана» со старым адресом (проверка 08.10, Н5).
+      if ((prior.destination || null) !== destination) {
+        throw new HttpError(409, `По этому окну уже создана поставка ${prior.number} с другим «куда / кому» — обновите экран.`);
       }
       return { id: prior.id, number: prior.number, replayed: true };
     }
@@ -1106,7 +1112,18 @@ async function disband(client, warehouseId, supplyId, { actor }) {
       `Поставка «${supply.number}» уже ${STATUS_NAMES[supply.status] || supply.status}`
       + ' — разобрать её в Аргусе нельзя.');
   }
-  await client.query(`SELECT id FROM invoices WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
+  const locked = await client.query(
+    `SELECT id, number, status FROM invoices WHERE warehouse_id=$1 AND supply_id=$2 ORDER BY id FOR UPDATE`, [warehouseId, supplyId]);
+  // Заказ, который уже принял WB, остаётся в своей поставке (07.10) — разобрать
+  // её значило бы выбросить его оттуда (проверка 08.10, Н3). Остальные заказы
+  // убирают по одному, поставка уедет с принятыми.
+  const gone = locked.rows.filter((o) => o.status === 'shipped');
+  if (gone.length) {
+    throw new HttpError(409,
+      `В поставке «${supply.number}» ${gone.length === 1 ? `заказ «${gone[0].number}»`
+        : `${gone.length} ${plural(gone.length, 'заказ', 'заказа', 'заказов')}`} уже принял WB — `
+      + 'разобрать её нельзя. Остальные заказы уберите из поставки по одному («Убрать из поставки»).');
+  }
   // Отобранное вернуть в очередь молча нельзя: товар уже снят с полки, и
   // «вернулось в очередь» означало бы, что его отберут второй раз.
   const picked = await client.query(

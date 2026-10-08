@@ -25,15 +25,22 @@ async function levels(client, warehouseId, companyId) {
 
 // Свободно для WB: со складов, с которых собирают на WB («Остальной товар» и
 // склады WB продавца), минус заказы вне поставки. Без складов — «Доступно».
-// Набор — плюс сколько можно собрать из частей (stock.js, addKits): иначе
-// «На WB больше, чем свободно» по каждому набору было ложной тревогой.
-function freeForWb(row, wbVw) {
-  if (row.kitParts && row.kitBuildable == null) return null;
-  const kit = Number(row.kitBuildable || 0);
-  if (!row.byWarehouse) return row.sellerAvailable == null ? null : row.sellerAvailable + kit;
+function baseFree(row, wbVw) {
+  if (!row.byWarehouse) return row.sellerAvailable == null ? null : row.sellerAvailable;
   const parts = row.byWarehouse.filter((w) => wbVw.has(w.id || ''));
-  if (parts.some((w) => w.available == null)) return null;
-  return Math.max(0, parts.reduce((n, w) => n + w.available, 0) - Number(row.orderedNotInSupply || 0)) + kit;
+  const own = (w) => (w.own === undefined ? w.available : w.own);
+  if (parts.some((w) => own(w) == null)) return null;
+  return Math.max(0, parts.reduce((n, w) => n + own(w), 0) - Number(row.orderedNotInSupply || 0));
+}
+// Набор — плюс сколько можно собрать из частей, лежащих там же, на складах
+// для WB (stock.js, addKits → kitBuildableWb): иначе «На WB больше, чем
+// свободно» по каждому набору было ложной тревогой, а части со склада «Озон»
+// прятали настоящую (проверка 08.10, Н6).
+function freeForWb(row, wbVw) {
+  const kit = row.kitParts ? row.kitBuildableWb : 0;
+  if (kit == null) return null;
+  const base = baseFree(row, wbVw);
+  return base == null ? null : base + Number(kit);
 }
 
 // sku → { listed, free, over, warehouses, top: { name, amount } } по товарам,
@@ -82,4 +89,4 @@ async function annotate(client, warehouseId, companyId, rows) {
   return over;
 }
 
-module.exports = { levels, listing, annotate };
+module.exports = { levels, listing, annotate, baseFree };

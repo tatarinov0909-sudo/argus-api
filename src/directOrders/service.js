@@ -12,7 +12,6 @@ const journal = require('../journal/repository');
 const vwarehouses = require('../vwarehouses/service');
 const supplies = require('../supplies/service');
 const { loadStock } = require('../sellers/stock');
-const { nextNumber } = require('../defects/service');
 const { warehouseToday } = require('../warehouses/time');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -49,20 +48,40 @@ async function companyName(client, companyId) {
 }
 
 // Продавцу — не больше свободного (того же «Доступно», что он видит у себя,
-// а на своём складе — его «Доступно»). Склад может больше: учёт бывает
-// неточным, экран склада переспрашивает сам.
+// а на своём складе — его «Доступно», но не больше общего: товар, обещанный
+// заказу «весь мой товар» или заказам WB вне поставки, лежит и на этом
+// складе — проверка 08.10, Н1). Склад может больше: учёт бывает неточным,
+// экран склада переспрашивает сам.
 async function requireFree(client, warehouseId, companyId, vw, lines) {
   const source = (await client.query('SELECT stock_source FROM warehouses WHERE id = $1', [warehouseId]))
     .rows[0]?.stock_source === 'argus' ? 'argus' : '1c';
   const rows = new Map((await loadStock(client, companyId, { source })).map((r) => [r.sku, r]));
   for (const l of lines) {
     const r = rows.get(l.sku);
-    const free = !r ? null : vw ? (r.byWarehouse || []).find((w) => w.id === vw.id)?.available ?? null : r.sellerAvailable;
+    // «Свободно» склада уже не больше общего «Доступно» (stock.js, splitOf).
+    const free = !r || r.sellerAvailable == null ? null
+      : vw ? (r.byWarehouse || []).find((w) => w.id === vw.id)?.available ?? null : r.sellerAvailable;
     if (free === null) throw new HttpError(409, `Сколько «${l.name}» на складе, пока неизвестно — заказ не создать. Спросите склад.`);
     if (l.qty > free) {
       throw new HttpError(409, `«${l.name}»: свободно ${free} шт.${vw ? ` на складе «${vw.name}»` : ''}, а в заказе ${l.qty}.`);
     }
   }
+}
+
+// Номер заказа физлицу — ЗФ-ДДММГГ-N. Выданный номер занят навсегда, и у
+// отменённого заказа: его называют покупателю и пишут в накладную службы
+// (проверка 08.10, Н7). Занятые номера лежат там же, где номера поставок.
+async function nextOrderNumber(client, warehouseId) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext('direct-number:' || $1))", [warehouseId]);
+  const [y, m, d] = (await warehouseToday(client, warehouseId)).split('-');
+  const head = `ЗФ-${d}${m}${y.slice(2)}-`;
+  const taken = (await client.query(
+    `SELECT number FROM supply_numbers WHERE warehouse_id = $1 AND number LIKE $2
+     UNION ALL SELECT number FROM invoices WHERE warehouse_id = $1 AND number LIKE $2`,
+    [warehouseId, `${head}%`])).rows.map((r) => Number(r.number.slice(head.length)) || 0);
+  const number = head + (Math.max(0, ...taken) + 1);
+  await client.query('INSERT INTO supply_numbers (warehouse_id, number) VALUES ($1, $2)', [warehouseId, number]);
+  return number;
 }
 
 async function create(client, warehouseId, {
@@ -95,7 +114,8 @@ async function create(client, warehouseId, {
   await client.query("SELECT pg_advisory_xact_lock(hashtext('direct-order:' || $1))", [companyId]);
   if (requestId) {
     const prior = (await client.query(
-      `SELECT i.id, i.number, d.virtual_warehouse_id,
+      `SELECT i.id, i.number, d.virtual_warehouse_id, d.recipient, d.address, d.phone, d.delivery_service, d.comment,
+              to_char(d.planned_date, 'YYYY-MM-DD') AS planned_day,
               (SELECT string_agg(ii.sku || ':' || ii.declared_qty, ',' ORDER BY ii.sku)
                  FROM invoice_items ii WHERE ii.invoice_id = i.id) AS lines
          FROM direct_orders d JOIN invoices i ON i.id = d.invoice_id
@@ -105,12 +125,20 @@ async function create(client, warehouseId, {
       if (prior.lines !== asked || (prior.virtual_warehouse_id || null) !== (vw ? vw.id : null)) {
         throw new HttpError(409, `По этому окну уже создан заказ ${prior.number} с другими товарами — обновите экран.`);
       }
+      // Исправили получателя и нажали ещё раз — не «создан» со старым адресом
+      // (проверка 08.10, Н5).
+      const same = (a, b) => (a || null) === (b || null);
+      if (!same(prior.recipient, to.recipient) || !same(prior.address, to.address) || !same(prior.phone, to.phone)
+          || !same(prior.delivery_service, to.service) || !same(prior.comment, to.comment) || !same(prior.planned_day, to.date)) {
+        throw new HttpError(409, `По этому окну уже создан заказ ${prior.number} с другим получателем — обновите экран `
+          + 'и поправьте получателя в заказе.');
+      }
       return { id: prior.id, number: prior.number, replayed: true };
     }
   }
   if (seller) await requireFree(client, warehouseId, companyId, vw, lines);
 
-  const number = await nextNumber(client, warehouseId, 'ЗФ', 'invoices');
+  const number = await nextOrderNumber(client, warehouseId);
   const order = (await client.query(
     `INSERT INTO invoices (warehouse_id, company_id, number, direction, source, source_document_type)
      VALUES ($1, $2, $3, 'out', 'direct', '${DOC_TYPE}') RETURNING id, number`,
@@ -240,7 +268,7 @@ async function cancel(client, warehouseId, invoiceId, { companyId = null, actor 
   await journal.createEntry(client, {
     warehouseId, agent: 'Кладовщик',
     actionText: `Заказ физлицу «${order.number}» отменён (${actorName(actor)}): ${units} `
-      + `${plural(units, 'штука', 'штуки', 'штук')} снова свободны.`,
+      + `${plural(units, 'штука', 'штуки', 'штук')} снова ${plural(units, 'свободна', 'свободны', 'свободны')}.`,
     entityType: 'invoice', entityId: invoiceId, actorType: actor.type, actorId: actor.id || null,
   });
   return { number: order.number };

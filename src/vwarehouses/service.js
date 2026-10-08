@@ -250,6 +250,9 @@ async function archive(client, { warehouseId, companyId, id, actor }) {
     `UPDATE invoice_items ii SET virtual_warehouse_id = NULL FROM invoices i
       WHERE i.id = ii.invoice_id AND ii.virtual_warehouse_id = $1 AND i.status NOT IN ('shipped', 'completed')`, [id]);
   await client.query(`UPDATE supplies SET virtual_warehouse_id = NULL WHERE virtual_warehouse_id = $1 AND status <> 'shipped'`, [id]);
+  // Заказ физлицу с этого склада — теперь «весь товар продавца»: товар лежит
+  // в «Остальном», и заказ собирается как обычно (проверка 08.10, Н2).
+  await client.query('UPDATE direct_orders SET virtual_warehouse_id = NULL WHERE virtual_warehouse_id = $1', [id]);
   await client.query('UPDATE cell_blocks SET reserved_vw_id = NULL WHERE reserved_vw_id = $1', [id]);
   await client.query('UPDATE virtual_warehouses SET archived_at = now() WHERE id = $1', [id]);
   const tail = units ? ` Товар (${units.toLocaleString('ru-RU')} шт.) остался на тех же полках и теперь в «${MAIN_NAME}».` : ' Он был пустой.';
