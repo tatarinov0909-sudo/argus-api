@@ -11,7 +11,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');   // рабочая копия сайта, не папка Codex
 let bad = 0;
 for (const page of ['cabinet_main.html', 'cabinet_main.js', 'loader.html', 'client_access.html', 'login.html']) {
   const text = fs.readFileSync(path.join(SITE, page), 'utf8');
@@ -19,7 +19,7 @@ for (const page of ['cabinet_main.html', 'cabinet_main.js', 'loader.html', 'clie
   for (const link of new Set(links)) {
     const exists = fs.existsSync(path.join(SITE, link));
     console.log(`  ${exists ? 'ok  ' : 'FAIL'}  ${page} → ${link}`
-      + (exists ? '' : '\n        ожидалось: файл есть в argus-product\n        получили:  файла нет (на стенде — 404)'));
+      + (exists ? '' : '\n        ожидалось: файл есть в репозитории сайта\n        получили:  файла нет (на стенде — 404)'));
     if (!exists) bad += 1;
   }
 }

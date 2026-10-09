@@ -5,7 +5,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+// Рабочая копия сайта (argus-handoff/wt-product), а не папка Codex argus-product: та уходит вперёд и назад
+// вместе с чужой работой. ARGUS_SITE — другая папка, если нужна.
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');
 const type = (p) => (p.endsWith('.html') ? 'text/html; charset=utf-8' : p.endsWith('.js') ? 'text/javascript'
   : p.endsWith('.css') ? 'text/css' : p.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream');
 

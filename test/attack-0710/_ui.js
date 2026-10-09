@@ -4,7 +4,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+// Рабочая копия сайта (argus-handoff/wt-product), а не папка Codex argus-product: та уходит вперёд и назад
+// вместе с чужой работой. ARGUS_SITE — другая папка, если нужна.
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');
 const ORIGIN = 'https://site.invalid';
 const API = 'https://api.argus-ai.online';
 const token = (claims) => 'x.' + Buffer.from(JSON.stringify({ exp: 4102444800, iat: 1700000000, ...claims })).toString('base64url') + '.x';

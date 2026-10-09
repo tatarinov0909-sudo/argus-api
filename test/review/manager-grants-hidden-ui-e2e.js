@@ -33,7 +33,7 @@ async function openCabinet(browser, app, token, role, requests) {
   await context.addInitScript(([t,r]) => { localStorage.setItem('argus_token',t); localStorage.setItem('argus_role',r); },[token,role]);
   const page = await context.newPage();
   await page.goto('http://argus.test/cabinet_main.html');
-  await page.locator(role === 'manager' ? '#view-orders.active' : '#view-chat.active').waitFor();
+  await page.locator('#view-home.active').waitFor();   // с 06.10 все роли открывают «Главную»
   return {context,page};
 }
 
@@ -60,7 +60,7 @@ async function openCabinet(browser, app, token, role, requests) {
     }
     browser=await chromium.launch({headless:true,channel:'chrome'});
     const owner=await openCabinet(browser,app,s.owner,'owner',record.browserRequests);
-    for(const id of ['nav-mp','nav-staff','nav-1c']) v.expect(`Контроль владельца: ${id} виден`,await owner.page.locator('#'+id).isVisible(),'виден','скрыт');
+    for(const id of ['nav-mp','nav-staff','nav-settings']) v.expect(`Контроль владельца: ${id} виден`,await owner.page.locator('#'+id).isVisible(),'виден','скрыт');
     await owner.page.locator('#nav-staff').click();
     await owner.page.locator('#managersToggle').click();
     const managerRow=owner.page.locator('#managerRows .staff-row').filter({has:owner.page.locator('.staff-name').filter({hasText:'Оля'})});
@@ -72,12 +72,17 @@ async function openCabinet(browser, app, token, role, requests) {
     const manager=await openCabinet(browser,app,s.manager,'manager',record.browserRequests);
     record.managerMenu=await manager.page.locator('.nav-item').evaluateAll(els=>els.map(el=>({id:el.id,text:el.textContent.trim()})));
     record.missing=[];
-    for(const [id,label] of [['nav-mp','Продавцы и площадки'],['nav-staff','Сотрудники'],['nav-1c','Подключение 1С']]){
+    // «Подключение 1С» — вкладка раздела «Настройки»: у менеджера пункт меню есть, а внутри только эта вкладка.
+    for(const [id,label] of [['nav-mp','Продавцы и площадки'],['nav-staff','Сотрудники'],['nav-settings','Настройки']]){
       const count=await manager.page.locator('#'+id).count();
       const visible=count>0 && await manager.page.locator('#'+id).isVisible();
       if(!visible) record.missing.push(id);
       v.expect(`Менеджеру доступен пункт «${label}» по выданному праву`,visible,'существует и виден',`элементов в DOM: ${count}`);
     }
+    await manager.page.locator('#nav-settings').click();
+    const tab=manager.page.locator('#view-configuration .pane-tab').filter({hasText:'Подключение 1С'});
+    v.expect('Менеджеру доступна вкладка «Подключение 1С» по выданному праву',await tab.count()===1&&await tab.isVisible(),'вкладка есть и видна',`вкладок: ${await tab.count()}`);
+    v.expect('Менеджеру закрыта вкладка «Работа склада» (не его право)',await manager.page.locator('#view-configuration .pane-tab').filter({hasText:'Работа склада'}).count()===0,'вкладки нет','вкладка есть');
     await manager.page.screenshot({path:`${ROOT}/manager-grants-${suffix}-manager.png`,fullPage:true,mask:[manager.page.locator('.staff-key'),manager.page.locator('#whCodeChip')]});
     console.log('Пункты менеджера: '+record.managerMenu.map(x=>x.id).join(', '));
     console.log('Флажки владельца: '+checked.join(', '));

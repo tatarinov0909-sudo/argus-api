@@ -25,7 +25,7 @@ async function openCabinet(browser,app,token,role,width,record){
  const page=await context.newPage();
  page.on('pageerror',e=>record.errors.push({role,width,error:e.message}));
  await page.goto('http://argus.test/cabinet_main.html');
- await page.locator(role==='manager'?'#view-orders.active':'#view-chat.active').waitFor();
+ await page.locator('#view-home.active').waitFor();   // с 06.10 все роли открывают «Главную»
  await page.evaluate(()=>document.fonts.ready);
  return {context,page};
 }

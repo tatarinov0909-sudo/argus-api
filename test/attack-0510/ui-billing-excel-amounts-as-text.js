@@ -10,7 +10,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');   // рабочая копия сайта, не папка Codex
 const ORIGIN = 'https://argus.test'; // https: кабинет пользуется crypto.randomUUID (только в защищённом контексте)
 const COMPANY = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 function verdicts(title) {

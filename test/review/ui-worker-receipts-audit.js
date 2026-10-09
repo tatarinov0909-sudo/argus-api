@@ -79,7 +79,8 @@ const OUT = 'C:/Users/tatar/Desktop/argus-review';
       await capture(p, 'home', { bottom: true, last: '.home-tile' });
       await p.evaluate(() => openDocs('in')); await capture(p, 'receipt-list', { bottom: true, last: '.rcv-row,.receipt-row' });
       await p.evaluate(id => openReceipt(id), receipt.id); await capture(p, 'receipt-card', { bottom: true, last: '.rcv-item' });
-      await p.evaluate(id => recvContinue(id), receipt.id); await capture(p, 'receiving-100000', { bottom: true, last: '#confirmBtn' });
+      await p.evaluate(id => recvContinue(id), receipt.id); await p.locator('#productsList .product-row').first().click();   // приёмка сама открывает «Все товары прихода» — выбираем коробку, как грузчик
+      await capture(p, 'receiving-100000', { bottom: true, last: '#confirmBtn' });
       await p.locator('#pauseBtn').click(); await capture(p, 'pause-sheet'); await p.evaluate(() => closeSheet());
       await p.evaluate(() => openDefect()); await capture(p, 'receiving-defect-sheet', { bottom: true, last: '#defGo' }); await p.evaluate(() => closeSheet());
       await p.evaluate(() => showHome()); await p.evaluate(() => openSupplies()); await capture(p, 'supplies');

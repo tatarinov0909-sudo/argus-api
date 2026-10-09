@@ -61,7 +61,7 @@ const apiData = (p, u, req) => {
     await page.evaluate(() => window.switchView && window.switchView('products'));
     await page.waitForTimeout(800);
     await page.evaluate((id) => window.openSellerProducts(id), company.id);
-    await page.locator('#productsList .pr-move').first().waitFor({ timeout: 15000 });
+    await page.locator('#productsList .stock-move').first().waitFor({ timeout: 15000 });
     await page.evaluate(() => window.openTransfer('R-1'));
     await page.locator('.ask-box #trTo').waitFor();
     await page.evaluate((id) => { document.getElementById('trFrom').value = 'main'; document.getElementById('trTo').value = id; }, ozon.id);

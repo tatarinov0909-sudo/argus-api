@@ -49,7 +49,11 @@ const { startApp, stand, verdicts, fail, realFetch } = require('../attack-0310/_
       await p.close();
       }
       const w = await page('worker', s.worker, width, 'loader.html');
-      if (!quantityOnly) { await w.evaluate(id => recvContinue(id), receipt.id); await w.waitForLoadState('networkidle'); }
+      if (!quantityOnly) {
+        await w.evaluate(id => recvContinue(id), receipt.id);
+        // Приёмка без названной позиции сама открывает «Все товары прихода»: грузчик выбирает коробку, как в жизни.
+        await w.locator('#productsList .product-row').first().click(); await w.waitForLoadState('networkidle');
+      }
       for (const kind of (quantityOnly ? ['return'] : ['receiving', 'return'])) {
         if (kind === 'return') { await w.evaluate(id => openOrder(id), ret.id); await w.locator('.bucket-option[data-bucket="good"]').click(); await w.waitForLoadState('networkidle'); }
         const q = await w.locator('#qtyValue').inputValue();

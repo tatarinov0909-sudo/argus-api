@@ -28,7 +28,7 @@ ${title}: ${good} выдержало, ${bad.length} нарушений`); if (ba
   };
 }
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');   // рабочая копия сайта, не папка Codex
 const ORIGIN = 'http://argus.test';
 const COMPANY = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TARGET = '11111111-1111-4111-8111-111111111111';

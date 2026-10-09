@@ -52,8 +52,10 @@ const F = require('./_flow');
     await F.ship(c, sup2);
     const both = await F.sellerStock(c, t1, sku);
     r = both.row;
-    v.expect('уехало: всего 9, в сборке 0, заказано 2, в пути 1, доступно 7',
-      r?.total === 9 && r?.inAssembly === 0 && r?.ordered === 2 && r?.inTransit === 1 && r?.available === 7, '9 / 0 / 2 / 1 / 7', F.nums(r));
+    // «Всего» — весь товар, пока WB его не принял, вместе с «В пути» (решение
+    // владельца 06.10.2026): 9 в ячейках и 1 едет — всего 10, доступно 10 − 2 − 1 = 7.
+    v.expect('уехало: всего 10 (9 в ячейках + 1 в пути), в сборке 0, заказано 2, в пути 1, доступно 7',
+      r?.total === 10 && r?.inAssembly === 0 && r?.ordered === 2 && r?.inTransit === 1 && r?.available === 7, '10 / 0 / 2 / 1 / 7', F.nums(r));
     const owner = await c.ok('GET', `/api/sellers/stock?companyId=${s1.companyId}&view=seller`, c.w.token);
     v.expect('владелец «его глазами» видит те же итоги', JSON.stringify(owner.summary) === JSON.stringify(both.summary),
       JSON.stringify(both.summary), JSON.stringify(owner.summary));

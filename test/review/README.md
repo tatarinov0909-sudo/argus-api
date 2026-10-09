@@ -3,19 +3,21 @@
 Каждая находка R01–R26 — отдельный тест, падавший на версии `fd551a7`. После
 починки 04.10.2026 проходят все, кроме:
 
-- `vw-parallel-moves-mix-separate-warehouses-e2e.js`,
-  `return-parallel-final-lines-stay-open-e2e.js`,
-  `inventory-parallel-runs-duplicate-tasks-e2e.js` — ручная синхронизация
-  транзакций ждала их на позднем шаге; после починки второй запрос ждёт
-  раньше, и тест не может «поймать» гонку. Вместо них —
-  `*-simple-e2e.js` (проверено: без починки падают, с ней проходят).
+- Три теста гонок (`vw-parallel-moves-mix-separate-warehouses`,
+  `return-parallel-final-lines-stay-open`, `inventory-parallel-runs-duplicate-tasks`)
+  удалены 09.10.2026: ручная синхронизация транзакций ждала их на позднем шаге,
+  после починки второй запрос ждёт раньше, и тест не может «поймать» гонку.
+  Вместо них — `*-simple-e2e.js` (проверено: без починки падают, с ней проходят).
 - `supply-disband-during-wb-handoff-orphans-e2e.js` (R11) — починено 04.10.2026
   (отметка «идёт передача в WB»); рабочая копия —
   `test/supply-disband-during-wb-handoff-e2e.js`, входит в общий прогон.
 - `owner-controls-violate-formatting-e2e.js` (R20, R21) — оформление
-  кабинета руководителя отложено решением владельца.
+  кабинета руководителя отложено решением владельца: перенесён в
+  `test/deferred/` (падает, пока в кабинете руководителя есть браузерные
+  списки в «Поставках» и не-Golos цифры в сверке WB).
 
-Запуск: `bash <argus-handoff>/stand/runt.sh <суффикс> test/review/<файл>`;
+Все папки проверок разом — `bash <argus-handoff>/stand/run-attack.sh` (после `run-e2e.sh`).
+Один тест: `bash <argus-handoff>/stand/runt.sh <суффикс> test/review/<файл>`;
 экранным тестам нужна копия сайта стенда на 127.0.0.1:8099.
 Тест отката миграций (`attack-2809/migrations-2809-roundtrip-e2e.js`)
 запускать на отдельной базе: откат справедливо отказывается, если в базе

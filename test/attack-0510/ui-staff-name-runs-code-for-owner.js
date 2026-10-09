@@ -10,7 +10,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SITE = path.resolve(__dirname, '../../../argus-product');
+const SITE = process.env.ARGUS_SITE || path.resolve(__dirname, '../../../argus-handoff/wt-product');   // рабочая копия сайта, не папка Codex
 const ORIGIN = 'http://argus.test';
 function verdicts(title) {
   const bad = []; let good = 0;
