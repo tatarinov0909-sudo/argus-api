@@ -2,6 +2,7 @@ const vwarehouses = require('../vwarehouses/service');
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const repository = require('./repository');
 const assembly = require('../shipping/assembly');
@@ -213,7 +214,7 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
     const supplyId = uuid(body.supplyId);
     const why = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ').slice(0, 200) : '';
     if (!why) throw new HttpError(400, 'Нужна причина паузы');
-    const entry = await withTenantContext({ warehouseId }, async (client) => {
+    const entry = await withWorkerCommand(req, async (client) => {
       // Сборка поставки — по supplyId, приёмка прихода — по invoiceId
       // (заказ на отгрузку приходом не окажется: у приёмки свой документ).
       const work = supplyId && !invoiceId ? { of: assembly, id: supplyId }
@@ -222,12 +223,14 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
         const out = await work.of.pauseOrResume(client, warehouseId, staffKeyId, work.id, {
           reason: why, resumed: resumed === true, exit: body.exit === true, comment: body.comment,
           at: typeof body.at === 'string' ? body.at : null,
+          workSessionId: body.workSessionId, eventAt: body.eventAt, eventSequence: body.eventSequence,
         });
         if (out) return { ...(out.entry || { repeated: true }), assembly: out.state };
         // Выход из работы, которую этот комплектовщик уже не ведёт (её забрали,
         // закончили или страница устарела), — не событие для журнала.
         if (body.exit === true) return { repeated: true, assembly: null };
       }
+      if (body.workSessionId) throw new HttpError(409, 'Нужен документ текущего захода работы', { code: 'work_session_changed' });
       const who = await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId]);
       const doc = invoiceId ? (await client.query(
         `SELECT i.id, i.number, s.number AS supply_number FROM invoices i

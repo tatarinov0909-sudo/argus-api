@@ -3,6 +3,7 @@ const {
   requireAuth, requireRole, requireGrant, allowWarehouseView,
 } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const { plural } = require('../journal/plural');
 const { LIMITS, normalizeName } = require('../warehouses/naming');
@@ -598,14 +599,14 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
     // с решением продавца (проверка 03.10.2026).
     if (fromQuality === 'good' && toQuality && toQuality !== 'good') {
       if (!companyId) throw new HttpError(400, 'Укажите продавца товара, который отмечаете браком');
-      const out = await withTenantContext({ warehouseId }, (client) => defects.markFromShelf(client, {
+      const out = await withWorkerCommand(req, (client) => defects.markFromShelf(client, {
         warehouseId, companyId, sku, fromCellBlockId, toCellBlockId: toCellBlockId || null, qty,
         bucket: toQuality, source: 'move', staffKeyId, vw,
       }));
       res.status(201).json(out);
       return;
     }
-    const moved = await withTenantContext({ warehouseId }, async (client) => {
+    const moved = await withWorkerCommand(req, async (client) => {
       const result = await moveStock(client, warehouseId, {
         sku, companyId, fromCellBlockId, toCellBlockId, qty, fromQuality, toQuality,
         workerKeyId: req.auth.staffKeyId || null, vw,

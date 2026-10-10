@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
@@ -166,7 +167,7 @@ router.post('/missing', requireAuth, requireRole('worker'), async (req, res, nex
     const { invoiceItemId, missingQty, note } = req.body || {};
     if (!invoiceItemId) throw new HttpError(400, 'Нужна позиция заказа');
     const qty = requireQty(missingQty, 'Сколько не хватает', { min: 1 });
-    const out = await withTenantContext({ warehouseId }, (client) => markMissing(
+    const out = await withWorkerCommand(req, (client) => markMissing(
       client, warehouseId, staffKeyId, { invoiceItemId, qty, note, requireWork: true },
     ));
     res.status(out.repeated ? 200 : 201).json(out);
@@ -479,7 +480,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     // Целое и больше нуля: «NaN» и «1.5» проходили прежнюю проверку и
     // записывались в остаток ячейки как есть.
     const qty = requireQty(pickedQty, 'Количество', { min: 1 });
-    const record = await withTenantContext({ warehouseId }, (client) => recordPick(
+    const record = await withWorkerCommand(req, (client) => recordPick(
       client, warehouseId, staffKeyId, { invoiceItemId, qty, cellBlockId, isFinal, pausedMs, pauseReasons, requireWork: true },
     ));
     res.status(201).json(record);
@@ -501,7 +502,7 @@ router.post('/product', requireAuth, requireRole('worker'), async (req, res, nex
       throw new HttpError(400, 'Нужны поставка, товар, ячейка и количество');
     }
     const qty = requireQty(pickedQty, 'Количество', { min: 1 });
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const s = await assembly.lockSupply(client, warehouseId, supplyId);
       await requireAssembly(client, warehouseId, staffKeyId, s.id);
       return pickProduct(client, warehouseId, staffKeyId, { supplyId, sku, cellBlockId, qty, pausedMs, pauseReasons });
@@ -595,7 +596,7 @@ router.post('/paper/start', requireAuth, requireRole('worker'), async (req, res,
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
-    const out = await withTenantContext({ warehouseId }, (client) => assembly.start(
+    const out = await withWorkerCommand(req, (client) => assembly.start(
       client, warehouseId, staffKeyId, body.supplyId, { mode: 'paper', takeOver: body.takeOver === true },
     ));
     res.status(201).json({
@@ -628,7 +629,7 @@ router.post('/assembly/:supplyId/start', requireAuth, requireRole('worker'), asy
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
-    const out = await withTenantContext({ warehouseId }, (client) => assembly.start(
+    const out = await withWorkerCommand(req, (client) => assembly.start(
       client, warehouseId, staffKeyId, req.params.supplyId,
       { mode: 'app', takeOver: body.takeOver === true, comment: body.comment },
     ));
@@ -641,7 +642,7 @@ router.post('/assembly/:supplyId/start', requireAuth, requireRole('worker'), asy
 router.post('/assembly/:supplyId/abandon', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => assembly.abandon(
+    const out = await withWorkerCommand(req, (client) => assembly.abandon(
       client, warehouseId, staffKeyId, req.params.supplyId, { comment: (req.body || {}).comment },
     ));
     res.json(out);
@@ -656,7 +657,7 @@ router.post('/assembly/:supplyId/abandon', requireAuth, requireRole('worker'), a
 router.post('/assembly/:supplyId/finish', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => finishAssembly(
+    const out = await withWorkerCommand(req, (client) => finishAssembly(
       client, warehouseId, staffKeyId, req.params.supplyId, { comment: (req.body || {}).comment },
     ));
     res.json(out);
@@ -741,7 +742,7 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
     const pausedMs = Math.max(0, Number(body.pausedMs) || 0);
     // «Где оставил, что осталось» — уходит в итог одной записью с ним.
     const note = assembly.cleanComment(body.comment);
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const s = await paperSupply(client, warehouseId, body.supplyId);
       // «Собрал по листу» — конец своей сборки (можно и с паузы), не чужой и
       // не без скана QR / «Начать».

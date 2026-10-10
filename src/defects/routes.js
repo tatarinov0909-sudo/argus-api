@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole, requireGrant } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const { tenantContextFromAuth } = require('../auth/tenantContext');
 const journal = require('../journal/repository');
@@ -46,7 +47,7 @@ router.post('/moves', requireAuth, requireRole('worker'), async (req, res, next)
   try {
     const b = req.body || {};
     const source = b.source === 'move' ? 'move' : 'picking';
-    const out = await inWarehouse(req, async (c) => {
+    const out = await withWorkerCommand(req, async (c) => {
       await activeCompany(c, req.auth.warehouseId, b.companyId);
       if (typeof b.sku !== 'string' || !b.sku) throw new HttpError(400, 'Укажите товар');
       // С какого виртуального склада годное (02.10.2026): сборка поставки —
@@ -142,7 +143,7 @@ router.get('/tasks', requireAuth, requireRole('worker', 'owner', 'manager'), asy
 
 router.post('/tasks/:id/done', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
-    const out = await inWarehouse(req, (c) => defects.execute(c, {
+    const out = await withWorkerCommand(req, (c) => defects.execute(c, {
       warehouseId: req.auth.warehouseId, decisionId: req.params.id, staffKeyId: req.auth.staffKeyId,
       cellBlockId: (req.body || {}).cellBlockId || null,
     }));

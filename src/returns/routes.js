@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const { refreshCellFill } = require('../cells/fill');
 const journal = require('../journal/repository');
@@ -51,7 +52,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     // закрывался, а в остаток товар не попадал и потом не размещался.
     if (!cellBlockId) throw new HttpError(400, 'Укажите ячейку, куда кладёте товар');
 
-    const record = await withTenantContext({ warehouseId }, async (client) => {
+    const record = await withWorkerCommand(req, async (client) => {
       // Возврат целиком — на запись первым: две последние строки одного
       // возврата, разобранные одновременно, иначе не видели друг друга и
       // возврат оставался «в работе» (проверка 03.10.2026).

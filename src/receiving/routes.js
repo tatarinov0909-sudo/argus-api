@@ -1,6 +1,7 @@
 const express = require('express');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { withTenantContext } = require('../db/pool');
+const { withWorkerCommand } = require('../worker/commands');
 const { HttpError } = require('../middleware/errorHandler');
 const { requireQty } = require('../middleware/qty');
 const { refreshCellFill } = require('../cells/fill');
@@ -101,7 +102,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
     const defectPlan = readDefect(defect);
     const plan = planPlacements({ accepted, cellBlockId, placements, defectQty: defectPlan ? defectPlan.qty : 0 });
 
-    const record = await withTenantContext({ warehouseId }, async (client) => {
+    const record = await withWorkerCommand(req, async (client) => {
       // Адресное хранение выключено (06.10.2026): всё — в «Склад», одной строкой.
       let places = plan;
       if (await addressing.isOff(client, warehouseId)) {
@@ -112,7 +113,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
       }
       return receiveItem(client, {
         warehouseId, staffKeyId, invoiceItemId, accepted, placements: places, pausedMs, pauseReasons, suggestionId,
-        requireWork: true, defect: defectPlan,
+        requireWork: true, defect: defectPlan, completionEvent: req.workerCommand,
       });
     });
     res.status(201).json(record);
@@ -144,7 +145,7 @@ router.post('/session/:invoiceId/start', requireAuth, requireRole('worker'), asy
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
-    const out = await withTenantContext({ warehouseId }, (client) => work.start(
+    const out = await withWorkerCommand(req, (client) => work.start(
       client, warehouseId, staffKeyId, req.params.invoiceId,
       { mode: 'app', takeOver: body.takeOver === true, comment: body.comment },
     ));
@@ -157,7 +158,7 @@ router.post('/session/:invoiceId/start', requireAuth, requireRole('worker'), asy
 router.post('/session/:invoiceId/abandon', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => work.abandon(
+    const out = await withWorkerCommand(req, (client) => work.abandon(
       client, warehouseId, staffKeyId, req.params.invoiceId, { comment: (req.body || {}).comment },
     ));
     res.json(out);
@@ -174,7 +175,7 @@ router.post('/session/:invoiceId/abandon', requireAuth, requireRole('worker'), a
 router.post('/session/:invoiceId/finish', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
-    const out = await withTenantContext({ warehouseId }, (client) => finishReceiving(
+    const out = await withWorkerCommand(req, (client) => finishReceiving(
       client, warehouseId, staffKeyId, req.params.invoiceId, { comment: (req.body || {}).comment },
     ));
     res.json(out);
@@ -252,7 +253,7 @@ async function finishReceiving(client, warehouseId, staffKeyId, invoiceId, { com
 // текстом и комментарием).
 async function receiveItem(client, {
   warehouseId, staffKeyId, invoiceItemId, accepted, placements = [], pausedMs = 0, pauseReasons = [],
-  suggestionId = null, closeWork = true, defect = null,
+  suggestionId = null, closeWork = true, defect = null, completionEvent = null,
   // Приход принимает только тот, кто ведёт приёмку, и не на паузе
   // (requireActive). «Закончить приёмку» уже проверила заход сама — ей можно
   // и с паузы.
@@ -416,7 +417,7 @@ async function receiveItem(client, {
   await kladovshchik.recordSuggestionOutcome(client, warehouseId, suggestionId, firstCell);
 
   const { status: newStatus, finished } = await settleInvoice(client, {
-    warehouseId, staffKeyId, invoiceId: item.invoice_id, number: item.invoice_number, direction: item.direction, closeWork,
+    warehouseId, staffKeyId, invoiceId: item.invoice_id, number: item.invoice_number, direction: item.direction, closeWork, completionEvent,
   });
   return {
     ...record,
@@ -435,7 +436,7 @@ async function receiveItem(client, {
 // Тогда заход приёмки закрывается здесь же, в этой транзакции (случай
 // 27.09.2026 — окно «Закончить» закрылось мимо, и заход остался на паузе у
 // принятого прихода). Экран получает итог сразу.
-async function settleInvoice(client, { warehouseId, staffKeyId, invoiceId, number, direction, closeWork = true }) {
+async function settleInvoice(client, { warehouseId, staffKeyId, invoiceId, number, direction, closeWork = true, completionEvent = null }) {
   const left = (await client.query(
     `SELECT count(*) FILTER (WHERE rr.id IS NULL)::int AS open,
             count(*) FILTER (WHERE rr.accepted_qty > COALESCE(p.placed, 0))::int AS unplaced
@@ -456,7 +457,7 @@ async function settleInvoice(client, { warehouseId, staffKeyId, invoiceId, numbe
   }
   let finished = null;
   if (status === 'completed' && direction === 'in' && closeWork) {
-    const [row] = await work.settle(client, warehouseId, [invoiceId], { force: true });
+    const [row] = await work.settle(client, warehouseId, [invoiceId], { force: true, completionEvent });
     if (row) {
       finished = {
         ...(await work.stateOf(client, warehouseId, { id: invoiceId, number, status }, staffKeyId)),
@@ -650,7 +651,7 @@ async function inCell(client, recordId, cellBlockId) {
 // Шаг сделан: ячейка записи приёмки, запись журнала, статус прихода (всё
 // разложено — принят, заход закрыт) и раскладка позиции для экрана.
 async function placingDone(client, {
-  warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId, legacy = false, skipJournal = false,
+  warehouseId, staffKeyId, invoice, item, journalText, entryStep, cellBlockId, legacy = false, skipJournal = false, completionEvent = null,
 }) {
   await syncRecordCell(client, item.record_id);
   if (!skipJournal) await journal.createEntry(client, {
@@ -666,7 +667,7 @@ async function placingDone(client, {
   });
   // Старое «своё место» принятого прихода — приход остаётся принятым.
   const { status, finished } = legacy ? { status: invoice.status, finished: null } : await settleInvoice(client, {
-    warehouseId, staffKeyId, invoiceId: invoice.id, number: invoice.number, direction: invoice.direction,
+    warehouseId, staffKeyId, invoiceId: invoice.id, number: invoice.number, direction: invoice.direction, completionEvent,
   });
   const placed = await client.query(
     'SELECT COALESCE(SUM(qty), 0) AS n FROM receiving_placements WHERE receiving_record_id = $1', [item.record_id]);
@@ -688,7 +689,7 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
     const qty = requireQty(body.qty, 'Сколько кладёте в ячейку', { min: 1 });
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'place' });
       if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено');
       if (qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — больше положить нельзя`);
@@ -700,7 +701,7 @@ router.post('/items/:invoiceItemId/place', requireAuth, requireRole('worker'), a
       });
       const left = unplaced - qty;
       return placingDone(client, {
-        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId, legacy,
+        warehouseId, staffKeyId, invoice, item, entryStep: step, cellBlockId, legacy, completionEvent: req.workerCommand,
         journalText: `Положил ${qty} шт. ${what(item)} в ячейку ${label}. `
           + (left ? `Осталось разложить ${left} шт.` : `Разложено всё принятое — ${Number(item.accepted_qty)} шт.`),
       });
@@ -717,7 +718,7 @@ router.post('/items/:invoiceItemId/defect', requireAuth, requireRole('worker'), 
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const plan = readDefect(req.body || {});
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const { invoice, item, unplaced, legacy } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'defect' });
       if (unplaced <= 0) throw new HttpError(409, 'Всё принятое уже разложено — брак отметьте через «Перепаковка и перестановка»');
       if (plan.qty > unplaced) throw new HttpError(400, `Осталось разложить ${unplaced} шт. — брака больше быть не может`);
@@ -752,7 +753,7 @@ router.post('/items/:invoiceItemId/move', requireAuth, requireRole('worker'), as
     if (String(body.fromCellBlockId || '').toLowerCase() === String(body.toCellBlockId || '').toLowerCase()) {
       throw new HttpError(400, 'Это та же ячейка — выберите другую');
     }
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const { invoice, item } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'move' });
       const from = await cellLabelOf(client, warehouseId, body.fromCellBlockId);
       const to = await cellLabelOf(client, warehouseId, body.toCellBlockId);
@@ -782,7 +783,7 @@ router.post('/items/:invoiceItemId/remove', requireAuth, requireRole('worker'), 
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
     const qty = requireQty(body.qty, 'Сколько убираете из ячейки', { min: 1 });
-    const out = await withTenantContext({ warehouseId }, async (client) => {
+    const out = await withWorkerCommand(req, async (client) => {
       const { invoice, item, unplaced } = await lockPlacing(client, warehouseId, req.params.invoiceItemId, { staffKeyId, action: 'remove' });
       const label = await cellLabelOf(client, warehouseId, body.cellBlockId);
       const here = await inCell(client, item.record_id, body.cellBlockId);
