@@ -108,7 +108,7 @@ router.get('/rows', requireAuth, allowWarehouseView, async (req, res, next) => {
 
 // Что лежит в одной ячейке — полностью, по нажатию на неё (владелец
 // 27.09.2026). Смотреть склад может тот же, кто видит карту: владелец,
-// грузчик и менеджер с правом «склад»; продавцу раскладка склада закрыта.
+// комплектовщик и менеджер с правом «склад»; продавцу раскладка склада закрыта.
 router.get('/blocks/:id/contents', requireAuth, allowWarehouseView, async (req, res, next) => {
   try {
     const { warehouseId } = req.auth;
@@ -593,7 +593,7 @@ router.post('/move', requireAuth, requireRole('worker'), async (req, res, next) 
     // Виртуальный склад строк (02.10.2026): не передан — любые строки, каждая
     // переезжает со своим складом; null — «Основной».
     const vw = Object.prototype.hasOwnProperty.call(req.body, 'vw') ? (req.body.vw || null) : undefined;
-    // Годное → брак — тем же путём, что кнопка «Брак» у грузчика: склад не
+    // Годное → брак — тем же путём, что кнопка «Брак» у комплектовщика: склад не
     // назван, а в ячейке товар разных складов продавца, — спорная ситуация
     // с решением продавца (проверка 03.10.2026).
     if (fromQuality === 'good' && toQuality && toQuality !== 'good') {

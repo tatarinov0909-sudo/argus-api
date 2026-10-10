@@ -419,7 +419,7 @@ async function listInvoices(client, warehouseId, { direction, status, limit = 20
        AND ($2::invoice_direction IS NULL OR i.direction = $2::invoice_direction)
        AND ($3::invoice_status IS NULL OR i.status = $3::invoice_status)
        AND ($3::invoice_status IS NULL OR $3::invoice_status = 'shipped' OR i.mp_closed_at IS NULL)
-       -- «Заказ поставщику» из 1С — заказ, а не привоз (как в списке грузчика).
+       -- «Заказ поставщику» из 1С — заказ, а не привоз (как в списке комплектовщика).
        AND i.source_document_type IS DISTINCT FROM 'supplier_order'
      GROUP BY i.id, i.number, i.direction, i.status, i.created_at, c.name
      ORDER BY (i.status IN ('completed', 'shipped') OR i.mp_closed_at IS NOT NULL) ASC, i.created_at DESC
@@ -489,8 +489,8 @@ async function invoiceDetails(client, warehouseId, number) {
   };
 }
 
-// Что склад ждёт сделать — как это видит грузчик в своих списках (одно
-// правило для утренней сводки, чата и экрана грузчика, разбор 02.10.2026):
+// Что склад ждёт сделать — как это видит комплектовщик в своих списках (одно
+// правило для утренней сводки, чата и экрана комплектовщика, разбор 02.10.2026):
 // сборка — заказы, которые менеджер положил в поставку, и отгрузки из 1С,
 // а не все заказы WB; приёмка — привозы, без «заказов поставщику» из 1С
 // (это заказ, а не привоз); возвраты — неразобранные; задания склада брака.
@@ -558,7 +558,7 @@ async function warehouseSummary(client, warehouseId) {
     [warehouseId],
   );
   // «Незакрытых документов 1358» ничего не говорило: туда попадали все
-  // заказы WB и заказы поставщику из 1С. Теперь — работа, как у грузчика.
+  // заказы WB и заказы поставщику из 1С. Теперь — работа, как у комплектовщика.
   const work = await workQueue(client, warehouseId);
 
   const bucketLabel = { good: 'хороший', defective: 'брак', packaging_defect: 'брак упаковки' };
@@ -582,7 +582,7 @@ async function warehouseSummary(client, warehouseId) {
   };
 }
 
-// «Что ждёт моего решения» — расхождения, записки грузчиков, «нет товара».
+// «Что ждёт моего решения» — расхождения, записки комплектовщиков, «нет товара».
 // Журнал только на чтение: подтверждать и откатывать можно в кабинете, где
 // видно всю карточку, а не одной фразой в чате. Журнал ничего не стирает:
 // ответ — новая запись со ссылкой на исходную, а исходная навсегда
@@ -661,7 +661,7 @@ async function suppliesInfo(client, warehouseId, number) {
         cells: p.cells.filter((x) => x.take > 0).map((x) => ({ cell: x.label, take: x.take })),
         ...(p.available < p.qty ? { notInCells: p.qty - p.available } : {}),
       })),
-      // «Нет товара» от грузчика, руководитель ещё не решил.
+      // «Нет товара» от комплектовщика, руководитель ещё не решил.
       notFound: c.shortages.map((x) => x.text),
     };
   }
@@ -709,7 +709,7 @@ async function workNow(client, warehouseId) {
       ORDER BY w.started_at`, [warehouseId])).rows;
 
   // Привозы: открытые приходы, кроме «заказов поставщику» из 1С — это заказ,
-  // а не машина (как в списке грузчика).
+  // а не машина (как в списке комплектовщика).
   const arrivals = (await client.query(
     `SELECT i.id, i.number, c.name AS seller, i.source_document_type, i.external_id, i.status,
             left(i.source_document_date::text, 10) AS planned_date,
@@ -769,7 +769,7 @@ async function workNow(client, warehouseId) {
       };
     }),
     // Склад брака: сколько брака у каждого продавца ещё никто не решил и
-    // какие решения ждут грузчика.
+    // какие решения ждут комплектовщика.
     defect: {
       waitingDecision: (await defects.waitingBySeller(client, warehouseId)).map((w) => ({
         seller: w.seller, qty: w.qty, since: w.since,

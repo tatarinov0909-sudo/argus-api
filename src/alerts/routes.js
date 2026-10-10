@@ -61,7 +61,7 @@ router.post('/:id/seen', requireAuth, requireRole('owner'), async (req, res, nex
 // «Сегодня» — четыре цифры на первом экране владельца (отчёт рецензии 03.10,
 // раздел 30): что отгрузить, что принять, что ждёт его решения, что не так с
 // обменом. Только числа: каждое открывает уже существующий список. Работа
-// считается тем же правилом, что у грузчика и Кладовщика (workQueue), обмен —
+// считается тем же правилом, что у комплектовщика и Кладовщика (workQueue), обмен —
 // по живым тревогам сторожа, чтобы «1С молчит» не считалось вторым способом.
 router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) => {
   try {
@@ -84,7 +84,22 @@ router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) =
              WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.source = 'wb' AND i.supply_id IS NULL
                AND i.status <> 'shipped' AND i.mp_closed_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM products p WHERE p.warehouse_id = ii.warehouse_id
-                                 AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped`,
+                                 AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped,
+           -- Те же заказы — сколько разных товаров (артикулов) не сопоставлено.
+           (SELECT count(DISTINCT (ii.company_id, ii.sku))::int FROM invoices i JOIN invoice_items ii ON ii.invoice_id = i.id
+              JOIN companies c ON c.id = i.company_id AND c.archived_at IS NULL
+             WHERE i.warehouse_id = $1 AND i.direction = 'out' AND i.source = 'wb' AND i.supply_id IS NULL
+               AND i.status <> 'shipped' AND i.mp_closed_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM products p WHERE p.warehouse_id = ii.warehouse_id
+                                 AND p.company_id = ii.company_id AND p.sku = ii.sku)) AS wb_unmapped_skus,
+           -- Клиенты (владелец 11.10.2026): сколько подключено и работает.
+           (SELECT count(*)::int FROM companies WHERE warehouse_id = $1 AND archived_at IS NULL) AS clients,
+           (SELECT count(DISTINCT c.id)::int FROM companies c JOIN marketplace_credentials m ON m.company_id = c.id
+             WHERE c.warehouse_id = $1 AND c.archived_at IS NULL) AS clients_connected,
+           (SELECT count(DISTINCT c.id)::int FROM companies c JOIN marketplace_credentials m ON m.company_id = c.id
+             WHERE c.warehouse_id = $1 AND c.archived_at IS NULL AND m.last_used_at > now() - interval '1 day') AS clients_live,
+           (SELECT count(DISTINCT c.id)::int FROM companies c JOIN seller_keys k ON k.company_id = c.id AND k.active
+             WHERE c.warehouse_id = $1 AND c.archived_at IS NULL) AS clients_cabinet`,
         [warehouseId],
       )).rows[0];
       const wbOver = await require('../sellers/stock').wbOverBySeller(client, warehouseId);
@@ -95,7 +110,8 @@ router.get('/today', requireAuth, requireRole('owner'), async (req, res, next) =
         ship: { supplies: work.suppliesToPick, orders: work.ordersToPick, ready: work.suppliesReady, onec: work.onecToPick },
         receive: { arrivals: work.toReceive, arrived: work.arrived, returns: work.returnsToSort },
         decide: { discrepancies: d.discrepancies, sellerRequests: d.seller_requests, recounts: d.recounts },
-        exchange: { sync, wbUnmapped: d.wb_unmapped, wbOver },
+        exchange: { sync, wbUnmapped: d.wb_unmapped, wbUnmappedSkus: d.wb_unmapped_skus, wbOver },
+        clients: { total: d.clients, connected: d.clients_connected, live: d.clients_live, cabinet: d.clients_cabinet },
       };
     });
     res.json(data);

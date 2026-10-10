@@ -71,7 +71,7 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
   try {
     const { warehouseId, ownerId, role, staffKeyId } = req.auth;
     const { id } = req.params;
-    // resolution: 'confirm' | 'rollback'; у записки грузчика о товаре —
+    // resolution: 'confirm' | 'rollback'; у записки комплектовщика о товаре —
     // 'ack', «Принял к сведению»: соглашаться там не с чем.
     const { resolution, note } = req.body;
     if (!['confirm', 'rollback', 'ack'].includes(resolution)) {
@@ -86,13 +86,13 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
         [id, warehouseId],
       );
       if (!original.rows[0]) return null;
-      // «Принял к сведению» — записки грузчика и предупреждение «зона склада
+      // «Принял к сведению» — записки комплектовщика и предупреждение «зона склада
       // продавца заполнена» (02.10.2026): соглашаться там не с чем.
       const ackOnly = ACK_TYPES.has(original.rows[0].entity_type);
       if (ackOnly !== (resolution === 'ack')) {
         throw new HttpError(400, ackOnly
           ? 'Такую запись отмечают «Принял к сведению»'
-          : '«Принял к сведению» — только для записок грузчика о товаре и предупреждений о зоне склада');
+          : '«Принял к сведению» — только для записок комплектовщика о товаре и предупреждений о зоне склада');
       }
       // Второй ответ на одну запись — два противоречащих решения в следе.
       // Так бывает с открытого давно кабинета: заказ уже убрали из поставки,
@@ -137,7 +137,7 @@ router.post('/:id/resolve', requireAuth, requireRole('owner', 'manager'), async 
 });
 
 // «Написать руководителю о товаре» (владелец 27.09.2026, третье задание):
-// грузчик на карточке товара — в приёмке или в сборке — пишет, что не так
+// комплектовщик на карточке товара — в приёмке или в сборке — пишет, что не так
 // («коробка мятая», «штрихкод не читается»). Это запись журнала «ждёт
 // решения»: висит, пока руководитель или менеджер не нажмёт «Принял к
 // сведению» (resolve с resolution 'ack'), и видна в карточке прихода или
@@ -180,7 +180,7 @@ router.post('/item-note', requireAuth, requireRole('worker'), async (req, res, n
       return repository.createEntry(client, {
         warehouseId,
         agent: 'Кладовщик',
-        actionText: `${who ? who.name : 'Грузчик'} пишет о товаре «${item.name}» (${item.sku}) ${where}: «${text}»`,
+        actionText: `${who ? who.name : 'Комплектовщик'} пишет о товаре «${item.name}» (${item.sku}) ${where}: «${text}»`,
         entityType: ITEM_NOTE,
         entityId: item.id,
         invoiceId: item.invoice_id,
@@ -195,12 +195,12 @@ router.post('/item-note', requireAuth, requireRole('worker'), async (req, res, n
   }
 });
 
-// Грузчик поставил работу на паузу или вернулся к ней — руководитель видит
+// Комплектовщик поставил работу на паузу или вернулся к ней — руководитель видит
 // это в журнале сразу, а не в итоге накладной (владелец 26.09.2026).
 // Работник журнал не читает, он только сообщает.
 //
 // Пауза сборки поставки и приёмки прихода идёт сюда же (владелец 27.09.2026):
-// у грузчика, который ведёт эту работу, она ещё и останавливает таймер на
+// у комплектовщика, который ведёт эту работу, она ещё и останавливает таймер на
 // сервере, а exit — «вышел» (стрелка «назад», другая вкладка). Запись в
 // журнале при этом одна, с тем, сколько сделано, и комментарием.
 router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next) => {
@@ -224,7 +224,7 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
           at: typeof body.at === 'string' ? body.at : null,
         });
         if (out) return { ...(out.entry || { repeated: true }), assembly: out.state };
-        // Выход из работы, которую этот грузчик уже не ведёт (её забрали,
+        // Выход из работы, которую этот комплектовщик уже не ведёт (её забрали,
         // закончили или страница устарела), — не событие для журнала.
         if (body.exit === true) return { repeated: true, assembly: null };
       }
@@ -238,7 +238,7 @@ router.post('/pause', requireAuth, requireRole('worker'), async (req, res, next)
       const where = doc
         ? (doc.supply_number ? ` Поставка «${doc.supply_number}», заказ «${doc.number}».` : ` Документ «${doc.number}».`)
         : sup ? ` Поставка «${sup.number}».` : '';
-      const name = who.rows[0] ? who.rows[0].name : 'Грузчик';
+      const name = who.rows[0] ? who.rows[0].name : 'Комплектовщик';
       const ms = Number(pausedMs) || 0;
       const took = ms < 60000 ? 'меньше минуты' : `${Math.round(ms / 60000)} мин`;
       return repository.createEntry(client, {

@@ -171,7 +171,7 @@ async function create(client, warehouseId, {
   const orders = await client.query(
     `SELECT i.id, i.number, i.company_id, i.direction, i.status, i.mp_closed_at, i.supply_id,
             i.source, i.external_id, c.name AS company_name, i.mp_warehouse_id,
-            d.virtual_warehouse_id AS direct_vw, d.recipient || ', ' || d.address AS direct_to,
+            d.virtual_warehouse_id AS direct_vw, d.recipient || COALESCE(', ' || d.address, '') AS direct_to,
             (SELECT w.name FROM seller_wb_warehouses w WHERE w.company_id = i.company_id
                AND w.mp_warehouse_id = i.mp_warehouse_id) AS mp_warehouse_name,
             ${WB_CONFIRMED_SQL} AS wb_confirmed,
@@ -287,7 +287,7 @@ async function create(client, warehouseId, {
   await journal.createEntry(client, {
     warehouseId,
     agent: 'Кладовщик',
-    // «Собрана» в Аргусе значит «грузчики всё собрали», поэтому здесь
+    // «Собрана» в Аргусе значит «комплектовщики всё собрали», поэтому здесь
     // «составлена»: пока это только решение менеджера, что уезжает.
     actionText: `Составлена поставка «${number}» — ${orders.rows.length} `
       + `${plural(orders.rows.length, 'заказ', 'заказа', 'заказов')}, продавец «${orders.rows[0].company_name}»`
@@ -361,8 +361,9 @@ async function createDirect(client, warehouseId, {
       && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(requestId))) {
     throw new HttpError(400, 'Неверный номер операции');
   }
+  // «Куда / кому» — необязательно (владелец 10.10.2026: поставка может
+  // формироваться без адреса доставки).
   const destination = cleanDestination(rawDestination);
-  if (!destination) throw new HttpError(400, 'Укажите, куда и кому едет поставка');
   // Дата — до записи заказа: мусорная дата падала в базе 500-й (проверка 08.10, Н8).
   const shipDate = cleanShipDate(rawShipDate, await warehouseToday(client, warehouseId));
   const lines = await cleanItems(client, warehouseId, companyId, items);
@@ -402,7 +403,7 @@ async function createDirect(client, warehouseId, {
   await insertLines(client, warehouseId, companyId, order.id, lines, null);
   await client.query(
     `INSERT INTO direct_orders (invoice_id, warehouse_id, company_id, recipient, address, planned_date, created_role, request_id)
-     VALUES ($1, $2, $3, $4, $4, $5, $6, $7)`,
+     VALUES ($1, $2, $3, COALESCE($4, 'Получатель не указан'), $4, $5, $6, $7)`,
     [order.id, warehouseId, companyId, destination, shipDate || null, actor?.type === 'manager' ? 'manager' : 'owner', requestId || null],
   );
   const hasVw = (await vwarehouses.list(client, companyId)).length > 0;
@@ -441,7 +442,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
   const lines = await client.query(
     `SELECT i.number AS order_number, ii.id AS item_id, ii.sku, ii.name, ii.declared_qty,
             -- Штрихкод — из заказа WB, а у поставки физлицу (заказа WB нет) —
-            -- из карточки товара (06.10.2026): грузчик узнаёт товар по нему.
+            -- из карточки товара (06.10.2026): комплектовщик узнаёт товар по нему.
             ii.mp_rid, ii.mp_article, COALESCE(ii.mp_barcode, codes.barcode) AS mp_barcode, ii.mp_nm_id,
             m.photo_url, st.part_a AS sticker_head, st.part_b AS sticker_tail,
             -- Сколько по строке уже снято с полки и закрыта ли она. Лист
@@ -452,7 +453,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
                        WHERE sr.invoice_item_id = ii.id), 0) AS picked,
             EXISTS (SELECT 1 FROM shipping_records sr2
                      WHERE sr2.invoice_item_id = ii.id AND sr2.is_final) AS picked_closed,
-            -- Грузчик отметил «нет товара», руководитель ещё не решил: при
+            -- Комплектовщик отметил «нет товара», руководитель ещё не решил: при
             -- сборке по товару к этой позиции не возвращаемся.
             EXISTS (SELECT 1 FROM journal_entries je
                      WHERE je.warehouse_id = ii.warehouse_id AND je.urgent AND je.status = 'pending'
@@ -583,7 +584,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
     if (!item) continue;
     item.cells.push({
       label: formatBlockLabel(row.row_num, row),
-      // По id грузчик открывает, что ещё лежит в этой ячейке (владелец 27.09.2026).
+      // По id комплектовщик открывает, что ещё лежит в этой ячейке (владелец 27.09.2026).
       cellBlockId: row.cell_block_id,
       qty: Number(row.qty),
       rowNum: row.row_num,
@@ -593,7 +594,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
     item.available += Number(row.qty);
   }
 
-  // Сколько брать из каждой ячейки — тем же правилом, что и в листе грузчика:
+  // Сколько брать из каждой ячейки — тем же правилом, что и в листе комплектовщика:
   // сколько есть в первой по обходу, остаток во второй. Без этого на бумаге
   // стоял один адрес и общее количество, а товар лежал в трёх местах.
   for (const item of bySku.values()) {
@@ -634,7 +635,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
     [warehouseId, supplyId],
   );
 
-  // Отметки грузчиков «нет товара» — видны в самой поставке, пока не решены.
+  // Отметки комплектовщиков «нет товара» — видны в самой поставке, пока не решены.
   const shortages = !showShortages ? { rows: [] } : await client.query(
     `SELECT je.id, je.action_text, je.created_at, i.number AS order_number, i.id AS invoice_id,
             -- Убрать из поставки можно только заказ, по которому ничего не
@@ -650,7 +651,7 @@ async function contents(client, warehouseId, supplyId, { showShortages = false, 
     [warehouseId, supplyId],
   );
 
-  // Записки грузчиков о товаре этой поставки — руководителю и менеджеру.
+  // Записки комплектовщиков о товаре этой поставки — руководителю и менеджеру.
   const notes = showNotes ? await journal.itemNotes(client, warehouseId, { supplyId }) : [];
 
   return {
@@ -779,7 +780,7 @@ async function ship(client, warehouseId, supplyId, { destination: rawDestination
 }
 
 // Хватит ли товара на полках — видно сразу, при составлении поставки, а не
-// когда грузчик дошёл до пустой ячейки (решение владельца 24.09.2026).
+// когда комплектовщик дошёл до пустой ячейки (решение владельца 24.09.2026).
 //
 // Годное в ячейках раздаём по очереди: сперва поставкам, которые уже
 // собираются (старшие первыми), потом заказам в очереди (старшие первыми).
@@ -836,7 +837,7 @@ async function stockCover(client, warehouseId, companyId = null) {
   return { shortInvoices, take, onHand, reserved, onHandLeft: (key) => stock.get(key) || 0 };
 }
 
-// recentOnly — грузчику: уехавшие больше двух недель назад не нужны, как и
+// recentOnly — комплектовщику: уехавшие больше двух недель назад не нужны, как и
 // закрытые документы в /api/invoices (проверка 01.10.2026).
 async function list(client, warehouseId, { status = null, showShortages = false, limit = null, recentOnly = false } = {}) {
   // Чужое значение отсекаем сами. Приведение к типу перечисления прямо
@@ -1147,7 +1148,7 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   }
 
   // Заказ поставки физлицу заведён самой поставкой — в очередь ему некуда:
-  // остался бы навсегда «Заказано» у продавца и «отгрузкой» у грузчика.
+  // остался бы навсегда «Заказано» у продавца и «отгрузкой» у комплектовщика.
   const own = await client.query(
     `DELETE FROM invoices WHERE warehouse_id = $1 AND supply_id = $2 AND source_document_type = '${DIRECT}' RETURNING id`,
     [warehouseId, supplyId],
@@ -1175,7 +1176,7 @@ async function disband(client, warehouseId, supplyId, { actor }) {
   return { number: supply.number, returned: freed.rowCount, canceled: own.rowCount };
 }
 
-// Убрать один заказ из поставки — обычно потому, что грузчик отметил «нет
+// Убрать один заказ из поставки — обычно потому, что комплектовщик отметил «нет
 // товара».
 //
 // Без этого один ненайденный товар держал поставку навсегда: «Уехала» ждёт,

@@ -29,7 +29,7 @@ const inSeller = (req, fn) => withTenantContext(tenantContextFromAuth(req.auth),
 const inWarehouse = (req, fn) => withTenantContext({ warehouseId: req.auth.warehouseId }, fn);
 
 // Склады продавца, его права и склады для поставки на WB.
-// Грузчику — тоже: склад продавца выбирают при заведении возврата.
+// Комплектовщику — тоже: склад продавца выбирают при заведении возврата.
 router.get('/', requireAuth, requireRole('seller', 'owner', 'manager', 'worker'), async (req, res, next) => {
   try {
     const companyId = companyOf(req);
@@ -90,7 +90,7 @@ router.get('/:id([0-9a-fA-F-]{36})/mixed', requireAuth, requireRole('owner', 'ma
   } catch (err) { next(err); }
 });
 
-// Задания «переложить» (склад «хранить отдельно»): грузчику — список с
+// Задания «переложить» (склад «хранить отдельно»): комплектовщику — список с
 // подсказкой ячеек, шаг «переложил»; руководитель может снять задание.
 router.get('/move-tasks', requireAuth, requireRole('worker', 'owner', 'manager'), async (req, res, next) => {
   try {

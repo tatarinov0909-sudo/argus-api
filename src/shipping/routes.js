@@ -117,7 +117,7 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
           tierEnd: r.tier_end,
           ...(generalPlace ? { label: addressing.GENERAL_LABEL, general: true } : {}),
         })),
-        // Сколько числится в учёте — чтобы грузчик знал, что берёт сверх.
+        // Сколько числится в учёте — чтобы комплектовщик знал, что берёт сверх.
         ...(generalPlace ? { addressOff: true } : {}),
       };
     });
@@ -127,7 +127,7 @@ router.get('/suggest/:invoiceItemId', requireAuth, requireRole('owner', 'worker'
   }
 });
 
-// «Лист грузчика» — один обход склада на несколько заказов сразу.
+// «Лист комплектовщика» — один обход склада на несколько заказов сразу.
 // ?supplyId=… — вся поставка (печать листа поставки: номера двухсот заказов
 // в адресе не помещаются, сервер отвечает 414).
 // ?invoiceIds=a,b,c — конкретные заказы; без параметра берутся все, что ждут
@@ -150,9 +150,9 @@ router.get('/pick-list', requireAuth, requireRole('owner', 'manager', 'worker'),
   }
 });
 
-// «Товара нет» — отметка грузчика со сборки.
+// «Товара нет» — отметка комплектовщика со сборки.
 //
-// Грузчик собирает заказ, а товара нет или не хватает. Раньше он мог только
+// Комплектовщик собирает заказ, а товара нет или не хватает. Раньше он мог только
 // отложить позицию и «сказать менеджеру» устно — в базу ничего не попадало.
 // Теперь отметка уходит в журнал с пометкой «очень важно» владельцу и
 // менеджеру с правом «отметки о нехватке» и видна в самой поставке.
@@ -233,7 +233,7 @@ async function markMissing(client, warehouseId, staffKeyId, { invoiceItemId, qty
     actionText: `ОЧЕНЬ ВАЖНО: нет товара «${item.name}» (${item.sku}) — не хватает ${qty} из ${remaining} шт. `
       + `Заказ «${item.invoice_number}»`
       + (item.supply_number ? `, поставка «${item.supply_number}»` : '')
-      + `. Отметил ${who.rows[0] ? who.rows[0].name : 'грузчик'} ${how}.`
+      + `. Отметил ${who.rows[0] ? who.rows[0].name : 'комплектовщик'} ${how}.`
       + (comment ? ` Комментарий: ${comment}` : ''),
     entityType: 'invoice_item',
     entityId: item.id,
@@ -488,7 +488,7 @@ router.post('/', requireAuth, requireRole('worker'), async (req, res, next) => {
   }
 });
 
-// Отбор по товару (решение владельца 24.09.2026): грузчик идёт к ячейке и
+// Отбор по товару (решение владельца 24.09.2026): комплектовщик идёт к ячейке и
 // берёт сразу всё нужное поставке по этому товару, а не по штуке на заказ.
 // Взятое раскладываем по заказам поставки — старшим номерам первыми; заказ,
 // которому хватило, закрыт, последний может остаться собранным частично.
@@ -524,7 +524,7 @@ async function openSupplyLines(client, warehouseId, supplyId, sku = null) {
         AND i.status NOT IN ('shipped') AND i.mp_closed_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM shipping_records sr
                          WHERE sr.invoice_item_id = ii.id AND sr.is_final)
-        -- Позицию с неразобранной отметкой «нет товара» экран грузчика не
+        -- Позицию с неразобранной отметкой «нет товара» экран комплектовщика не
         -- считает, и сюда взятое не кладём: иначе штука уйдёт в заказ,
         -- который руководитель уберёт из поставки, а тот, ради которого
         -- её брали, останется несобранным (проверка 25.09.2026). То же
@@ -564,7 +564,7 @@ async function pickProduct(client, warehouseId, staffKeyId, {
 }
 
 // Сборка по бумажному листу (владелец 22.09 и 26.09.2026). Бумага остаётся —
-// лист на тележке удобен, — но собранное грузчик отмечает сам, с телефона:
+// лист на тележке удобен, — но собранное комплектовщик отмечает сам, с телефона:
 // сканирует QR на листе — начало сборки и таймер; в конце — «собрал по
 // листу» и чего не нашёл. Взятое записывается теми же правилами, что и
 // сборка по товарам, недостача — теми же отметками «нет товара».
@@ -575,7 +575,7 @@ async function paperSupply(client, warehouseId, supplyId) {
 }
 
 const workerName = async (client, staffKeyId) =>
-  (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0]?.name || 'Грузчик';
+  (await client.query('SELECT name FROM staff_keys WHERE id = $1', [staffKeyId])).rows[0]?.name || 'Комплектовщик';
 
 // Заказ поставки собирает только тот, кто ведёт сборку, и не на паузе
 // (владелец 29.09.2026: «защита точно нужна» — как у приёмки). Раньше это
@@ -607,8 +607,8 @@ router.post('/paper/start', requireAuth, requireRole('worker'), async (req, res,
 });
 
 // ---------- Состояние сборки поставки (владелец 27.09.2026) ----------
-// Действует только грузчик; руководитель и менеджер видят состояние, но
-// сборку за грузчика не начинают, не бросают и не заканчивают.
+// Действует только комплектовщик; руководитель и менеджер видят состояние, но
+// сборку за комплектовщика не начинают, не бросают и не заканчивают.
 
 router.get('/assembly/:supplyId', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
@@ -623,7 +623,7 @@ router.get('/assembly/:supplyId', requireAuth, requireRole('owner', 'manager', '
 });
 
 // «Начать» в окне «Сейчас запустится таймер сборки». takeOver — забрать
-// сборку, которую ведёт другой грузчик (он ушёл, телефон сел).
+// сборку, которую ведёт другой комплектовщик (он ушёл, телефон сел).
 router.post('/assembly/:supplyId/start', requireAuth, requireRole('worker'), async (req, res, next) => {
   try {
     const { warehouseId, staffKeyId } = req.auth;
@@ -670,7 +670,7 @@ async function finishAssembly(client, warehouseId, staffKeyId, supplyId, { comme
   const supply = await assembly.lockSupply(client, warehouseId, supplyId);
   const cur = await assembly.liveOf(client, warehouseId, supply.id, staffKeyId);
   if (!cur) {
-    // Поставка уже собрана, и заход этого грузчика закрылся сам (защита от
+    // Поставка уже собрана, и заход этого комплектовщика закрылся сам (защита от
     // зависшей сборки, work/sessions.js — settle): «Закончить» показывает
     // итог того же захода и дописывает комментарий, а не ругается.
     const last = await assembly.latest(client, warehouseId, supply.id);
@@ -728,7 +728,7 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
   try {
     const { warehouseId, staffKeyId } = req.auth;
     const body = req.body || {};
-    // Что грузчик не нашёл: {sku, found} — сколько всё-таки нашёл (0 — ничего).
+    // Что комплектовщик не нашёл: {sku, found} — сколько всё-таки нашёл (0 — ничего).
     const found = new Map();
     for (const x of Array.isArray(body.notFound) ? body.notFound : []) {
       const n = Number(x && x.found);
@@ -758,7 +758,7 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
       }
       if (!bySku.size) throw new HttpError(409, `По поставке «${s.number}» собирать больше нечего`);
       // Набор, которого нет в ячейках, — не пропажа: его не собрали из
-      // компонентов. Руководителю так и пишем, а не «грузчик нашёл, но нет».
+      // компонентов. Руководителю так и пишем, а не «комплектовщик нашёл, но нет».
       const kits = await kitSkusAmong(client, warehouseId, [...bySku.keys()]);
       const report = [];
       let firstPick = true;
@@ -807,8 +807,8 @@ router.post('/paper/finish', requireAuth, requireRole('worker'), async (req, res
           await markMissing(client, warehouseId, staffKeyId, {
             invoiceItemId: l.id, qty: part, how: 'по бумажному листу',
             note: !noCells ? ''
-              : kits.has(it.sku) ? 'набор не собран из компонентов — собрать можно на экране грузчика'
-                : 'грузчик нашёл товар, но в ячейках Аргуса его нет',
+              : kits.has(it.sku) ? 'набор не собран из компонентов — собрать можно на экране комплектовщика'
+                : 'комплектовщик нашёл товар, но в ячейках Аргуса его нет',
           });
           short -= part;
         }

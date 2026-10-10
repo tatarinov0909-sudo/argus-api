@@ -42,7 +42,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
     const cells = (await db(`SELECT cb.id, ${blockLabelSql('cb', 'wr')} AS label FROM cell_blocks cb
       JOIN warehouse_rows wr ON wr.id = cb.warehouse_row_id WHERE cb.warehouse_id = $1 ORDER BY wr.row_num, cb.rack_start`, [warehouseId])).rows;
     const [A, B, C, D, E, F] = cells;
-    const wk = await api('POST', '/api/staff', owner, { name: 'Грузчик' }, 201);
+    const wk = await api('POST', '/api/staff', owner, { name: 'Комплектовщик' }, 201);
     const worker = (await api('POST', '/api/auth/staff/login', null, { keyCode: wk.key_code })).token;
     const ozon = await api('POST', '/api/vwarehouses', owner, { companyId: company, name: 'Озон', marketplace: 'ozon' }, 201);
     const qty = async (quality = 'good') => Object.fromEntries((await db(
@@ -73,7 +73,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
     const mixed = await api('GET', `/api/vwarehouses/${ozon.id}/mixed?companyId=${company}`, owner);
     assert.deepEqual(mixed, { cells: 1, units: 50 });
     const ask = await call('PATCH', `/api/vwarehouses/${ozon.id}`, owner, { companyId: company, keepSeparate: true });
-    assert.equal(ask.status, 409); assert.match(ask.body.error, /выберите: задания грузчику на разделение или разделять только новый товар/);
+    assert.equal(ask.status, 409); assert.match(ask.body.error, /выберите: задания комплектовщику на разделение или разделять только новый товар/);
     const on = await api('PATCH', `/api/vwarehouses/${ozon.id}`, owner, { companyId: company, keepSeparate: true, separateExisting: 'tasks' });
     assert.equal(on.keepSeparate, true); assert.equal(on.tasks, 1);
     let tasks = await api('GET', '/api/vwarehouses/move-tasks', worker);
@@ -132,7 +132,7 @@ const kladovshchik = require('../src/agents/kladovshchik');
     }
     assert.equal((await db('SELECT status FROM vw_transfers WHERE id = $1', [t.id])).rows[0].status, 'done');
     assert.ok((await api('GET', '/api/vwarehouses/notifications', seller)).some((n) => n.kind === 'vw_moved' && n.text.includes(t.number)));
-    check('перенос на склад «хранить отдельно» — задания грузчику; каждая переложенная штука сразу на новом складе');
+    check('перенос на склад «хранить отдельно» — задания комплектовщику; каждая переложенная штука сразу на новом складе');
 
     // ---- Предупреждение: везут на склад с заполненной зоной ----
     const inb = await api('POST', '/api/sellers/inbound', seller, { grid: [['Артикул', 'Количество', 'Склад'], ['R-1', 40, 'Озон']], apply: true });

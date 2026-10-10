@@ -89,7 +89,7 @@ async function maybeDigest(client, warehouseId) {
     [warehouseId],
   );
 
-  // Работа дня — как её видит грузчик (разбор 02.10.2026): «1202 на сборку»
+  // Работа дня — как её видит комплектовщик (разбор 02.10.2026): «1202 на сборку»
   // считало все заказы WB, а «46 на приёмку» — заказы поставщику из 1С.
   const w = await workQueue(client, warehouseId);
   const parts = [];

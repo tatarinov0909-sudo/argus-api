@@ -72,14 +72,13 @@ const check = (label, fn) => {
     });
 
     // Поставка физлицу.
-    const noWhere = await api('POST', '/api/supplies/direct', owner, { companyId: company, items: [{ sku: 'DR-1', qty: 2 }] });
+    // Без «куда / кому» — можно (владелец 10.10.2026), проверено в home-tiles-no-address-e2e.js.
     const unknown = await api('POST', '/api/supplies/direct', owner, { companyId: company, destination: 'Иванов', items: [{ sku: 'X-1', qty: 1 }] });
     const twice = await api('POST', '/api/supplies/direct', owner, { companyId: company, destination: 'Иванов',
       items: [{ sku: 'DR-1', qty: 1 }, { sku: 'DR-1', qty: 1 }] });
     const zero = await api('POST', '/api/supplies/direct', owner, { companyId: company, destination: 'Иванов', items: [{ sku: 'DR-1', qty: 0 }] });
     const bySeller = await api('POST', '/api/supplies/direct', seller, { companyId: company, destination: 'Иванов', items: [{ sku: 'DR-1', qty: 1 }] });
-    check('без «куда / кому», с чужим или повторным товаром, нулём или продавцом — не создаётся', () => {
-      assert.equal(noWhere.status, 400);
+    check('с чужим или повторным товаром, нулём или продавцом — не создаётся', () => {
       assert.equal(unknown.status, 400, 'чужой товар попал в поставку');
       assert.equal(twice.status, 400);
       assert.equal(zero.status, 400);

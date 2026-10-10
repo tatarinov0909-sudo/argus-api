@@ -80,14 +80,14 @@ router.post('/match', requireAuth, requireRole('owner', 'manager', 'seller'), as
           const several = !p && cat.byArticle.get(sku.toUpperCase());
           if (several && several.size > 1) {
             const both = byCode.filter((s) => several.has(s));
-            if (both.length !== 1) return fail('Этот артикул у нескольких товаров (например, размеров) — укажите штрихкод');
+            if (both.length !== 1) return fail('Этот код у нескольких товаров (например, размеров) — укажите штрихкод');
             p = products.get(both[0]);
           }
-          if (!p) return fail('Артикул не найден в каталоге продавца');
-          if (barcode && !byCode.includes(p.sku)) return fail('Артикул и штрихкод указывают на разные товары');
-        } else if (!barcode) return fail('Укажите артикул или штрихкод');
+          if (!p) return fail('Код не найден в каталоге продавца');
+          if (barcode && !byCode.includes(p.sku)) return fail('Код и штрихкод указывают на разные товары');
+        } else if (!barcode) return fail('Укажите код или штрихкод');
         else if (byCode.length === 0) return fail('Штрихкод не найден в каталоге продавца');
-        else if (byCode.length > 1) return fail('Этот штрихкод у нескольких товаров — укажите артикул');
+        else if (byCode.length > 1) return fail('Этот штрихкод у нескольких товаров — укажите код');
         else p = products.get(byCode[0]);
         return { row: i + 1, sku: p.sku, name: p.name };
       });

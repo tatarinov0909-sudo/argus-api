@@ -68,7 +68,7 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
       const docs = worker ? [] : (await c.query(
         `SELECT id, kind, number, to_char(doc_date, 'DD.MM.YYYY') AS doc_date, supplier, file_name, file_type, file_size, added_by, created_at
            FROM invoice_documents WHERE invoice_id = $1 ORDER BY created_at`, [inv.id])).rows;
-      // Переписка — между складом и продавцом; у грузчика чата нет (правило владельца).
+      // Переписка — между складом и продавцом; у комплектовщика чата нет (правило владельца).
       const comments = worker ? [] : (await c.query(
         `SELECT id, sku, author_role, author_name, body, created_at FROM invoice_comments
           WHERE invoice_id = $1 ORDER BY created_at, id`, [inv.id])).rows;
@@ -96,8 +96,8 @@ router.get('/:id', requireAuth, requireRole('seller', 'owner', 'manager', 'worke
           supplier: d.supplier, fileName: d.file_name, fileType: d.file_type, fileSize: d.file_size, addedBy: d.added_by, createdAt: d.created_at })),
         comments: comments.map((m) => ({ id: m.id, sku: m.sku, productName: m.sku ? names.get(m.sku) || m.sku : null,
           authorRole: m.author_role, authorName: m.author_name, body: m.body, createdAt: m.created_at })),
-        // Записки грузчиков о товаре — руководителю и менеджеру (продавцу и
-        // самим грузчикам — нет: это разговор внутри склада).
+        // Записки комплектовщиков о товаре — руководителю и менеджеру (продавцу и
+        // самим комплектовщикам — нет: это разговор внутри склада).
         notes: ['owner', 'manager'].includes(req.auth.role)
           ? await journal.itemNotes(c, req.auth.warehouseId, { invoiceId: inv.id }) : [],
       };
@@ -156,7 +156,7 @@ function actorFields(auth) {
   return { actorType: a.type, actorId: a.id };
 }
 
-// «Машина приехала» — отмечает склад у ворот: грузчик или руководитель.
+// «Машина приехала» — отмечает склад у ворот: комплектовщик или руководитель.
 // Сколько мест приехало — пересчитывают сразу при выгрузке.
 router.post('/:id/arrived', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {

@@ -6,7 +6,7 @@
 // - перемещение на склад брака (defect_moves): документ с номером на каждый
 //   найденный брак — откуда, сколько, описание, фото;
 // - решение по браку (defect_decisions): продавец или склад за него решает,
-//   что делать с N штуками; пока склад не выполнил — это задание грузчику;
+//   что делать с N штуками; пока склад не выполнил — это задание комплектовщику;
 // - выполнение решения: брак уходит со склада брака — к продавцу, в
 //   утилизацию, обратно в продажу или в продажу отдельным товаром «уценка».
 const { HttpError } = require('../middleware/errorHandler');
@@ -38,7 +38,7 @@ function requireBucket(bucket) {
 }
 
 // Номер документа: ПРЕФИКС-ДДММГГ-N, день — по поясу склада, под замком
-// склада (два грузчика отмечают брак одновременно).
+// склада (два комплектовщика отмечают брак одновременно).
 async function nextNumber(client, warehouseId, prefix, table) {
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2))", [`defect-number-${prefix}`, warehouseId]);
   const [y, m, d] = todayIn(await zoneOf(client, warehouseId)).split('-');
@@ -289,14 +289,14 @@ async function decide(client, {
     actionText: `${byWarehouse ? `${actor.name || 'Склад'} решил за продавца «${company.name}»` : `Продавец «${company.name}» решил`}`
       + ` по браку ${number}: «${row.name}», ${amount} шт. (${BUCKETS[bucket]}) — ${ACTIONS[action]}`
       + (barcode ? `, штрихкод уценки ${barcode}` : '') + '.'
-      + (cleanNote(note) ? ` Комментарий: ${cleanNote(note)}` : '') + ' Задание грузчику создано.',
+      + (cleanNote(note) ? ` Комментарий: ${cleanNote(note)}` : '') + ' Задание комплектовщику создано.',
     entityType: 'defect_decision', entityId: inserted.id,
     actorType: actor.role, actorId: actor.id || null,
   });
   return { id: inserted.id, number, decidedAt: inserted.decided_at };
 }
 
-// Где лежит брак этого товара — для задания грузчику (сначала самый давний).
+// Где лежит брак этого товара — для задания комплектовщику (сначала самый давний).
 async function defectCells(client, warehouseId, companyId, sku, bucket) {
   return (await client.query(
     `SELECT cs.cell_block_id AS id, SUM(cs.qty)::int AS qty, MIN(cs.updated_at) AS oldest, ${blockLabelSql('cb', 'wr')} AS label
@@ -307,7 +307,7 @@ async function defectCells(client, warehouseId, companyId, sku, bucket) {
     .map((r) => ({ cellBlockId: r.id, label: r.label, qty: r.qty }));
 }
 
-// Задания грузчику: решения, которые склад ещё не выполнил.
+// Задания комплектовщику: решения, которые склад ещё не выполнил.
 async function tasks(client, warehouseId) {
   const rows = (await client.query(
     `SELECT d.id, d.number, d.company_id, c.name AS company, d.sku, d.name, d.bucket, d.qty, d.done_qty, d.action,

@@ -19,7 +19,7 @@ async function createEntry(client, {
   // Документ и место события. Необязательны — но без них запись остаётся
   // текстом, из которого никуда нельзя перейти.
   invoiceId = null, cellBlockId = null,
-  // «Очень важно»: отметка, по которой стоит работа (грузчик не нашёл товар).
+  // «Очень важно»: отметка, по которой стоит работа (комплектовщик не нашёл товар).
   urgent = false,
 }) {
   const result = await client.query(
@@ -55,7 +55,7 @@ function entriesSelect(extra = '') {
             -- Документ, на который запись ссылается как на сущность («отменил
             -- привоз» пишется без invoice_id) — для категории (journal/category.js).
             ei.direction AS entity_direction,
-            -- Кто именно работал: в кабинете работа грузчика — одна строка с
+            -- Кто именно работал: в кабинете работа комплектовщика — одна строка с
             -- его именем, а не «Кладовщик» на каждый товар.
             sk.name AS actor_name,
             -- Заказ сейчас в поставке? Тогда у отметки «нет товара» есть
@@ -65,7 +65,7 @@ function entriesSelect(extra = '') {
             s.number AS invoice_supply_number,
             -- «ряд.стеллаж.ярус», как на карте склада (см. cells/label.js).
             CASE WHEN cb.id IS NULL THEN NULL ELSE ${blockLabelSql('cb', 'wr')} END AS cell_label,
-            -- Чья это работа (третье задание 27.09.2026): всё, что грузчик
+            -- Чья это работа (третье задание 27.09.2026): всё, что комплектовщик
             -- сделал по одному приходу или одной поставке, — и ответы
             -- руководителя на его записи — кабинет собирает в одну строку.
             -- «supply:…» — сборка поставки (у заказов поставки и у записей
@@ -385,7 +385,7 @@ async function resolveEntry(client, {
   const original = originalResult.rows[0];
   if (!original) return null;
 
-  // 'ack' — «Принял к сведению» записку грузчика о товаре.
+  // 'ack' — «Принял к сведению» записку комплектовщика о товаре.
   const status = resolution === 'rollback' ? 'rolled_back' : 'confirmed';
   const who = actorType === 'manager' ? 'менеджером' : 'владельцем';
   const actionText = resolution === 'ack'
@@ -409,7 +409,7 @@ async function resolveEntry(client, {
   return result.rows[0];
 }
 
-// Записки грузчиков о товаре (entity_type 'item_note') — для карточки
+// Записки комплектовщиков о товаре (entity_type 'item_note') — для карточки
 // прихода (invoiceId) или поставки (supplyId): и ждущие ответа, и уже
 // отмеченные «Принял к сведению» — кем и когда.
 async function itemNotes(client, warehouseId, { invoiceId = null, supplyId = null }) {

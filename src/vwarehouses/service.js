@@ -145,7 +145,7 @@ async function update(client, {
   };
   next.defectSeparate = next.keepSeparate && (defectSeparate === undefined ? cur.defect_separate : defectSeparate === true);
   // Включили «хранить отдельно», а товар уже лежит вместе с товаром других
-  // складов (владелец 02.10.2026): склад решает — задания грузчику на
+  // складов (владелец 02.10.2026): склад решает — задания комплектовщику на
   // разделение или только новый товар.
   const turnedOn = (next.keepSeparate && !cur.keep_separate) || (next.defectSeparate && !cur.defect_separate);
   let mixed = [];
@@ -155,7 +155,7 @@ async function update(client, {
     else if (cur.keep_separate) mixed = mixed.filter((m) => m.quality !== 'good');
     if (mixed.length && !['tasks', 'new'].includes(separateExisting)) {
       throw new HttpError(409, `Товар склада «${cur.name}» уже лежит вместе с товаром других складов в ${mixed.length} `
-        + `${mixed.length === 1 ? 'ячейке' : 'ячейках'} — выберите: задания грузчику на разделение или разделять только новый товар`);
+        + `${mixed.length === 1 ? 'ячейке' : 'ячейках'} — выберите: задания комплектовщику на разделение или разделять только новый товар`);
     }
   }
   if (next.name.toLowerCase() !== cur.name.toLowerCase()) {
@@ -178,7 +178,7 @@ async function update(client, {
   let tasks = 0;
   if (mixed.length && separateExisting === 'tasks') {
     tasks = await separate.createSeparateTasks(client, warehouseId, { companyId, vwId: id, list: mixed });
-    changes.push(`задания грузчику на разделение — ${tasks}`);
+    changes.push(`задания комплектовщику на разделение — ${tasks}`);
   } else if (mixed.length) {
     changes.push(`уже лежащее вместе (${mixed.length} яч.) не разделяем — отдельно только новый товар`);
   }
@@ -288,7 +288,7 @@ async function transferable(client, companyId, sku, vwId) {
            AND (i.supply_id IS NOT NULL OR i.source = '1c' OR (i.source = 'direct' AND ii.virtual_warehouse_id IS NOT NULL))
            AND NOT EXISTS (SELECT 1 FROM shipping_records f WHERE f.invoice_item_id = ii.id AND f.is_final)
            AND ii.virtual_warehouse_id IS NOT DISTINCT FROM $3::uuid) AS to_pick,
-       -- Обещано переносу, который грузчик ещё перекладывает (проверка 03.10.2026).
+       -- Обещано переносу, который комплектовщик ещё перекладывает (проверка 03.10.2026).
        (SELECT COALESCE(SUM(t.qty - t.moved), 0) FROM vw_move_tasks t
          WHERE t.company_id = $1 AND t.sku = $2 AND t.status = 'open' AND t.kind = 'transfer'
            AND t.quality = 'good' AND t.from_vw IS NOT DISTINCT FROM $3::uuid) AS promised`,
@@ -347,7 +347,7 @@ async function execute(client, warehouseId, t, actor) {
       + ' (остальное в ячейках занято поставками этого склада или его нет)');
   }
   // Склад «хранить отдельно» (владелец 02.10.2026): товар надо переложить
-  // руками — задания грузчику; каждая переложенная штука сразу переходит.
+  // руками — задания комплектовщику; каждая переложенная штука сразу переходит.
   if (await separate.needsMove(client, t.company_id, t.from_vw, t.to_vw, t.quality || 'good')) {
     await separate.createTransferTasks(client, warehouseId, t);
     return (await client.query(
@@ -397,7 +397,7 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
   const what = describe(t, rows);
   if (status === 'done') {
     t = await execute(client, warehouseId, t, actor);
-    const byHand = t.status === 'to_move' ? ' Склад хранится отдельно — грузчик перекладывает товар, переложенное сразу на новом складе.' : '';
+    const byHand = t.status === 'to_move' ? ' Склад хранится отдельно — комплектовщик перекладывает товар, переложенное сразу на новом складе.' : '';
     await journal.createEntry(client, {
       warehouseId, agent: 'Кладовщик', status: 'auto',
       actionText: `Перенос ${number} у продавца «${company.name}»: ${what}.${t.note ? ` Комментарий: ${t.note}` : ''}${byHand}`,
@@ -426,7 +426,7 @@ async function transfer(client, { warehouseId, companyId, sku, qty, fromVw, toVw
 }
 
 const STATUS_NAME = {
-  requested: 'ждёт склада', waiting_seller: 'ждёт согласия продавца', to_move: 'грузчик перекладывает',
+  requested: 'ждёт склада', waiting_seller: 'ждёт согласия продавца', to_move: 'комплектовщик перекладывает',
   done: 'выполнен', rejected: 'отказано',
 };
 function transferView(t, rows) {
@@ -552,7 +552,7 @@ async function releaseOrders(client, warehouseId, invoiceIds) {
     [warehouseId, invoiceIds]);
 }
 
-// Склад поставки — на все строки её заказов: грузчик собирает строку только
+// Склад поставки — на все строки её заказов: комплектовщик собирает строку только
 // с этого склада (вопрос 3). Заказ, который уже собирали с другого склада, в
 // поставку с другого склада не берём: взятое числится за прежним складом.
 async function assignOrders(client, warehouseId, invoiceIds, vwId) {
@@ -749,7 +749,7 @@ async function retag(client, warehouseId, { companyId, sku, name, fromVw, toVw, 
              CASE WHEN $14 = 'done' THEN now() END) RETURNING *`,
     [warehouseId, companyId, number, sku, name, qty, fromVw, toVw, note, quality, actor.role, actor.id || null,
       actor.name || ACTOR_NAME[actor.role] || null, byHand ? 'to_move' : 'done'])).rows[0];
-  // Склад «хранить отдельно» — переложить руками (задания грузчику).
+  // Склад «хранить отдельно» — переложить руками (задания комплектовщику).
   if (byHand) {
     await separate.createTransferTasks(client, warehouseId, t);
     return number;

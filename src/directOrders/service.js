@@ -3,7 +3,7 @@
 // Заказ заводит склад (руководитель, менеджер) или сам продавец, если склад
 // это разрешил (warehouses.sellers_direct_orders). Это обычный заказ на
 // отгрузку (invoices, source 'direct'): стоит в «Заказах», склад составляет из
-// таких заказов поставку — несколько физлиц в одной, грузчик видит заказ
+// таких заказов поставку — несколько физлиц в одной, комплектовщик видит заказ
 // только в поставке. Здесь — получатель и то, что после отъезда: трек-номер и
 // статусы «в пути», «доставлен», «отказ / возврат», которые ставят вручную.
 const { HttpError } = require('../middleware/errorHandler');
@@ -93,7 +93,8 @@ async function create(client, warehouseId, {
   }
   const to = {
     recipient: text(recipient, 'Кому', 120, { required: true }),
-    address: text(address, 'Адрес', 300, { required: true }),
+    // Адрес — необязательный (владелец 10.10.2026): забирают сами или уточнят позже.
+    address: text(address, 'Адрес', 300),
     phone: text(phone, 'Телефон', 40),
     service: text(deliveryService, 'Служба доставки', 60),
     comment: text(comment, 'Комментарий', 500),
@@ -156,7 +157,7 @@ async function create(client, warehouseId, {
     warehouseId,
     agent: 'Кладовщик',
     actionText: `Заказ физлицу «${number}»${seller ? ' от продавца' : ''} «${await companyName(client, companyId)}»: `
-      + `${units} шт. — ${to.recipient}, ${to.address}${to.service ? `, ${to.service}` : ''}`
+      + `${units} шт. — ${to.recipient}${to.address ? `, ${to.address}` : ''}${to.service ? `, ${to.service}` : ''}`
       + `${vw ? `, со склада «${vw.name}»` : ''}.`,
     entityType: 'invoice', entityId: order.id, invoiceId: order.id,
     actorType: actor.type, actorId: actor.id || null,

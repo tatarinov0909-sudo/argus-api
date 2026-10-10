@@ -36,7 +36,7 @@ router.get('/', requireAuth, async (req, res, next) => {
                 i.source, i.external_id, i.mp_status, i.mp_supplier_status,
                 i.mp_closed_at, i.mp_close_reason, i.mp_stock_returned_at, i.mp_status_checked_at, i.shipped_at,
                 c.name AS company_name,
-                -- Поставка заказа: экран грузчика собирает заказы по поставкам
+                -- Поставка заказа: экран комплектовщика собирает заказы по поставкам
                 -- и показывает, куда она едет.
                 i.supply_id, s.number AS supply_number, s.destination AS supply_destination,
                 -- Привоз (владелец 26.09.2026): когда и в какое окно, сколько
@@ -63,11 +63,11 @@ router.get('/', requireAuth, async (req, res, next) => {
            -- только отправленные на сборку, то есть в поставке.
            AND (NOT $2::boolean OR i.mp_closed_at IS NULL)
            AND (NOT $2::boolean OR i.direction <> 'out' OR i.source = '1c' OR i.supply_id IS NOT NULL)
-           -- «Заказ поставщику» из 1С — это заказ, а не привоз: грузчику его
+           -- «Заказ поставщику» из 1С — это заказ, а не привоз: комплектовщику его
            -- принимать нечего (решение владельца 27.09.2026). В кабинете он
            -- остаётся — под фильтром «Откуда: из 1С».
            AND (NOT $2::boolean OR i.source_document_type IS DISTINCT FROM 'supplier_order')
-           -- Грузчику закрытое старше двух недель не нужно: он видит работу и
+           -- Комплектовщику закрытое старше двух недель не нужно: он видит работу и
            -- десяток недавно принятых. Без этого список рос бы бесконечно —
            -- каждый уехавший заказ WB остаётся документом (аудит 30.09.2026).
            -- Две недели — от закрытия, а не от того, когда документ завели:
@@ -86,8 +86,8 @@ router.get('/', requireAuth, async (req, res, next) => {
         [direction || null, req.auth.role === 'worker', source || null],
       );
       // Кто принимает приход и сколько принято: «На паузе · Дима · принято 3
-      // из 8 позиций» видят все грузчики и склад (владелец 27.09.2026).
-      // Продавцу имена грузчиков и их заметки не нужны.
+      // из 8 позиций» видят все комплектовщики и склад (владелец 27.09.2026).
+      // Продавцу имена комплектовщиков и их заметки не нужны.
       if (req.auth.role !== 'seller') {
         // Заход на уже принятом приходе закрывается здесь же (см. settle):
         // список — «следующее обращение», и строка «На паузе · Джоник»
@@ -164,7 +164,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
           `SELECT ii.id, ii.name, ii.sku, ii.declared_qty, ii.virtual_warehouse_id,
                   COALESCE(SUM(sr.picked_qty), 0) AS picked_qty,
                   COALESCE(BOOL_OR(sr.is_final), false) AS closed,
-                  -- Грузчик уже отметил «нет товара», а руководитель ещё не
+                  -- Комплектовщик уже отметил «нет товара», а руководитель ещё не
                   -- ответил: экран сборки не предлагает позицию снова.
                   EXISTS (SELECT 1 FROM journal_entries je
                            WHERE je.urgent AND je.status = 'pending'
@@ -234,7 +234,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
       return { ...inv, items: itemsResult.rows };
     });
     if (!invoice) throw new HttpError(404, 'Накладная не найдена');
-    // Продавцу — только то, что про его товар: адреса ячеек и паузы грузчиков
+    // Продавцу — только то, что про его товар: адреса ячеек и паузы комплектовщиков
     // остаются внутри склада (правило .business/seller-cabinet.md; найдено
     // проверкой 26.09.2026). Так же вырезано в /api/sellers/history.
     if (req.auth.role === 'seller') {

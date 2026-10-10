@@ -1,7 +1,7 @@
 // Приёмка прихода со своим состоянием на сервере (задание 27.09.2026,
 // второе — «приёмка и склад»), по образцу сборки поставки: старт → выход
-// (пауза) → возврат → отказ → другой грузчик продолжает → «забрать себе» →
-// «Закончить приёмку» с не приехавшим. Плюс: список приходов у грузчика
+// (пауза) → возврат → отказ → другой комплектовщик продолжает → «забрать себе» →
+// «Закончить приёмку» с не приехавшим. Плюс: список приходов у комплектовщика
 // (заказы поставщику скрыты, состояние приёмки видно), руководитель только
 // смотрит, чужой склад и продавец не видят, коды товара на экране приёмки,
 // полная карточка ячейки. Только на отдельной тестовой базе.
@@ -67,10 +67,10 @@ const { withTenantContext } = require('../src/db/pool');
       items: [{ sku: 'RC-1', name: 'Батончик', declaredQty: 100 }] }), 201);
     await run((c) => c.query(`UPDATE invoices SET source = '1c', external_id = 'zp-1', source_document_type = 'supplier_order' WHERE id = $1`, [order.id]));
 
-    // ---------- Список у грузчика ----------
+    // ---------- Список у комплектовщика ----------
     const listDima = must(await api('GET', '/api/invoices?direction=in', dima));
     const listOwner = must(await api('GET', '/api/invoices?direction=in', owner));
-    check('заказ поставщику грузчику не виден, в кабинете — есть', () => {
+    check('заказ поставщику комплектовщику не виден, в кабинете — есть', () => {
       assert.ok(!listDima.some((i) => i.id === order.id));
       assert.ok(listOwner.some((i) => i.id === order.id && i.source_document_type === 'supplier_order'));
     });
@@ -123,7 +123,7 @@ const { withTenantContext } = require('../src/db/pool');
     const again = must(await api('POST', '/api/journal/pause', dima, { invoiceId: inv.id, reason: 'Вышел из приёмки', exit: true }));
     check('второй выход не пишется', () => assert.equal(again.repeated, true));
     const listPaused = must(await api('GET', '/api/invoices?direction=in', ivan)).find((i) => i.id === inv.id);
-    check('в списке у другого грузчика: «на паузе · Дима · принято 1 из 3», комментарий', () => {
+    check('в списке у другого комплектовщика: «на паузе · Дима · принято 1 из 3», комментарий', () => {
       assert.equal(listPaused.work.assembly.status, 'paused');
       assert.equal(listPaused.work.assembly.workerName, 'Дима');
       assert.equal(listPaused.work.assembly.mine, false);
@@ -153,7 +153,7 @@ const { withTenantContext } = require('../src/db/pool');
       assert.equal(abandoned.taken, 1);
     });
     assert.ok((await journalTexts()).includes(`Дима отказался от приёмки прихода «${num}», принято 1 из 3 позиций.`
-      + ' Приход свободен — его продолжит любой грузчик с того же места. Комментарий: паста в дальнем углу'));
+      + ' Приход свободен — его продолжит любой комплектовщик с того же места. Комментарий: паста в дальнем углу'));
 
     // ---------- Иван продолжает, Дима забирает ----------
     must(await api('POST', `/api/receiving/session/${inv.id}/start`, ivan, {}), 201);
@@ -230,7 +230,7 @@ const { withTenantContext } = require('../src/db/pool');
     const sellerCell = await api('GET', `/api/cells/blocks/${cellAt(2, 1).id}/contents`, seller);
     const sellerState = await api('GET', `/api/receiving/session/${inv.id}`, seller);
     const managerNoGrant = await api('GET', `/api/cells/blocks/${cellAt(2, 1).id}/contents`, manager);
-    check('чужой склад не видит ни приёмки, ни ячейки; продавцу — ни имён грузчиков, ни раскладки', () => {
+    check('чужой склад не видит ни приёмки, ни ячейки; продавцу — ни имён комплектовщиков, ни раскладки', () => {
       assert.equal(foreign.status, 404);
       assert.equal(foreignCell.status, 404);
       assert.ok(sellerList.length > 0);

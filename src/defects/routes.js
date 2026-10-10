@@ -132,7 +132,7 @@ router.get('/moves/:id/photo', requireAuth, requireRole('seller', 'worker', 'own
   } catch (err) { next(err); }
 });
 
-// Задания грузчику: решения по браку, которые склад ещё не выполнил.
+// Задания комплектовщику: решения по браку, которые склад ещё не выполнил.
 router.get('/tasks', requireAuth, requireRole('worker', 'owner', 'manager'), async (req, res, next) => {
   try {
     const out = await inWarehouse(req, (c) => defects.tasks(c, req.auth.warehouseId));

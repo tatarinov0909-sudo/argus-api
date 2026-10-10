@@ -12,7 +12,7 @@ const assembly = require('../shipping/assembly');
 const router = express.Router();
 
 // Отметки «нет товара» видят владелец и менеджер с правом «отметки о
-// нехватке» — так решил владелец. Грузчику и продавцу — нет.
+// нехватке» — так решил владелец. Комплектовщику и продавцу — нет.
 const seesShortages = (auth) => auth.role === 'owner'
   || (auth.role === 'manager' && (auth.grants || []).includes('shortages'));
 
@@ -155,7 +155,7 @@ router.get('/', requireAuth, requireRole('owner', 'manager', 'worker', 'seller')
         { status: req.query.status || null, showShortages: seesShortages(req.auth), limit, recentOnly: req.auth.role === 'worker' },
       );
       // Ход сборки — строкой у поставки: «На паузе · Дима · взято 3 из 7».
-      // Складу, не продавцу: имена грузчиков и их заметки — внутреннее дело.
+      // Складу, не продавцу: имена комплектовщиков и их заметки — внутреннее дело.
       if (req.auth.role === 'seller') return list;
       // Собранная или уехавшая поставка не держит сборку «на паузе».
       await assembly.settle(client, req.auth.warehouseId);
@@ -187,7 +187,7 @@ router.get('/:id', requireAuth, requireRole('owner', 'manager', 'worker', 'selle
 });
 
 // Уехала. Событие в физическом мире, и назад его не отменить — см. service.
-// Отмечает тот, кто видит машину: менеджер, владелец или грузчик.
+// Отмечает тот, кто видит машину: менеджер, владелец или комплектовщик.
 // «Собрана» отдельной кнопки не имеет — она ставится сама по отбору.
 router.post('/:id/ship', requireAuth, requireRole('owner', 'manager', 'worker'), async (req, res, next) => {
   try {
@@ -253,7 +253,7 @@ router.delete('/:id', requireAuth, requireRole('owner', 'manager'), async (req, 
   } catch (err) { next(err); }
 });
 
-// Убрать заказ из поставки — ответ на отметку грузчика «нет товара»: заказ
+// Убрать заказ из поставки — ответ на отметку комплектовщика «нет товара»: заказ
 // возвращается в очередь, поставка едет без него. Право владельца и
 // менеджера: состав поставки — их решение (см. service.removeOrder).
 router.post('/orders/:invoiceId/remove', requireAuth, requireRole('owner', 'manager'), async (req, res, next) => {

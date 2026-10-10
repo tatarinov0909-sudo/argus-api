@@ -417,6 +417,15 @@ function summarize(rows) {
   const knownRows = inventoryRows.filter((row) => row.totalKnown);
   const unknownRows = inventoryRows.filter((row) => !row.totalKnown);
   const shortRows = inventoryRows.filter((row) => row.shortage);
+  // Проблемные товары для «Главной» склада (владелец 11.10.2026): то, что
+  // не даёт собрать заказы. Обычный товар — заказов больше, чем есть; набор —
+  // заказов больше, чем готовых и можно собрать из частей (у части нет учёта —
+  // тоже проблема: сколько собрать, неизвестно).
+  const kitNeed = (row) => Number(row.orderedNotInSupply || 0) + Number(row.inAssembly || 0);
+  const kitHave = (row) => Math.max(0, Number(row.total || 0) - Number(row.transitCounted || 0)) + Number(row.kitBuildable || 0);
+  const problemShort = shortRows.filter((row) => !row.kitParts);
+  const problemKits = inventoryRows.filter((row) => row.kitParts && kitNeed(row) > 0
+    && (row.kitBuildable == null || kitHave(row) < kitNeed(row)));
   const sum = (source, field) => source.reduce((total, row) => total + Number(row[field] || 0), 0);
   // Сортировка строк давала не самую свежую дату, а последнюю по алфавиту.
   const updatedAt = inventoryRows
@@ -437,6 +446,9 @@ function summarize(rows) {
     defect: sum(inventoryRows, 'defective') + sum(inventoryRows, 'packagingDefect'),
     // Заказов больше, чем товара по учёту.
     shortageCount: shortRows.length,
+    problemShortCount: problemShort.length,
+    problemKitCount: problemKits.length,
+    problemNames: problemShort.concat(problemKits).slice(0, 5).map((row) => row.name || row.sku),
     unknownCount: unknownRows.length,
     unknownNames: unknownRows.slice(0, 5).map((row) => row.name || row.sku),
     updatedAt,

@@ -6,7 +6,7 @@
 // для брака. Зона — ячейки, закреплённые за складом: ничего другого туда не
 // кладут; пока в зоне есть пустая ячейка — кладут туда, заполнена — рядом,
 // руководителю уведомление. Перенос на такой склад и разделение уже
-// смешанного — задания грузчику «переложить»: каждая переложенная штука
+// смешанного — задания комплектовщику «переложить»: каждая переложенная штука
 // сразу переходит куда нужно.
 const { HttpError } = require('../middleware/errorHandler');
 const { requireQty } = require('../middleware/qty');
@@ -281,7 +281,7 @@ async function listTasks(client, warehouseId, { open = true, companyId = null, i
   return rows.map((t) => taskView(t, names));
 }
 
-// Шаг задания: грузчик переложил qty штук в ячейку toCellBlockId. Каждая
+// Шаг задания: комплектовщик переложил qty штук в ячейку toCellBlockId. Каждая
 // переложенная штука сразу на новом месте (и на новом складе у переноса).
 async function step(client, warehouseId, { taskId, toCellBlockId, qty, staffKeyId = null }) {
   if (!UUID.test(String(taskId || ''))) throw new HttpError(404, 'Задание не найдено');

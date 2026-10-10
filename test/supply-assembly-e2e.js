@@ -1,5 +1,5 @@
 // Сборка поставки со своим состоянием на сервере (задание 27.09.2026):
-// старт → выход (пауза) → возврат → отказ → другой грузчик продолжает →
+// старт → выход (пауза) → возврат → отказ → другой комплектовщик продолжает →
 // завершение с комментарием. Плюс: руководитель и менеджер только смотрят,
 // чужой склад не видит, «забрать себе», недобор при «Закончить сборку»,
 // бумажный лист, лист всей поставки и остаток у заказов.
@@ -94,7 +94,7 @@ const { withTenantContext } = require('../src/db/pool');
     const byOwner = await api('POST', `/api/shipping/assembly/${supply.id}/start`, owner, {});
     const byManager = await api('POST', `/api/shipping/assembly/${supply.id}/start`, manager, {});
     const managerRead = await api('GET', `/api/shipping/assembly/${supply.id}`, manager);
-    check('начать, бросить и закончить сборку может только грузчик; менеджер только смотрит', () => {
+    check('начать, бросить и закончить сборку может только комплектовщик; менеджер только смотрит', () => {
       assert.equal(byOwner.status, 403);
       assert.equal(byManager.status, 403);
       assert.equal(managerRead.status, 200);
@@ -122,7 +122,7 @@ const { withTenantContext } = require('../src/db/pool');
       assert.ok(exit.assembly.assembly.pausedAt);
       assert.ok(managerJournal.includes(`Дима вышел из сборки поставки «${num}», сборка на паузе, взято 3 из 7 шт.`));
     });
-    check('в списке поставок у другого грузчика: на паузе · Дима · взято 3 из 7', () => {
+    check('в списке поставок у другого комплектовщика: на паузе · Дима · взято 3 из 7', () => {
       assert.equal(ivanSees.assembly.assembly.status, 'paused');
       assert.equal(ivanSees.assembly.assembly.workerName, 'Дима');
       assert.equal(ivanSees.assembly.assembly.mine, false);
@@ -180,11 +180,11 @@ const { withTenantContext } = require('../src/db/pool');
       assert.equal(ivanSeesFree.assembly.lastComment.by, 'Дима');
     });
     assert.ok((await journalTexts()).includes(`Дима отказался от сборки поставки «${num}», взято 3 из 7 шт. `
-      + 'Поставка свободна — её продолжит любой грузчик с того же места. Комментарий: 2 короба собраны, стоят у ворот 3'));
+      + 'Поставка свободна — её продолжит любой комплектовщик с того же места. Комментарий: 2 короба собраны, стоят у ворот 3'));
     const abandonAgain = await api('POST', `/api/shipping/assembly/${supply.id}/abandon`, dima, {});
     check('бросить не свою (уже брошенную) сборку нельзя — 409', () => assert.equal(abandonAgain.status, 409));
 
-    // 5. Другой грузчик продолжает с того же места.
+    // 5. Другой комплектовщик продолжает с того же места.
     const ivanStart = must(await api('POST', `/api/shipping/assembly/${supply.id}/start`, ivan, {}), 201);
     check('Иван продолжает: новый заход, взятое Димой засчитано', () => {
       assert.equal(ivanStart.assembly.workerName, 'Иван');
@@ -336,7 +336,7 @@ const { withTenantContext } = require('../src/db/pool');
     const sellerRows = must(await api('GET', '/api/supplies', seller));
     const sellerDb = await withTenantContext({ companyId: company },
       (c) => c.query('SELECT count(*)::int AS n FROM work_sessions'));
-    check('чужой склад сборку не видит; продавцу ни состояния, ни имён грузчиков', () => {
+    check('чужой склад сборку не видит; продавцу ни состояния, ни имён комплектовщиков', () => {
       assert.equal(foreign.status, 404);
       assert.equal(foreignRows.rows[0].n, 0);
       assert.ok(sellerRows.length > 0);
